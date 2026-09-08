@@ -1,0 +1,19 @@
+{
+  "name": "dspi-link-js",
+  "private": true,
+  "version": "1.0.0",
+  "description": "DSPi Link TypeScript client library and the web UI a hub serves",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @dspi/link && npm run build --workspace @dspi/web",
+    "test": "npm run test --workspace @dspi/link",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
