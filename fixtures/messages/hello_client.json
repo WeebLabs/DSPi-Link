@@ -1,0 +1,12 @@
+{
+  "client" : {
+    "app" : "DSPi Mobile",
+    "name" : "Troy's iPhone",
+    "version" : "0.1"
+  },
+  "proto" : {
+    "major" : 1,
+    "minor" : 0
+  },
+  "t" : "hello"
+}

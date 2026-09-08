@@ -1,0 +1,95 @@
+{
+  "frames" : [
+    {
+      "bRequest" : 210,
+      "direction" : "set",
+      "file" : "cmd_request_set_master_volume.bin",
+      "handle" : 0,
+      "hex" : "010007000000d2000000020004000000a0c1",
+      "note" : "spec 11.1: master volume -20.0 dB, session 12",
+      "payload_hex" : "0000a0c1",
+      "tag" : 7,
+      "type" : "cmd_request",
+      "wIndex" : 2,
+      "wLength" : 4,
+      "wValue" : 0
+    },
+    {
+      "bRequest" : 127,
+      "direction" : "get",
+      "file" : "cmd_request_get_platform.bin",
+      "handle" : 1,
+      "hex" : "0100080001017f00000002000600",
+      "tag" : 8,
+      "type" : "cmd_request",
+      "wIndex" : 2,
+      "wLength" : 6,
+      "wValue" : 0
+    },
+    {
+      "file" : "cmd_response_platform.bin",
+      "hex" : "8100080000000600010117090107",
+      "note" : "RP2350, firmware 1.1.7, 9 outputs",
+      "payload_hex" : "010117090107",
+      "status" : 0,
+      "tag" : 8,
+      "type" : "cmd_response"
+    },
+    {
+      "file" : "cmd_response_denied.bin",
+      "hex" : "8100090081000000",
+      "status" : 129,
+      "tag" : 9,
+      "type" : "cmd_response"
+    },
+    {
+      "file" : "notify_param_changed.bin",
+      "handle" : 0,
+      "hex" : "0200030000000c0002020029100004000100000000000000",
+      "origin" : 12,
+      "packet" : {
+        "event" : 2,
+        "seq" : 41,
+        "source" : 1,
+        "version" : 2,
+        "wire_offset" : 16,
+        "wire_size" : 4
+      },
+      "tag" : 3,
+      "type" : "notify"
+    },
+    {
+      "file" : "poll_status.bin",
+      "handle" : 0,
+      "hex" : "0300640000021b00000102030405060708090a0b0c0d0e0f101112131415161718191a",
+      "payload_length" : 27,
+      "slot" : 2,
+      "tag" : 100,
+      "type" : "poll"
+    },
+    {
+      "data_hex" : "aabbcc",
+      "file" : "fwdata_chunk.bin",
+      "hex" : "0400030000000100aabbcc",
+      "offset" : 65536,
+      "tag" : 3,
+      "type" : "fwdata"
+    },
+    {
+      "file" : "fwdata_ack.bin",
+      "hex" : "840003000000010000",
+      "offset" : 65536,
+      "status" : 0,
+      "tag" : 3,
+      "type" : "fwdata_ack"
+    },
+    {
+      "file" : "resync_reattached.bin",
+      "handle" : 0,
+      "hex" : "050000000001",
+      "reason" : 1,
+      "type" : "resync"
+    }
+  ],
+  "spec_version" : "1.0"
+}

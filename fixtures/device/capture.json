@@ -1,0 +1,25 @@
+{
+  "bulk" : {
+    "file" : "bulk_v30.bin",
+    "master_volume_db" : -25,
+    "note" : "WireBulkParams as REQ_GET_ALL_PARAMS (0xA0) returned it; decode per the firmware's bulk_params.h for this wire version",
+    "num_channels" : 17,
+    "num_input_channels" : 8,
+    "num_output_channels" : 9,
+    "size" : 5980,
+    "wire_version" : 30
+  },
+  "captured" : "2026-09-08T15:40:15Z",
+  "platform" : {
+    "fw" : "1.1.6",
+    "outputs" : 9,
+    "platform" : 1,
+    "raw_hex" : "010116090106"
+  },
+  "serial" : "4BA1DDB9D1443D6A",
+  "status" : {
+    "file" : "status_wvalue9.bin",
+    "layout" : "peaks[num_channels] u16, cpu0 u8, cpu1 u8, clip_flags u32, active_input_channels u8",
+    "size" : 41
+  }
+}

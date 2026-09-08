@@ -1,0 +1,10 @@
+{
+  "device" : {
+    "handle" : 1,
+    "link" : "usb",
+    "name" : "Bench",
+    "serial" : "4BA1DDB9D1443D6A",
+    "state" : "online"
+  },
+  "t" : "device.added"
+}

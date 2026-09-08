@@ -1,0 +1,6 @@
+{
+  "code" : "denied",
+  "id" : 7,
+  "msg" : "admin role required",
+  "t" : "err"
+}

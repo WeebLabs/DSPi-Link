@@ -1,0 +1,29 @@
+{
+  "auth" : "pin",
+  "caps" : [
+    "cmd",
+    "notify",
+    "poll",
+    "snapshot",
+    "lock",
+    "rename"
+  ],
+  "hub" : {
+    "id" : "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+    "kind" : "console",
+    "name" : "Studio Mac",
+    "version" : "1.1.7"
+  },
+  "limits" : {
+    "max_frame" : 65536,
+    "max_inflight" : 8,
+    "max_payload" : 8192,
+    "poll_budget_bps" : 200000,
+    "poll_max_hz" : 20
+  },
+  "proto" : {
+    "major" : 1,
+    "minor" : 0
+  },
+  "t" : "hello"
+}

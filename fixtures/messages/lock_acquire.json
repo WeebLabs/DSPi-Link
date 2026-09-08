@@ -1,0 +1,7 @@
+{
+  "handle" : 0,
+  "id" : 10,
+  "reason" : "Applying configuration",
+  "t" : "lock.acquire",
+  "timeout_ms" : 10000
+}

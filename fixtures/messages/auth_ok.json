@@ -1,0 +1,19 @@
+{
+  "id" : 1,
+  "policy" : {
+    "denied" : [
+      [
+        240,
+        1
+      ],
+      [
+        83,
+        1
+      ]
+    ]
+  },
+  "role" : "control",
+  "session" : 12,
+  "t" : "ok",
+  "token" : "Zm9vYmFyYmF6cXV4"
+}

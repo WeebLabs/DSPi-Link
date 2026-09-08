@@ -1,0 +1,23 @@
+{
+  "handle" : 0,
+  "id" : 8,
+  "polls" : [
+    {
+      "hz" : 10,
+      "idx" : 2,
+      "len" : 27,
+      "req" : 80,
+      "slot" : 0,
+      "val" : 9
+    },
+    {
+      "hz" : 15,
+      "idx" : 2,
+      "len" : 80,
+      "req" : 11,
+      "slot" : 1,
+      "val" : 3
+    }
+  ],
+  "t" : "poll.subscribe"
+}
