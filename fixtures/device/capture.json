@@ -19,7 +19,7 @@
     "platform" : 1,
     "raw_hex" : "01011609010605"
   },
-  "serial" : "4BA1DDB9D1443D6A",
+  "serial" : "0123456789ABCDEF",
   "status" : {
     "active_input_channels" : 2,
     "clip_flags" : 0,

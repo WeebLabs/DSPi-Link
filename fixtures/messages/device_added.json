@@ -3,7 +3,7 @@
     "handle" : 1,
     "link" : "usb",
     "name" : "Bench",
-    "serial" : "4BA1DDB9D1443D6A",
+    "serial" : "0123456789ABCDEF",
     "state" : "online"
   },
   "t" : "device.added"

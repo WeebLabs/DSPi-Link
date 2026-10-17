@@ -305,7 +305,7 @@ Client to hub, first message:
 
 ```json
 {"t": "hello", "proto": {"major": 1, "minor": 1},
- "client": {"name": "Troy's iPhone", "app": "DSPi Mobile", "version": "0.1"}}
+ "client": {"name": "Living Room iPad", "app": "DSPi Mobile", "version": "0.1"}}
 ```
 
 Hub to client, in reply (no `id`):
@@ -344,11 +344,11 @@ advertises a small one.
 {"t": "auth.token", "id": 1, "token": "<base64url>"}
 {"t": "ok", "id": 1, "session": 12, "role": "control", "policy": {"denied": [[240,1],[83,1]]}}
 
-{"t": "auth.pair", "id": 1, "pin": "482913", "name": "Troy's iPhone", "role": "control"}
+{"t": "auth.pair", "id": 1, "pin": "482913", "name": "Living Room iPad", "role": "control"}
 {"t": "ok", "id": 1, "session": 12, "role": "control", "token": "<base64url>", "policy": {...}}
 
 {"t": "auth.list", "id": 2}                         (admin)
-{"t": "ok", "id": 2, "clients": [{"cid": 3, "name": "Troy's iPhone", "role": "control",
+{"t": "ok", "id": 2, "clients": [{"cid": 3, "name": "Living Room iPad", "role": "control",
                                   "created": "2026-09-08T10:12:00Z", "last_seen": "...", "online": true}]}
 {"t": "auth.revoke", "id": 3, "cid": 3}             (admin)
 {"t": "auth.set_role", "id": 4, "cid": 3, "role": "viewer"}   (admin)

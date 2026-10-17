@@ -14,7 +14,7 @@ import { fixtureBytes } from "./fixtures.js";
 
 const DEVICE: DeviceInfo = {
   handle: 0,
-  serial: "4BA1DDB9D1443D6A",
+  serial: "0123456789ABCDEF",
   name: "Bench",
   platform: 1,
   fw: "1.1.6",
