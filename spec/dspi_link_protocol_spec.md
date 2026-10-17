@@ -1,7 +1,7 @@
 # DSPi Link Protocol Specification
 
 *Version: 1.1 (draft)*
-*Status: draft; dspi-link-js implements 1.1, the DSPi Console `feature/dspi-link` branch implements 1.0*
+*Status: draft; dspi-link-js and the DSPi Console `feature/dspi-link` branch implement 1.1*
 *Last updated: 2026-10-17 (changes from 1.0 are listed in section 13)*
 
 DSPi Link is the local-network protocol through which a **hub** (DSPi Console
