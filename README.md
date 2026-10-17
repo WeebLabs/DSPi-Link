@@ -19,6 +19,4 @@ Implementations: DSPi Console for macOS (`WeebLabs/DSPi-Console`, hub and
 client), DSPi Console for Windows (planned), the web UI here, and the ESP32
 bridge (planned). Each vendors a tagged version of this repository.
 
-Writing style: no em-dashes anywhere in this repository; use a hyphen.
-
 License: MIT, see `LICENSE`.

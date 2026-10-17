@@ -13,8 +13,6 @@ vendor command catalogue (`Documentation/commands.md` in the firmware repo)
 and the notification spec (`notification_protocol_v2_spec.md`). No DSPi Console
 source is required.
 
-Writing style note: this document avoids em-dashes per project convention.
-
 ---
 
 ## 1. Design principles
