@@ -13,7 +13,7 @@ everything an implementation in any language needs:
 | `fixtures/messages/` | Control-plane JSON samples, one file per message type. |
 | `fixtures/device/` | Real captures from a board (bulk blob, status frame, platform), with a sidecar giving the decoded values, so every client's decoders agree on the same bytes. |
 | `js/` | `dspi-link-js`: the TypeScript client library and the web UI the hub serves. |
-| `conformance/` | Reference client and hub for testing implementations against (Python). |
+| `conformance/` | Planned, not yet in the repository: reference client and hub for testing implementations against (Python). |
 
 Implementations: DSPi Console for macOS (`WeebLabs/DSPi-Console`, hub and
 client), DSPi Console for Windows (planned), the web UI here, and the ESP32
