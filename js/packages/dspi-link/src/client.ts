@@ -390,11 +390,11 @@ export class LinkClient {
     this.setState("handshaking");
     this.send({
       t: "hello",
-      proto: { major: 1, minor: 0 },
+      proto: { major: 1, minor: 1 },
       client: {
         name: this.connectOptions.clientName,
         app: this.connectOptions.app ?? "dspi-link-js",
-        version: this.connectOptions.version ?? "1.0.0",
+        version: this.connectOptions.version ?? "1.1.0",
       },
     });
   }

@@ -8,7 +8,7 @@ everything an implementation in any language needs:
 | Path | What it is |
 |------|------------|
 | `spec/dspi_link_protocol_spec.md` | The protocol, the single normative text. |
-| `policy/commands.json` | Every vendor opcode with its direction(s) and authorization class (`read`, `control`, `config`). Hubs embed it; clients use it to grey out controls. A code absent from it is `config`. |
+| `policy/commands.json` | Every vendor opcode with its direction(s) and authorization class (`read`, `control`, `config`), per direction where the two differ. Hubs embed it; clients use it to grey out controls. A code absent from it is `config`. |
 | `fixtures/frames/` | Byte-exact binary frames of every type, with `frames.json` giving each one's decoded meaning. |
 | `fixtures/messages/` | Control-plane JSON samples, one file per message type. |
 | `fixtures/device/` | Real captures from a board (bulk blob, status frame, platform), with a sidecar giving the decoded values, so every client's decoders agree on the same bytes. |

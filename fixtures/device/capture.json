@@ -1,23 +1,30 @@
 {
   "bulk" : {
-    "file" : "bulk_v30.bin",
-    "master_volume_db" : -25,
+    "file" : "bulk_v32.bin",
+    "global_preamp_db" : 0,
+    "master_volume_db" : -20,
     "note" : "WireBulkParams as REQ_GET_ALL_PARAMS (0xA0) returned it; decode per the firmware's bulk_params.h for this wire version",
     "num_channels" : 17,
     "num_input_channels" : 8,
     "num_output_channels" : 9,
-    "size" : 5980,
-    "wire_version" : 30
+    "size" : 6136,
+    "wire_version" : 32
   },
-  "captured" : "2026-09-08T15:40:15Z",
+  "captured" : "2026-10-17T19:18:14Z",
+  "firmware" : "v1.1.6-beta4-50-gf81dae1 (REQ_GET_BUILD_INFO; the v1.1.6-beta5 version bump commit)",
   "platform" : {
     "fw" : "1.1.6",
+    "fw_beta" : 5,
     "outputs" : 9,
     "platform" : 1,
-    "raw_hex" : "010116090106"
+    "raw_hex" : "01011609010605"
   },
   "serial" : "4BA1DDB9D1443D6A",
   "status" : {
+    "active_input_channels" : 2,
+    "clip_flags" : 0,
+    "cpu0" : 0,
+    "cpu1" : 0,
     "file" : "status_wvalue9.bin",
     "layout" : "peaks[num_channels] u16, cpu0 u8, cpu1 u8, clip_flags u32, active_input_channels u8",
     "size" : 41

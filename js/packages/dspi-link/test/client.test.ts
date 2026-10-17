@@ -18,9 +18,10 @@ const DEVICE: DeviceInfo = {
   name: "Bench",
   platform: 1,
   fw: "1.1.6",
+  fw_beta: 5,
   outputs: 9,
   inputs: 8,
-  wire_version: 30,
+  wire_version: 32,
   state: "online",
   link: "usb",
   locked_by: null,
@@ -251,13 +252,13 @@ describe("events and inventory", () => {
 
 describe("snapshot and polls", () => {
   it("decodes the base64 blobs a snapshot carries", async () => {
-    const bulk = fixtureBytes("device", "bulk_v30.bin");
+    const bulk = fixtureBytes("device", "bulk_v32.bin");
     const status = fixtureBytes("device", "status_wvalue9.bin");
     const hub = new FakeHub({
       auth: "none",
       devices: [DEVICE],
       snapshot: {
-        wire_version: 30,
+        wire_version: 32,
         age_ms: 120,
         bulk_b64: bytesToBase64(bulk),
         status_b64: bytesToBase64(status),
@@ -267,7 +268,7 @@ describe("snapshot and polls", () => {
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
 
     const snap = await client.snapshot(0);
-    expect(snap.wire_version).toBe(30);
+    expect(snap.wire_version).toBe(32);
     expect(snap.age_ms).toBe(120);
     expect(snap.bulk?.length).toBe(bulk.length);
     expect(snap.status?.length).toBe(status.length);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   BULK_GLOBAL_OFFSET,
   BULK_MASTER_VOLUME_OFFSET,
+  BULK_MIN_WIRE_VERSION,
   BULK_PARAMS_SIZE,
   BULK_WIRE_VERSION,
   NotifyEvent,
@@ -18,11 +19,12 @@ import {
   statusFrameLength,
 } from "../src/decoders.js";
 import { decodeFrame } from "../src/frames.js";
-import { fixtureBytes, fixtureJson } from "./fixtures.js";
+import { fixtureBytes, fixtureJson, toHex } from "./fixtures.js";
 
 interface Capture {
   bulk: {
     file: string;
+    global_preamp_db: number;
     master_volume_db: number;
     num_channels: number;
     num_input_channels: number;
@@ -30,8 +32,16 @@ interface Capture {
     size: number;
     wire_version: number;
   };
-  platform: { fw: string; outputs: number; platform: number; raw_hex: string };
-  status: { file: string; layout: string; size: number };
+  platform: { fw: string; fw_beta: number; outputs: number; platform: number; raw_hex: string };
+  status: {
+    file: string;
+    layout: string;
+    size: number;
+    cpu0: number;
+    cpu1: number;
+    clip_flags: number;
+    active_input_channels: number;
+  };
   serial: string;
 }
 
@@ -67,7 +77,14 @@ describe("bulk blob from a real board", () => {
 
   it("reads the global preamp at offset 16", () => {
     expect(BULK_GLOBAL_OFFSET).toBe(16);
-    expect(readGlobalPreampDb(bulk)).toBe(0);
+    expect(readGlobalPreampDb(bulk)).toBe(capture.bulk.global_preamp_db);
+  });
+
+  it("accepts the checked wire range and refuses versions outside it", () => {
+    const header = decodeBulkHeader(bulk);
+    expect(isSupportedBulkVersion({ ...header, wireVersion: BULK_MIN_WIRE_VERSION })).toBe(true);
+    expect(isSupportedBulkVersion({ ...header, wireVersion: BULK_MIN_WIRE_VERSION - 1 })).toBe(false);
+    expect(isSupportedBulkVersion({ ...header, wireVersion: BULK_WIRE_VERSION + 1 })).toBe(false);
   });
 
   it("refuses a blob too short to hold the field", () => {
@@ -89,10 +106,10 @@ describe("combined status frame", () => {
   it("decodes the captured meters", () => {
     const frame = decodeStatusFrame(status, numChannels);
     expect(frame.peaks.every((p) => p === 0)).toBe(true);
-    expect(frame.cpu0).toBe(8);
-    expect(frame.cpu1).toBe(0);
-    expect(frame.clipFlags).toBe(0);
-    expect(frame.activeInputChannels).toBe(2);
+    expect(frame.cpu0).toBe(capture.status.cpu0);
+    expect(frame.cpu1).toBe(capture.status.cpu1);
+    expect(frame.clipFlags).toBe(capture.status.clip_flags);
+    expect(frame.activeInputChannels).toBe(capture.status.active_input_channels);
   });
 
   it("falls back to a u16 clip mask and no input count on a short frame", () => {
@@ -123,7 +140,9 @@ describe("platform reply", () => {
     const info = decodePlatform(platform);
     expect(info.platform).toBe(capture.platform.platform);
     expect(info.fw).toBe(capture.platform.fw);
+    expect(info.fwBeta).toBe(capture.platform.fw_beta);
     expect(info.outputs).toBe(capture.platform.outputs);
+    expect(toHex(platform)).toBe(capture.platform.raw_hex);
   });
 
   it("decodes the platform frame fixture the same way", () => {
@@ -131,8 +150,13 @@ describe("platform reply", () => {
     expect(frame?.type).toBe("cmd_response");
     const info = decodePlatform((frame as { payload: Uint8Array }).payload);
     expect(info.fw).toBe("1.1.7");
+    expect(info.fwBeta).toBe(0);
     expect(info.platform).toBe(1);
     expect(info.outputs).toBe(9);
+  });
+
+  it("leaves the beta unknown on a 6-byte reply rather than calling it final", () => {
+    expect(decodePlatform(platform.subarray(0, 6)).fwBeta).toBeUndefined();
   });
 
   it("prefers bytes 4 and 5 over the legacy nibbles when both disagree", () => {
@@ -142,7 +166,9 @@ describe("platform reply", () => {
   });
 
   it("falls back to the nibbles on a 4-byte short read from old firmware", () => {
-    expect(decodePlatform(new Uint8Array([0, 1, 0x16, 5])).fw).toBe("1.1.6");
+    const info = decodePlatform(new Uint8Array([0, 1, 0x16, 5]));
+    expect(info.fw).toBe("1.1.6");
+    expect(info.fwBeta).toBeUndefined();
   });
 });
 

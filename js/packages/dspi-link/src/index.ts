@@ -1,5 +1,5 @@
 /*
- * dspi-link: a TypeScript client for the DSPi Link protocol (spec 1.0).
+ * dspi-link: a TypeScript client for the DSPi Link protocol (spec 1.1).
  *
  * Four layers, each usable on its own:
  *   frames.ts    binary data plane, spec 8

@@ -135,7 +135,7 @@ function renderConnect(): void {
         clientName,
         token,
         app: "DSPi Web",
-        version: "1.0.0",
+        version: "1.1.0",
       });
     } catch (e) {
       connectError = (e as Error).message;

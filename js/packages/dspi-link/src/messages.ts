@@ -193,6 +193,8 @@ export interface DeviceInfo {
   name: string;
   platform?: number;
   fw?: string;
+  /** Beta number, 0 for a final release. Absent means unknown, not 0 (spec 7.4, 1.1). */
+  fw_beta?: number;
   outputs?: number;
   inputs?: number;
   wire_version?: number;
@@ -320,6 +322,7 @@ export interface FwDoneMessage extends Envelope {
   handle: number;
   ok: boolean;
   fw?: string;
+  fw_beta?: number;
 }
 
 // ---------------------------------------------------------------------------

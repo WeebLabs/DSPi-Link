@@ -19,18 +19,18 @@
       "direction" : "get",
       "file" : "cmd_request_get_platform.bin",
       "handle" : 1,
-      "hex" : "0100080001017f00000002000600",
+      "hex" : "0100080001017f00000002000700",
       "tag" : 8,
       "type" : "cmd_request",
       "wIndex" : 2,
-      "wLength" : 6,
+      "wLength" : 7,
       "wValue" : 0
     },
     {
       "file" : "cmd_response_platform.bin",
-      "hex" : "8100080000000600010117090107",
-      "note" : "RP2350, firmware 1.1.7, 9 outputs",
-      "payload_hex" : "010117090107",
+      "hex" : "810008000000070001011709010700",
+      "note" : "RP2350, firmware 1.1.7 final (beta 0), 9 outputs",
+      "payload_hex" : "01011709010700",
       "status" : 0,
       "tag" : 8,
       "type" : "cmd_response"
@@ -91,5 +91,5 @@
       "type" : "resync"
     }
   ],
-  "spec_version" : "1.0"
+  "spec_version" : "1.1"
 }

@@ -7,15 +7,19 @@
  * combined status frame, the platform reply and the v2 notification packet.
  * The whole WireBulkParams struct is out of scope.
  *
- * Every offset below belongs to a specific wire-format version and is only
- * valid while the header's format_version matches. Check it before reading.
+ * Every offset below is checked against a range of wire-format versions and
+ * is only valid while the header's format_version falls inside it. Check
+ * with isSupportedBulkVersion before reading.
  */
 
-/** Wire format this module's bulk offsets were taken from (firmware bulk_params.h). */
-export const BULK_WIRE_VERSION = 30;
+/** Oldest wire format the bulk offsets below were checked against. */
+export const BULK_MIN_WIRE_VERSION = 30;
 
-/** Byte length of WireBulkParams at wire version 30. */
-export const BULK_PARAMS_SIZE = 5980;
+/** Newest wire format checked (firmware bulk_params.h). Raise only after re-checking every offset. */
+export const BULK_WIRE_VERSION = 32;
+
+/** Byte length of WireBulkParams at BULK_WIRE_VERSION. Other versions differ; use the header's payloadLength. */
+export const BULK_PARAMS_SIZE = 6136;
 
 /** WireHeader, 16 bytes at offset 0. Stable since the wire format began. */
 export const BULK_HEADER_SIZE = 16;
@@ -23,7 +27,7 @@ export const BULK_HEADER_SIZE = 16;
 /** WireGlobalParams; its first float is preamp_gain_db. Offset 16 since V16. */
 export const BULK_GLOBAL_OFFSET = 16;
 
-/** WireMasterVolume.master_volume_db, float32 LE. Offset 4700 at wire version 30. */
+/** WireMasterVolume.master_volume_db, float32 LE. Offset 4700 from V30 to V32 (V31 and V32 only append). */
 export const BULK_MASTER_VOLUME_OFFSET = 4700;
 
 /** master_volume_db sentinel meaning muted (the firmware's mute value). */
@@ -89,7 +93,7 @@ export function decodeBulkHeader(blob: Uint8Array): BulkHeader {
 }
 
 /**
- * Master output volume in dB, float32 LE at offset 4700 (wire version 30).
+ * Master output volume in dB, float32 LE at offset 4700 (wire versions 30 to 32).
  * -128 is the mute sentinel, not a real level.
  */
 export function readMasterVolumeDb(blob: Uint8Array): number {
@@ -103,9 +107,12 @@ export function readGlobalPreampDb(blob: Uint8Array): number {
   return view(blob).getFloat32(BULK_GLOBAL_OFFSET, true);
 }
 
-/** True when this blob's offsets match the layout this module was written against. */
+/**
+ * True when the blob's wire version is one these offsets were checked against.
+ * Later versions are refused, not assumed: a version bump can move fields.
+ */
 export function isSupportedBulkVersion(header: BulkHeader): boolean {
-  return header.wireVersion === BULK_WIRE_VERSION;
+  return header.wireVersion >= BULK_MIN_WIRE_VERSION && header.wireVersion <= BULK_WIRE_VERSION;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +134,7 @@ export interface StatusFrame {
 /**
  * Decode the combined meter packet.
  *
- * Layout (as captured from wire-version-30 firmware):
+ * Layout (as captured from v1.1.6-beta5 firmware, wire version 32):
  *   peaks[numChannels] u16 LE, cpu0 u8, cpu1 u8, clip_flags u32 LE,
  *   active_input_channels u8
  *
@@ -167,18 +174,21 @@ export function statusFrameLength(numChannels: number): number {
 export interface PlatformInfo {
   /** 0 = RP2040, 1 = RP2350. */
   platform: number;
-  /** "major.minor.patch". */
+  /** "major.minor.patch", without the beta number. */
   fw: string;
   fwMajor: number;
   fwMinor: number;
   fwPatch: number;
+  /** Beta number, 0 for a final release; undefined on a reply shorter than 7 bytes. */
+  fwBeta?: number;
   /** NUM_OUTPUT_CHANNELS. */
   outputs: number;
 }
 
 /**
  * Decode the platform reply: [platform, fw major, (minor << 4) | patch,
- * outputs, fw minor, fw patch].
+ * outputs, fw minor, fw patch, fw beta]. Request 7 bytes; the device clamps
+ * the reply to wLength, and betas of one patch differ only in byte 6.
  *
  * Bytes 4 and 5 are the full-width minor and patch and are preferred; the
  * packed nibbles in byte 2 are the legacy encoding and only stay truthful
@@ -193,7 +203,7 @@ export function decodePlatform(bytes: Uint8Array): PlatformInfo {
   const full = bytes.length >= 6;
   const fwMinor = full ? bytes[4] : (bytes[2] >> 4) & 0x0f;
   const fwPatch = full ? bytes[5] : bytes[2] & 0x0f;
-  return {
+  const info: PlatformInfo = {
     platform,
     fw: `${fwMajor}.${fwMinor}.${fwPatch}`,
     fwMajor,
@@ -201,6 +211,8 @@ export function decodePlatform(bytes: Uint8Array): PlatformInfo {
     fwPatch,
     outputs,
   };
+  if (bytes.length >= 7) info.fwBeta = bytes[6];
+  return info;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
   "devices" : [
     {
       "fw" : "1.1.7",
+      "fw_beta" : 0,
       "handle" : 0,
       "inputs" : 8,
       "link" : "usb",
@@ -10,7 +11,7 @@
       "platform" : 1,
       "serial" : "E46058388B1A2E2C",
       "state" : "online",
-      "wire_version" : 30
+      "wire_version" : 32
     }
   ],
   "id" : 5,

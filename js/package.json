@@ -1,7 +1,7 @@
 {
   "name": "dspi-link-js",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSPi Link TypeScript client library and the web UI a hub serves",
   "type": "module",
   "workspaces": [

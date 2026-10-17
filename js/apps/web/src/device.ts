@@ -17,6 +17,7 @@ import {
   decodeBulkHeader,
   decodeNotifyPacket,
   decodeStatusFrame,
+  isSupportedBulkVersion,
   readMasterVolumeDb,
   statusFrameLength,
 } from "@dspi/link";
@@ -45,7 +46,7 @@ export interface DevicePageHandles {
 
 export function deviceHandleLabel(device: DeviceInfo): string {
   const bits = [device.serial];
-  if (device.fw) bits.push(`fw ${device.fw}`);
+  if (device.fw) bits.push(`fw ${device.fw}${device.fw_beta ? `-beta${device.fw_beta}` : ""}`);
   if (device.link) bits.push(device.link.toUpperCase());
   return bits.join("  |  ");
 }
@@ -85,6 +86,8 @@ export function createDevicePage(
   let inputs = device.inputs ?? 0;
   let outputs = device.outputs ?? 0;
   let disposed = false;
+  // False once a snapshot shows a wire version the bulk offsets were not checked against.
+  let bulkOffsetsValid = true;
 
   // -- volume state --------------------------------------------------------
   // lastLevelDb is the level to return to when unmuting, since the device
@@ -220,12 +223,15 @@ export function createDevicePage(
           numChannels = header.numChannels;
           inputs = header.numInputChannels;
           outputs = header.numOutputChannels;
-          applyDeviceVolume(readMasterVolumeDb(snap.bulk));
-          buildMeters();
-          setStatus(
-            `Wire version ${header.wireVersion}, ${numChannels} channels, snapshot ${snap.age_ms ?? 0} ms old`,
-          );
-          return;
+          bulkOffsetsValid = isSupportedBulkVersion(header);
+          if (bulkOffsetsValid) {
+            applyDeviceVolume(readMasterVolumeDb(snap.bulk));
+            buildMeters();
+            setStatus(
+              `Wire version ${header.wireVersion}, ${numChannels} channels, snapshot ${snap.age_ms ?? 0} ms old`,
+            );
+            return;
+          }
         }
       }
       // No cache on this hub, or an empty one: ask the device itself.
@@ -289,7 +295,7 @@ export function createDevicePage(
     const packet = decodeNotifyPacket(frame.packet);
     if (!packet) return;
     if (packet.kind === "param_changed") {
-      if (packet.wireOffset === BULK_MASTER_VOLUME_OFFSET && packet.value.length >= 4) {
+      if (bulkOffsetsValid && packet.wireOffset === BULK_MASTER_VOLUME_OFFSET && packet.value.length >= 4) {
         const dv = new DataView(packet.value.buffer, packet.value.byteOffset, packet.value.byteLength);
         applyDeviceVolume(dv.getFloat32(0, true));
       }
