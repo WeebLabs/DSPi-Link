@@ -1,0 +1,2 @@
+# ESP32-C6. No PSRAM support. The defaults in sdkconfig.defaults apply
+# unchanged; this file exists so every chip has one.

@@ -1,0 +1,10 @@
+# Partition table for every supported chip (bridge spec 14.1).
+# Offsets are left blank so ESP-IDF places and aligns each partition.
+# Two equal app slots allow updates with rollback (bridge spec 14.2).
+#
+# Name,     Type, SubType, Offset, Size
+nvs,        data, nvs,     ,       24K
+otadata,    data, ota,     ,       8K
+phy_init,   data, phy,     ,       4K
+ota_0,      app,  ota_0,   ,       1920K
+ota_1,      app,  ota_1,   ,       1920K

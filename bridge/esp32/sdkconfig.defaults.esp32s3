@@ -1,0 +1,6 @@
+# ESP32-S3. Most S3 boards with PSRAM use octal PSRAM (DevKitC-1 N8R8,
+# XIAO ESP32S3). Boards with quad PSRAM boot without it and allow fewer
+# sessions (bridge spec 4.1 and 8.2).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

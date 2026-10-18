@@ -8,11 +8,13 @@ everything an implementation in any language needs:
 | Path | What it is |
 |------|------------|
 | `spec/dspi_link_protocol_spec.md` | The protocol, the single normative text. |
+| `spec/esp32_bridge_spec.md` | The ESP32 bridge: a reference bridge hub that serves one DSPi over UART and Wi-Fi. |
 | `policy/commands.json` | Every vendor opcode with its direction(s) and authorization class (`read`, `control`, `config`), per direction where the two differ. Hubs embed it; clients use it to grey out controls. A code absent from it is `config`. |
 | `fixtures/frames/` | Byte-exact binary frames of every type, with `frames.json` giving each one's decoded meaning. |
 | `fixtures/messages/` | Control-plane JSON samples, one file per message type. |
 | `fixtures/device/` | Real captures from a board (bulk blob, status frame, platform), with a sidecar giving the decoded values, so every client's decoders agree on the same bytes. |
 | `js/` | `dspi-link-js`: the TypeScript client library and the web UI the hub serves. |
+| `bridge/esp32/` | The ESP32 bridge firmware (ESP-IDF), in progress; `PLAN.md` gives the build order and status. |
 | `conformance/` | Planned, not yet in the repository: reference client and hub for testing implementations against (Python). |
 
 Implementations: DSPi Console for macOS (`WeebLabs/DSPi-Console`, hub and

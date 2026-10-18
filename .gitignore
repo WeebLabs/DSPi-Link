@@ -1,3 +1,10 @@
 node_modules/
 dist/
 .DS_Store
+
+# ESP32 bridge build output (bridge/esp32/tools/build.sh)
+bridge/esp32/build/
+bridge/esp32/managed_components/
+bridge/esp32/sdkconfig
+bridge/esp32/sdkconfig.old
+bridge/esp32/build-host/

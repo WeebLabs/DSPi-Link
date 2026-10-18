@@ -1,0 +1,15 @@
+# Settings shared by every chip. Chip-specific settings live in
+# sdkconfig.defaults.<chip>, which ESP-IDF applies on top of this file.
+
+# Flash and partitions (bridge spec 4.1 and 14.1): 4 MB is the smallest
+# flash on any supported board.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# A new firmware image must confirm itself after a healthy start, or the
+# bootloader returns to the previous one (bridge spec 14.2).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Optimise for size: the image must stay under 1.5 MB (bridge spec 14.1).
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y

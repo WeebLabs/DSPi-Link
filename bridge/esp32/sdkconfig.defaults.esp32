@@ -1,0 +1,4 @@
+# ESP32 (original). Some boards (WROVER) carry PSRAM; use it when present
+# and boot normally when absent (bridge spec 4.1 and 8.2).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
