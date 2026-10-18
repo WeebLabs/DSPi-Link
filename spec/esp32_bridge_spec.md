@@ -298,7 +298,7 @@ bridge/esp32/
     link_codec/             Link binary frames and JSON messages      [portable]
     link_policy/            Authorization table generated from policy/commands.json [portable]
     dspi_frame/             DSPi UART frame encoder, parser and CRC   [portable]
-    dspi_uart/              The uart task: timing, retries, presence, baud detection
+    dspi_uart/              The link engine [portable] and the uart task around it
     hub/                    The hub task's state machine              [portable core]
     hub_auth/               PIN and token hashing, rate limits        [portable]
     http_server/            Ports 11915 and 80, WebSocket glue, static files
@@ -311,11 +311,10 @@ bridge/esp32/
     status_led/             LED patterns
     web_assets/             Generated from the built web pages; never edited
   test/
-    host/                   Host test runner for the [portable] components
+    host/                   Host tests for the [portable] components, with a simulated DSPi
   tools/
     gen_policy.py           policy/commands.json -> link_policy C table
     embed_web.py            js/apps/web/dist -> web_assets C sources (gzipped)
-    fake_dspi.py            A DSPi simulator for bench tests over a USB-UART adapter
 ```
 
 Components marked `[portable]` include no ESP-IDF headers. They take time,
@@ -330,7 +329,7 @@ the same source compiles into the firmware and into the host tests.
 | `link_codec` | Encodes and decodes Link frames (Link spec 8) and JSON messages (Link spec 7). | cJSON |
 | `link_policy` | `link_policy_class(bRequest, dir)`, generated from `policy/commands.json` with the spec version it came from. Unknown codes are `config`. | nothing |
 | `dspi_frame` | Builds DSPi UART requests and parses responses and notifications byte by byte (firmware spec 3). | nothing |
-| `dspi_uart` | The uart task. Sends one request at a time, enforces the idle gap, retries safe reads, recovers after timeouts, detects the baud rate and the device. | `dspi_frame`, `board`, `settings` |
+| `dspi_uart` | The link engine (`dspi_link.c`, portable): one request at a time, the idle gap, retries, recovery after timeouts, baud detection and the device's identity. The uart task (`dspi_uart.c`) runs it on the real UART and reports the device found or lost. | `dspi_frame` |
 | `hub` | The hub task: sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration. | `link_codec`, `link_policy`, `hub_auth` |
 | `hub_auth` | PIN hashing and checking, token creation and hashing, rate limits. | mbedtls (behind an interface) |
 | `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, turns frames into hub events and back. | `hub`, `web_assets`, `setup_api` |
@@ -407,28 +406,39 @@ one-at-a-time use.
 
 ### 7.3 Retries
 
-The uart task retries a request once, after the recovery in section 7.4,
-only when all of these hold:
+The uart task sends a request at most twice, and only in these cases:
 
-- the request is a GET;
-- `link_policy` classes it as *read*, which excludes write-as-read commands
-  such as `REQ_RTA_CONTROL` (0x0E) and `REQ_CS_MACRO_FIRE` (0x25), whose GET
-  frames change state;
-- the failure was a timeout, `CRC_ERROR` (0x05) or `FRAME_ERROR` (0x07).
+- **The DSPi answers `CRC_ERROR` (0x05) or `FRAME_ERROR` (0x07).** The DSPi
+  rejected the frame itself and did not run the request, so any request,
+  SET included, is sent again.
+- **No valid answer arrives** (a timeout, or an answer that fails its CRC),
+  and the request is a GET that `link_policy` classes as *read*. Such a
+  request is safe to repeat. Write-as-read commands such as
+  `REQ_RTA_CONTROL` (0x0E) and `REQ_CS_MACRO_FIRE` (0x25) are excluded,
+  because their GET frames change state.
 
-SETs are never retried, because the bridge cannot know whether a timed-out
-SET was applied. `BUSY` (0x01) and `BULK_LOCKED` (0x04) are passed to the
-client unchanged, since the firmware has already retried for 50 ms. When the
-retry also fails, a timeout becomes Link status `0x82 TIMEOUT` and any other
-status is passed on.
+Other requests with no valid answer are not repeated, because the bridge
+cannot know whether they ran. `BUSY` (0x01) and `BULK_LOCKED` (0x04) are
+passed to the client unchanged, since the firmware has already retried for
+50 ms. When the last attempt gets no answer, the client receives Link
+status `0x82 TIMEOUT`; when it gets an answer that fails its CRC, status
+`0x05 CRC_ERROR`. Every DSPi status is passed on unchanged.
 
 ### 7.4 Recovery after a timeout
 
 A response that arrives late could be mistaken for the answer to the next
-request. After a timeout the uart task therefore enters quarantine: it
-discards every incoming frame except notifications until the line has been
-silent for 20 ms, and only then sends again. After 3 timeouts in a row it
-also reinstalls the UART driver, which clears a receiver stuck on noise.
+request, because responses carry no request id. Two rules prevent this:
+
+- **Quarantine.** After a request gets no valid answer, the uart task
+  discards every incoming frame except notifications until the line has
+  been silent for 20 ms (at most 500 ms in all), and only then sends again.
+- **Shape.** An answer counts only if its type matches the request (SET or
+  GET response) and, for a GET, it is no longer than the `wLength` asked for,
+  since the firmware never returns more. Anything else is a late answer and
+  is dropped.
+
+After 3 timeouts in a row the uart task also reinstalls the UART driver,
+which clears a receiver stuck on noise.
 
 ### 7.5 Finding the baud rate
 
@@ -451,8 +461,8 @@ reports into Link events.
   values. The hub assigns handle 0 and sends `device.added`.
 - **Watching.** When the link has carried no traffic for 1 s, the uart task
   sends 0xF9 as a heartbeat.
-- **Losing.** Three failed requests in a row, of any kind, mark the device
-  lost. A single timeout never does (Link spec 8.2). The hub reports the
+- **Losing.** Three requests in a row without a valid answer mark the
+  device lost. A single timeout never does (Link spec 8.2). The hub reports the
   device `offline` and keeps handle 0 for 60 s, then sends
   `device.removed`.
 - **Swapping.** If a device returns with a different serial, the hub sends
@@ -993,9 +1003,9 @@ C and TypeScript alike.
 | Level | What | Where |
 |-------|------|-------|
 | Host unit tests | `link_codec` against every file in `fixtures/frames` and `fixtures/messages`; `dspi_frame` against the firmware spec's worked examples and corrupted, split and noisy byte streams; `link_policy` against `policy/commands.json`; `hub_auth` hashing and rate limits. | `bridge/esp32/test/host`, run in CI |
+| Host link tests | The UART link engine against a simulated DSPi on a virtual clock: timeouts, late and corrupt answers, retries, the idle gap, notifications while waiting, baud detection and identity. | `bridge/esp32/test/host`, run in CI |
 | Host hub tests | The `hub` state machine driven by scripted sessions and a simulated DSPi, with a fake clock: ordering, `max_inflight`, origin attribution, poll fan-out and stop, locks, offline and swap, RESYNC, auth modes and revocation. | `bridge/esp32/test/host`, run in CI |
 | Build checks | Firmware for all four chips, image size under 1.5 MB, web build, generated files up to date. | CI |
-| Bench with simulator | A real bridge wired to `tools/fake_dspi.py` through a USB-UART adapter, covering timeouts, CRC errors, notifications under load and baud detection. | Manual, before each release |
 | Bench with a DSPi | A real bridge and DSPi on each of the four chips, driven by the `dspi-link-js` test suite pointed at the bridge, and by DSPi Console. Walks the Link spec 12 conformance checklist and the setup journey of section 3 on an iPhone and an Android phone. | Manual, before each release |
 
 ---

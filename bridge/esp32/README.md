@@ -6,8 +6,9 @@ that DSPi over the network. What it does and why is in
 [`spec/esp32_bridge_spec.md`](../../spec/esp32_bridge_spec.md); the build
 order is in [`PLAN.md`](PLAN.md).
 
-**Status:** phase 1 of 8. The firmware boots, loads and saves its settings,
-and logs its chip, PSRAM and pins. It does not yet talk to a DSPi.
+**Status:** phase 2 of 8. The firmware finds a wired DSPi over UART,
+detecting its baud rate, reads its identity and settings blob, and logs
+every notification it sends. It has no network side yet.
 
 Supported chips: ESP32, ESP32-S3, ESP32-C3 and ESP32-C6, with at least 4 MB
 of flash.
@@ -83,6 +84,9 @@ clang-format --dry-run --Werror $(find components main test -name '*.[ch]')
 | `components/bridge_config/` | Every tunable number, with its unit and reason. |
 | `components/board/` | The pins each chip may use, and PSRAM detection. |
 | `components/settings/` | The saved settings: their rules and their storage in flash. |
+| `components/dspi_frame/` | The DSPi's UART frames and their CRC. |
+| `components/dspi_uart/` | The link engine and the uart task that owns the UART. |
+| `main/phase2_bench.c` | Temporary: logs what the uart task finds, until the hub replaces it in phase 3. |
 | `test/host/` | Host tests for the portable components. |
 | `tools/build.sh` | The Docker build used locally and in CI. |
 | `tools/qemu_smoke.sh` | Boots a built image twice in QEMU, used locally and in CI. |

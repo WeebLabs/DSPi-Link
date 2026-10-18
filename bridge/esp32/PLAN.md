@@ -44,21 +44,34 @@ still to do.
 - `dspi_frame`: encoder, byte-at-a-time parser and CRC, with host tests from
   the firmware spec's worked examples and corrupted, split and noisy
   streams.
-- `dspi_uart`: the uart task with the timing of section 7.2, retries (7.3),
-  quarantine (7.4), baud detection (7.5) and presence (7.6).
-- `tools/fake_dspi.py`: a DSPi simulator for a USB-UART adapter, able to
-  inject timeouts, CRC errors and notification bursts.
-- A temporary console command that sends one request and prints the reply,
-  removed at the end of phase 3.
+- `dspi_uart`: the portable link engine (`dspi_link.c`) with the timing of
+  section 7.2, retries (7.3), quarantine (7.4), baud detection (7.5) and
+  identity reading (7.6), and the uart task around it.
+- `test/host/fake_dspi.c`: a simulated DSPi on a virtual clock that can stay
+  silent, answer late, corrupt its CRC or return any status. It takes the
+  place of the planned USB-UART simulator, since no adapter is available.
+- `main/phase2_bench.c`, temporary: starts the uart task and logs the device
+  being found, a bulk read and each notification. Removed in phase 3.
 
 The front panel firmware's timeout recovery (`DSPi-ESP32-Front-Panel`,
 `dspiRecoverAfterTimeout`) is a useful reference, but the code is written
 fresh to these standards, with a receive buffer sized for 132-byte replies
 and 6136-byte bulk reads.
 
-**Done when** the bridge finds a real DSPi at 1 Mbaud and at 115200 baud,
-reads its serial, platform and bulk blob, relays notifications while
-commands run, and recovers from every fault the simulator injects.
+**Done when** the bridge finds a real DSPi, reads its serial, platform and
+bulk blob, and logs notifications while the DSPi is changed from Console,
+and the host tests cover every fault the simulated DSPi can inject.
+
+**Status (2026-10-18):** done. On an ESP32-S3 (octal PSRAM, 16 MB flash)
+wired to a DSPi running 1.1.6-beta5:
+
+- The bridge found the DSPi at 115200 baud by detection and saved the rate.
+  A bulk read took 535 ms.
+- 98 volume notifications from Console arrived with consecutive `seq`
+  values and no gaps.
+- When the DSPi was switched to 1,000,000 baud, the bridge reported it lost
+  after three timeouts, found it again at the new rate 210 ms later and
+  saved that rate. A bulk read then took 62 ms (61 ms predicted).
 
 ## Phase 3: The Link hub
 
@@ -156,5 +169,7 @@ These belong to DSPi Console and are listed so nothing is forgotten:
    in `idf_version.txt`. Builds run in Espressif's official Docker image of
    that version, so no local installation is needed.
 2. **Default UART pins** as in section 4.4 of the bridge spec.
-3. **Test hardware:** one board of each chip and a USB-UART adapter for the
-   simulator, needed by phase 2 (simulator) and phase 8 (all chips).
+3. **Test hardware:** one ESP32 board and a DSPi are available. There is no
+   USB-UART adapter, so fault injection runs against the simulated DSPi in
+   the host tests instead. Testing every chip in phase 8 needs a board of
+   each.

@@ -13,3 +13,8 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Optimise for size: the image must stay under 1.5 MB (bridge spec 14.1).
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# A 1 ms scheduler tick, so the UART link's 2 ms idle gap and 5 ms listen
+# slice are real (bridge spec 7.2). The default 10 ms tick would round them
+# away.
+CONFIG_FREERTOS_HZ=1000

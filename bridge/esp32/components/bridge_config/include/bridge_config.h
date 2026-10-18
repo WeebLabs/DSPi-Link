@@ -130,6 +130,10 @@
  * silent this long (bridge spec 7.4). */
 #define DSPI_UART_QUARANTINE_SILENCE_MS 20
 
+/* Upper bound on one quarantine, so a line that never falls silent (noise,
+ * a wrong baud rate) cannot hold the link forever. */
+#define DSPI_UART_QUARANTINE_MAX_MS 500
+
 /* Timeouts in a row before the UART driver is reinstalled (bridge spec 7.4). */
 #define DSPI_UART_TIMEOUTS_BEFORE_REINSTALL 3
 
@@ -143,6 +147,30 @@
 /* Idle time after which a heartbeat request checks the device is still
  * there (bridge spec 7.6). */
 #define DSPI_UART_HEARTBEAT_IDLE_MS 1000
+
+/* While no request is waiting, the uart task checks for notifications this
+ * often. Requests themselves start at once; this only bounds how late a
+ * notification can be read. */
+#define DSPI_UART_LISTEN_SLICE_MS 5
+
+/* The ESP-IDF UART driver's receive ring. Holds over 40 ms of traffic at
+ * 1 Mbaud, longer than the uart task ever goes without reading. */
+#define DSPI_UART_DRIVER_RX_BUFFER_BYTES 4096
+
+/* Requests waiting for the uart task: room for every session's in-flight
+ * commands (8 sessions x LINK_MAX_INFLIGHT) plus the hub's own polls. */
+#define DSPI_UART_QUEUE_DEPTH 40
+
+/* ---------------------------------------------------------------------------
+ * Tasks (bridge spec 6.2)
+ * ------------------------------------------------------------------------- */
+
+/* The uart task needs little stack: its buffers are static. */
+#define DSPI_UART_TASK_STACK_BYTES 4096
+
+/* Above the HTTP server and the hub, so a request in progress on the wire
+ * is never held up by network work. */
+#define DSPI_UART_TASK_PRIORITY 10
 
 /* ---------------------------------------------------------------------------
  * Networking (bridge spec 9)

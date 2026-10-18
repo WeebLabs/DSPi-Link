@@ -19,14 +19,22 @@ add_executable(host_tests
     test_main.c
     test_board_tables.c
     test_settings_model.c
+    test_dspi_frame.c
+    test_frames.c
+    test_dspi_link.c
+    fake_dspi.c
     ${COMPONENTS}/board/board_tables.c
+    ${COMPONENTS}/dspi_frame/dspi_frame.c
+    ${COMPONENTS}/dspi_uart/dspi_link.c
     ${COMPONENTS}/settings/settings_model.c)
 
 target_include_directories(host_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${COMPONENTS}/bridge_config/include
     ${COMPONENTS}/board/include
-    ${COMPONENTS}/settings/include)
+    ${COMPONENTS}/settings/include
+    ${COMPONENTS}/dspi_frame/include
+    ${COMPONENTS}/dspi_uart/include)
 
 enable_testing()
 add_test(NAME host_tests COMMAND host_tests)
