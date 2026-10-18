@@ -1,0 +1,4 @@
+# mDNS and DNS-SD (bridge spec 8.8), from the ESP-IDF component registry.
+# Pinned exactly, so every build of a release uses the same code.
+dependencies:
+  espressif/mdns: "==1.14.0"

@@ -91,6 +91,25 @@ wired to a DSPi running 1.1.6-beta5:
 the `dspi-link-js` test suite passes against it, and the existing web client
 served from the bridge shows volume and meters.
 
+**Status (2026-10-18):** done, with one substitution: the `dspi-link-js`
+unit suite runs against its own fake hub, so `tools/link_smoke.mjs` drives
+the live bridge through the library instead. On the ESP32-S3 and DSPi from
+phase 2:
+
+- DSPi Console found the bridge by DNS-SD and controlled the DSPi through
+  it, and the web client served from the bridge showed volume and meters.
+- `tools/link_smoke.mjs` passed all 12 checks on six runs: two sessions,
+  the device list, a platform read, a snapshot in about 90 ms, a
+  notification reaching both sessions with the writer's session as origin,
+  meter polls at the granted 10 Hz, a lock refusing another session's write
+  with `LOCKED`, and `hub.stats`.
+- One earlier run had a snapshot request time out, and it did not happen
+  again. A JSON message the bridge cannot queue is now logged, so a repeat
+  will show its cause.
+- ESP-IDF 6.1 no longer calls the WebSocket handler at the handshake, so
+  sessions open in the post-handshake hook.
+
+
 ## Phase 4: Wi-Fi setup
 
 - `net`: the states of section 9.1, the setup network, captive DNS and the

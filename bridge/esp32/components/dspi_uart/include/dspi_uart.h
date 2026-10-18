@@ -58,4 +58,18 @@ esp_err_t dspi_uart_start(const dspi_uart_config_t *config);
  */
 esp_err_t dspi_uart_submit(const dspi_request_t *request, bool may_retry, uint32_t tag);
 
+/* What hub.stats reports about the link (bridge spec 8.7). */
+typedef struct {
+    uint8_t tx_pin;
+    uint8_t rx_pin;
+    uint32_t baud;
+    bool device_present;
+    dspi_link_counters_t counters;
+} dspi_uart_status_t;
+
+/* A copy of the link's status and counters. The uart task updates them as
+ * it runs; each field is a single aligned word, so a copy may mix two
+ * moments but never holds a torn value. Good enough for statistics. */
+void dspi_uart_get_status(dspi_uart_status_t *status);
+
 #endif /* DSPI_UART_H */

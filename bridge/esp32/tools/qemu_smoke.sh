@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
 # Boots a built image twice in Espressif's QEMU, from the same flash, and
-# checks that the first boot creates the settings and the second keeps the
-# same hub id. This stands in for a real board where none is attached; QEMU
-# has no Wi-Fi or UART peripherals worth testing, so it only proves the boot
-# sequence and flash storage.
+# checks that the first boot creates the settings, the second keeps the same
+# hub id, and neither crashes on the way. This stands in for a real board
+# where none is attached. QEMU has no Wi-Fi radio, so each boot is stopped
+# once the startup summary is logged, before Wi-Fi starts: the test proves
+# the boot sequence and flash storage only.
 #
 # Usage, after tools/build.sh <chip>:
 #   tools/qemu_smoke.sh esp32s3
@@ -28,16 +29,18 @@ case "${chip}" in
 esac
 
 # Inside the container: merge the build into one 4 MB flash image, then boot
-# it twice and keep only the bridge's own log lines. The original ESP32 is
-# slow under emulation, hence the generous timeout.
+# it twice. sed keeps the bridge's own lines and any crash, and quits at the
+# last line of the startup summary, which ends that boot. The original ESP32
+# is slow under emulation, hence the generous timeout.
 boot_twice=$(cat <<SCRIPT
-set -euo pipefail
+set -uo pipefail
 cd build/${chip}
 python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin @flash_args > /dev/null
 for boot in 1 2; do
     echo "BOOT \${boot}"
     timeout 45 ${qemu} -nographic -machine ${chip} \
-        -drive file=/tmp/flash.bin,if=mtd,format=raw 2>&1 | grep -E "I \([0-9]+\) (settings|bridge):" || true
+        -drive file=/tmp/flash.bin,if=mtd,format=raw 2>&1 |
+        sed -n -E '/I \([0-9]+\) (settings|bridge):|Guru Meditation|abort\(\)|assert failed/p; /bridge: DSPi UART/q'
 done
 SCRIPT
 )
@@ -46,7 +49,7 @@ log=$(docker run --rm \
     --volume "${REPO_DIR}:/repo" \
     --workdir /repo/bridge/esp32 \
     "espressif/idf:${IDF_VERSION}" \
-    bash -c "${boot_twice}" 2>/dev/null)
+    bash -c "${boot_twice}" 2>/dev/null) || true # QEMU exits non-zero when sed ends a boot
 echo "${log}"
 
 first_boot=$(sed -n '/^BOOT 1/,/^BOOT 2/p' <<< "${log}")
@@ -59,6 +62,7 @@ fail() {
     echo "FAILED (${chip}): $1" >&2
     exit 1
 }
+grep -qE "Guru Meditation|abort\(\)|assert failed" <<< "${log}" && fail "the firmware crashed"
 grep -q "First boot: saving factory settings" <<< "${first_boot}" || fail "first boot did not create settings"
 grep -q "First boot" <<< "${second_boot}" && fail "second boot created settings again"
 [[ -n "${first_id}" ]] || fail "first boot did not log a hub id"

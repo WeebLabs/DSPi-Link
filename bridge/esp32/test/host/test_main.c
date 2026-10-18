@@ -10,6 +10,9 @@ void test_board_tables(void);
 void test_settings_model(void);
 void test_dspi_frame(void);
 void test_dspi_link(void);
+void test_link_policy(void);
+void test_link_frames(void);
+void test_hub(void);
 
 int main(void)
 {
@@ -17,6 +20,9 @@ int main(void)
     test_settings_model();
     test_dspi_frame();
     test_dspi_link();
+    test_link_policy();
+    test_link_frames();
+    test_hub();
 
     const int failures = check_failure_count();
     if (failures == 0) {

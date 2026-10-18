@@ -287,3 +287,12 @@ esp_err_t dspi_uart_submit(const dspi_request_t *request, bool may_retry, uint32
     const queued_request_t item = {.request = *request, .may_retry = may_retry, .tag = tag};
     return xQueueSend(uart_task_state.queue, &item, 0) == pdTRUE ? ESP_OK : ESP_ERR_NO_MEM;
 }
+
+void dspi_uart_get_status(dspi_uart_status_t *status)
+{
+    status->tx_pin = uart_task_state.config.tx_pin;
+    status->rx_pin = uart_task_state.config.rx_pin;
+    status->baud = dspi_link_baud(&uart_task_state.link);
+    status->device_present = uart_task_state.device_present;
+    status->counters = *dspi_link_counters(&uart_task_state.link);
+}

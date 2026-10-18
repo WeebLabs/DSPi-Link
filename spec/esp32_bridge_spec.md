@@ -218,7 +218,9 @@ The bridge checks the result rather than trusting it:
 The firmware is built with ESP-IDF, Espressif's own framework, version 6.1.
 The version is pinned in one place (`bridge/esp32/idf_version.txt`) and used
 by the build script and CI, which both run Espressif's official Docker image
-of that version.
+of that version. Components from the ESP-IDF component registry are pinned
+to exact versions in the `idf_component.yml` of the component that uses
+them, and the host tests fetch the same cJSON release.
 
 ESP-IDF components used:
 
@@ -226,10 +228,10 @@ ESP-IDF components used:
 |-----------|----------|
 | `esp_wifi`, `esp_netif`, `esp_event` | Station and setup-network Wi-Fi. |
 | `esp_http_server` | HTTP, the WebSocket and the setup API on ports 11915 and 80. |
-| `mdns` (managed component) | DNS-SD advertisement and the `.local` hostname. |
+| `espressif/mdns` (component registry) | DNS-SD advertisement and the `.local` hostname. |
 | `nvs_flash` | Saved settings. |
-| `driver/uart` | The DSPi link. |
-| `json` (cJSON) | The JSON control plane. |
+| `esp_driver_uart` | The DSPi link. |
+| `espressif/cjson` (component registry) | The JSON control plane. ESP-IDF 6 moved cJSON out of the framework. |
 | `mbedtls` | SHA-256 and PBKDF2 for tokens and the PIN. |
 | `app_update`, `bootloader_support` | Firmware updates with rollback. |
 | `esp_sntp` | Wall-clock time for the paired-client list. |
@@ -238,8 +240,9 @@ ESP-IDF components used:
 ### 6.2 Tasks and ownership
 
 The firmware runs three tasks of its own, and each piece of state has
-exactly one owner. No mutexes guard shared state, because no state is
-shared.
+exactly one owner. Only three small things are shared between tasks, each
+behind a lock held for a few instructions: the HTTP server's table of
+session slots, the cached `/dspi/v1/info` document, and the Wi-Fi status.
 
 ```
                 +-----------------------------+
@@ -267,9 +270,14 @@ shared.
 - **The uart task owns the UART.** It takes one request at a time from its
   queue, runs it to completion and posts the result back. It also reads
   notifications between requests and probes for the device.
-- **The HTTP task belongs to ESP-IDF.** Handlers on it only parse input and
+- **The HTTP task belongs to ESP-IDF.** Handlers on it only copy input and
   post events to the hub task; they never touch hub state. Outbound frames
-  go through `httpd_ws_send_frame_async`.
+  go through `httpd_ws_send_data_async`, whose completion callback frees
+  each frame and counts it off the session's queue (section 8.2).
+- **A session's slot is reused only once the hub has seen it close.** The
+  HTTP server marks a slot closing when its socket closes, and frees it
+  when the hub task has handled the close. A new connection can therefore
+  never receive frames the hub meant for the old one.
 - **Wi-Fi, the button and the LED** run from ESP-IDF event callbacks and a
   timer. They post events to the hub task or call the `net` module's
   functions, which are safe to call from any task.
@@ -295,11 +303,11 @@ bridge/esp32/
     app_main.c              Boot order only (section 6.5); no logic
   components/
     bridge_config/          Every tunable constant, with units, in one header
-    link_codec/             Link binary frames and JSON messages      [portable]
+    link_codec/             Link binary frames and base64             [portable]
     link_policy/            Authorization table generated from policy/commands.json [portable]
     dspi_frame/             DSPi UART frame encoder, parser and CRC   [portable]
     dspi_uart/              The link engine [portable] and the uart task around it
-    hub/                    The hub task's state machine              [portable core]
+    hub/                    The hub state machine [portable] and the hub task around it
     hub_auth/               PIN and token hashing, rate limits        [portable]
     http_server/            Ports 11915 and 80, WebSocket glue, static files
     setup_api/              The setup network's HTTP API (section 9.3)
@@ -313,8 +321,11 @@ bridge/esp32/
   test/
     host/                   Host tests for the [portable] components, with a simulated DSPi
   tools/
-    gen_policy.py           policy/commands.json -> link_policy C table
-    embed_web.py            js/apps/web/dist -> web_assets C sources (gzipped)
+    build.sh                Builds each chip in Espressif's Docker image
+    qemu_smoke.sh           Boots a built image twice in QEMU
+    gen_policy.py           policy/commands.json -> link_policy C table (committed)
+    embed_web.py            js/apps/web/dist -> web_assets C source at build time
+    link_smoke.mjs          Drives a live bridge end to end with dspi-link-js
 ```
 
 Components marked `[portable]` include no ESP-IDF headers. They take time,
@@ -326,13 +337,13 @@ the same source compiles into the firmware and into the host tests.
 | Component | Responsibility | Depends on |
 |-----------|----------------|------------|
 | `bridge_config` | Named constants: timeouts, queue depths, limits, retry counts. | nothing |
-| `link_codec` | Encodes and decodes Link frames (Link spec 8) and JSON messages (Link spec 7). | cJSON |
+| `link_codec` | Encodes and decodes Link binary frames (Link spec 8), and base64 for the `_b64` fields. | nothing |
 | `link_policy` | `link_policy_class(bRequest, dir)`, generated from `policy/commands.json` with the spec version it came from. Unknown codes are `config`. | nothing |
 | `dspi_frame` | Builds DSPi UART requests and parses responses and notifications byte by byte (firmware spec 3). | nothing |
 | `dspi_uart` | The link engine (`dspi_link.c`, portable): one request at a time, the idle gap, retries, recovery after timeouts, baud detection and the device's identity. The uart task (`dspi_uart.c`) runs it on the real UART and reports the device found or lost. | `dspi_frame` |
-| `hub` | The hub task: sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration. | `link_codec`, `link_policy`, `hub_auth` |
+| `hub` | The hub state machine (portable): sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration, with JSON through cJSON. The hub task (`hub_task.c`) runs it and connects it to the HTTP server, the uart task, flash and mDNS. | `link_codec`, `link_policy`, `hub_auth`, cJSON |
 | `hub_auth` | PIN hashing and checking, token creation and hashing, rate limits. | mbedtls (behind an interface) |
-| `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, turns frames into hub events and back. | `hub`, `web_assets`, `setup_api` |
+| `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, and hands frames to its caller through callbacks, so it does not depend on the hub. | `web_assets`, `setup_api` |
 | `setup_api` | The setup network's endpoints, answering only on the setup network. | `net`, `settings`, `hub` |
 | `net` | Wi-Fi states (section 9.1), setup network, captive DNS, mDNS records, SNTP. | `settings`, `board` |
 | `settings` | Reads and writes every saved value through typed functions, with defaults and a schema version. | `nvs_flash` |
@@ -351,11 +362,12 @@ step:
 2. Load settings (`settings`). On first boot, generate the hub id (UUID v4
    from the hardware random number generator) and default name.
 3. Start the status LED and the button watcher.
-4. Start the hub task, then the uart task with the saved pins and baud rate.
-5. Start networking (`net`): station mode if a home network is saved,
-   otherwise the setup network.
-6. Start the HTTP servers.
-7. If this image is new, start the rollback confirmation timer (section 14.2).
+4. Start networking (`net`): station mode if a home network is saved,
+   otherwise the setup network. mDNS starts here, so the hub has somewhere
+   to advertise from its first moment.
+5. Start the hub task, which starts the uart task with the saved pins and
+   baud rate and then the HTTP servers that feed it.
+6. If this image is new, start the rollback confirmation timer (section 14.2).
 
 ---
 
@@ -1006,7 +1018,8 @@ C and TypeScript alike.
 | Host link tests | The UART link engine against a simulated DSPi on a virtual clock: timeouts, late and corrupt answers, retries, the idle gap, notifications while waiting, baud detection and identity. | `bridge/esp32/test/host`, run in CI |
 | Host hub tests | The `hub` state machine driven by scripted sessions and a simulated DSPi, with a fake clock: ordering, `max_inflight`, origin attribution, poll fan-out and stop, locks, offline and swap, RESYNC, auth modes and revocation. | `bridge/esp32/test/host`, run in CI |
 | Build checks | Firmware for all four chips, image size under 1.5 MB, web build, generated files up to date. | CI |
-| Bench with a DSPi | A real bridge and DSPi on each of the four chips, driven by the `dspi-link-js` test suite pointed at the bridge, and by DSPi Console. Walks the Link spec 12 conformance checklist and the setup journey of section 3 on an iPhone and an Android phone. | Manual, before each release |
+| Boot in QEMU | `tools/qemu_smoke.sh` boots the ESP32, ESP32-S3 and ESP32-C3 images twice and checks that the settings survive and nothing crashes. | CI |
+| Bench with a DSPi | A real bridge and DSPi on each of the four chips, driven by `tools/link_smoke.mjs` (the `dspi-link-js` client against the live bridge) and by DSPi Console. Walks the Link spec 12 conformance checklist and the setup journey of section 3 on an iPhone and an Android phone. | Manual, before each release |
 
 ---
 

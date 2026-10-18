@@ -2,9 +2,8 @@
  * app_main.c - the bridge's boot sequence, and nothing else.
  *
  * Implements bridge spec 6.5. Each step starts one component; the
- * components hold all behaviour. Steps 3 and 5 to 7 (LED and button,
- * networking, HTTP servers, rollback timer) join as phases 3 to 6 of
- * bridge/esp32/PLAN.md add their components.
+ * components hold all behaviour. The LED and button (step 3) and the
+ * rollback timer (step 6) join in phase 6 of bridge/esp32/PLAN.md.
  */
 
 #include <inttypes.h>
@@ -14,7 +13,8 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_log.h"
-#include "phase2_bench.h"
+#include "hub_task.h"
+#include "net.h"
 #include "settings.h"
 
 static const char *TAG = "bridge";
@@ -51,10 +51,12 @@ void app_main(void)
     /* 2. Load the settings. First boot creates the hub id and names. */
     bridge_settings_t settings;
     ESP_ERROR_CHECK(settings_load(&settings));
-
     log_startup_summary(&settings);
 
-    /* 4. Start the uart task. Until the hub arrives in phase 3, the
-     *    temporary bench drives it and logs what it finds. */
-    ESP_ERROR_CHECK(phase2_bench_start(&settings));
+    /* 4. Join Wi-Fi and start mDNS, so the hub has somewhere to advertise. */
+    ESP_ERROR_CHECK(net_start(settings.hostname));
+
+    /* 5. Start the hub task, which starts the uart task and the HTTP
+     *    servers that feed it. */
+    ESP_ERROR_CHECK(hub_task_start(&settings));
 }

@@ -1,0 +1,8 @@
+# cJSON for the JSON control plane (Link spec 7). ESP-IDF 6 ships it from the
+# component registry rather than in the framework. Public, because hub_io.h
+# exposes cJSON to the hub task. Pinned exactly, so every build of a release
+# uses the same code; the host tests fetch the same cJSON release.
+dependencies:
+  espressif/cjson:
+    version: "==1.7.19~2"
+    public: true

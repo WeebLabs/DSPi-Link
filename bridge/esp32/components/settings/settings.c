@@ -8,10 +8,12 @@
 
 #include "settings.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "board.h"
 #include "bootloader_random.h"
+#include "bridge_config.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -246,6 +248,95 @@ esp_err_t settings_save(const bridge_settings_t *settings)
         return err;
     }
     err = write_all(nvs, settings);
+    nvs_close(nvs);
+    return err;
+}
+
+/* ---------------------------------------------------------------------------
+ * Device names (namespace `devices`)
+ * ------------------------------------------------------------------------- */
+
+#define DEVICES_NAMESPACE "devices"
+#define KEY_DEVICE_NAMES "names"
+
+/* One saved name. The list is kept most recently used first. */
+typedef struct {
+    char serial[17];
+    char name[SETTINGS_NAME_MAX_BYTES + 1];
+} saved_device_name_t;
+
+/* Reads the whole list; a missing list is an empty one. */
+static esp_err_t read_device_names(nvs_handle_t nvs, saved_device_name_t *names, size_t *count)
+{
+    size_t bytes = sizeof(saved_device_name_t) * LINK_MAX_DEVICE_NAMES;
+    const esp_err_t err = nvs_get_blob(nvs, KEY_DEVICE_NAMES, names, &bytes);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        *count = 0;
+        return ESP_OK;
+    }
+    *count = bytes / sizeof(saved_device_name_t);
+    return err;
+}
+
+esp_err_t settings_load_device_name(const char *serial, char *name, size_t size)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(DEVICES_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND; /* Nothing has ever been saved */
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    saved_device_name_t names[LINK_MAX_DEVICE_NAMES];
+    size_t count = 0;
+    err = read_device_names(nvs, names, &count);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (strncmp(names[i].serial, serial, sizeof(names[i].serial)) == 0) {
+            snprintf(name, size, "%s", names[i].name);
+            return ESP_OK;
+        }
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t settings_save_device_name(const char *serial, const char *name)
+{
+    if (!settings_name_is_valid(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(DEVICES_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    saved_device_name_t names[LINK_MAX_DEVICE_NAMES];
+    size_t count = 0;
+    err = read_device_names(nvs, names, &count);
+    if (err == ESP_OK) {
+        /* Put this device first; drop its old entry, and the last entry if
+         * the list is full. */
+        saved_device_name_t updated[LINK_MAX_DEVICE_NAMES];
+        memset(updated, 0, sizeof(updated));
+        snprintf(updated[0].serial, sizeof(updated[0].serial), "%s", serial);
+        snprintf(updated[0].name, sizeof(updated[0].name), "%s", name);
+        size_t kept = 1;
+        for (size_t i = 0; i < count && kept < LINK_MAX_DEVICE_NAMES; i++) {
+            if (strncmp(names[i].serial, serial, sizeof(names[i].serial)) != 0) {
+                updated[kept++] = names[i];
+            }
+        }
+        err = nvs_set_blob(nvs, KEY_DEVICE_NAMES, updated, kept * sizeof(saved_device_name_t));
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
     nvs_close(nvs);
     return err;
 }

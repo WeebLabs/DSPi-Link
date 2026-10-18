@@ -1,8 +1,8 @@
 /*
  * settings.h - loads and saves the bridge's settings in flash (NVS).
  *
- * Implements bridge spec 11 for the `bridge` namespace; the `wifi`, `auth`
- * and `devices` namespaces join it in later phases. This is the only module
+ * Implements bridge spec 11 for the `bridge` and `devices` namespaces; the
+ * `wifi` and `auth` namespaces join them in later phases. This is the only module
  * that touches NVS. Call settings_init() once at boot before anything else
  * uses flash storage. The load and save functions may be called from any
  * task, because NVS serialises access itself; in practice the hub task is
@@ -33,5 +33,17 @@ esp_err_t settings_load(bridge_settings_t *out);
 
 /* Saves `settings`, which must pass settings_model_find_problem(). */
 esp_err_t settings_save(const bridge_settings_t *settings);
+
+/*
+ * Device names, saved by serial in the `devices` namespace (bridge spec
+ * 8.7 and 11). Up to LINK_MAX_DEVICE_NAMES are kept; saving a new one when
+ * full replaces the name used least recently.
+ */
+
+/* Copies the saved name for `serial` into `name`. ESP_ERR_NOT_FOUND if
+ * there is none. */
+esp_err_t settings_load_device_name(const char *serial, char *name, size_t size);
+
+esp_err_t settings_save_device_name(const char *serial, const char *name);
 
 #endif /* SETTINGS_H */

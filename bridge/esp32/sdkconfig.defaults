@@ -14,6 +14,15 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # Optimise for size: the image must stay under 1.5 MB (bridge spec 14.1).
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
+# The Link WebSocket (bridge spec 8.2) needs the HTTP server's WebSocket
+# support, its handshake hooks (before: so a full bridge can answer 503;
+# after: where a session begins), and enough sockets for 8 sessions plus
+# page loads.
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
+CONFIG_LWIP_MAX_SOCKETS=16
+
 # A 1 ms scheduler tick, so the UART link's 2 ms idle gap and 5 ms listen
 # slice are real (bridge spec 7.2). The default 10 ms tick would round them
 # away.
