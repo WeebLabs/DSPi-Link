@@ -6,11 +6,13 @@ that DSPi over the network. What it does and why is in
 [`spec/esp32_bridge_spec.md`](../../spec/esp32_bridge_spec.md); the build
 order is in [`PLAN.md`](PLAN.md).
 
-**Status:** phase 4 of 8. The bridge is a working Link hub that sets itself
+**Status:** phase 5 of 8. The bridge is a working Link hub that sets itself
 up: on first power-up it shows the setup network `DSPi Bridge XXXX`, a phone
 that joins it gets the setup page by itself, and from there the bridge joins
 the home network, advertises itself by DNS-SD, and serves DSPi Console and
-the web client with the `auth: none` default.
+the web client. Access is open by default; an optional PIN protects both.
+Its settings page, inside the web client, changes the DSPi connection,
+Wi-Fi, PIN, name and hostname, and restarts or resets the bridge.
 
 Supported chips: ESP32, ESP32-S3, ESP32-C3 and ESP32-C6, with at least 4 MB
 of flash.
@@ -63,9 +65,13 @@ python3 -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 erase-flash
 On first power-up the bridge shows an open Wi-Fi network named
 `DSPi Bridge XXXX`. Join it from a phone and the setup page opens by itself;
 if it does not, browse to `http://192.168.4.1/`. Choose your 2.4 GHz home
-network, enter its password and a name, and the page shows the bridge's
-address once it has joined. If the home network disappears for 3 minutes,
-the setup network comes back by itself.
+network, enter its password and a name, and choose whether to protect the
+bridge with a PIN. The page shows the bridge's address once it has joined.
+If the home network disappears for 3 minutes, the setup network comes back
+by itself.
+
+Everything else is on the settings page: open the bridge's address, connect,
+and choose **Bridge settings**.
 
 ## Test
 
@@ -124,7 +130,8 @@ python3 tools/gen_policy.py
 | `components/dspi_uart/` | The link engine and the uart task that owns the UART. |
 | `components/link_policy/` | Which role may send which command, generated from `policy/commands.json`. |
 | `components/link_codec/` | Link binary frames and base64. |
-| `components/hub/` | The Link hub state machine, and the hub task that runs it. |
+| `components/hub/` | The Link hub state machine, its administration messages and configuration keys, and the hub task that runs it. |
+| `components/hub_auth/` | The PIN, paired clients' tokens and the pairing rate limits. |
 | `components/http_server/` | The Link WebSocket, the info endpoint, the web pages and the port 80 redirect. |
 | `components/net/` | The Wi-Fi state machine, the setup network and its DNS answers, and the DNS-SD advertisement. |
 | `components/web_assets/` | The built web pages, gzipped into the firmware at build time. |

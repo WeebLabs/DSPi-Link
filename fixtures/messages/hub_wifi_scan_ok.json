@@ -1,0 +1,26 @@
+{
+  "current" : {
+    "ip" : "192.168.1.40",
+    "rssi" : -50,
+    "ssid" : "Home"
+  },
+  "id" : 22,
+  "networks" : [
+    {
+      "rssi" : -52,
+      "secure" : true,
+      "ssid" : "Home"
+    },
+    {
+      "rssi" : -71,
+      "secure" : true,
+      "ssid" : "Studio"
+    },
+    {
+      "rssi" : -80,
+      "secure" : false,
+      "ssid" : "Cafe"
+    }
+  ],
+  "t" : "ok"
+}

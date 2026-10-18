@@ -66,10 +66,36 @@ static uint32_t now_ms(void *context)
     return fake->now_ms;
 }
 
-static void save_hub_name(void *context, const char *name)
+static void apply_settings(void *context, const bridge_settings_t *settings)
 {
     fake_hub_io_t *fake = context;
-    snprintf(fake->saved_hub_name, sizeof(fake->saved_hub_name), "%s", name);
+    fake->applied = *settings;
+    fake->apply_count++;
+}
+
+static void start_wifi_scan(void *context, int slot, uint16_t session_id, int request_id)
+{
+    fake_hub_io_t *fake = context;
+    fake->scan_slot = slot;
+    fake->scan_session = session_id;
+    fake->scan_request = request_id;
+}
+
+static bool wifi_join(void *context, const char *ssid, const char *password)
+{
+    fake_hub_io_t *fake = context;
+    (void)password;
+    if (fake->refuse_join) {
+        return false;
+    }
+    snprintf(fake->joined_ssid, sizeof(fake->joined_ssid), "%s", ssid);
+    return true;
+}
+
+static void restart(void *context, hub_restart_level_t level)
+{
+    fake_hub_io_t *fake = context;
+    fake->restart_level = (int)level;
 }
 
 static void save_device_name(void *context, const char *serial, const char *name)
@@ -99,6 +125,8 @@ hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
 {
     memset(fake, 0, sizeof(*fake));
     fake->now_ms = 5000;
+    fake->scan_slot = -1;
+    fake->restart_level = -1;
     return (hub_io_t){
         .context = fake,
         .send_text = send_text,
@@ -107,7 +135,10 @@ hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
         .close = close_slot,
         .submit = submit,
         .now_ms = now_ms,
-        .save_hub_name = save_hub_name,
+        .apply_settings = apply_settings,
+        .start_wifi_scan = start_wifi_scan,
+        .wifi_join = wifi_join,
+        .restart = restart,
         .save_device_name = save_device_name,
         .load_device_name = load_device_name,
         .advertise = advertise,

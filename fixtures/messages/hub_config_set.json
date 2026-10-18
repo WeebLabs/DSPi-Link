@@ -1,0 +1,9 @@
+{
+  "config" : {
+    "uart" : {
+      "baud" : 921600
+    }
+  },
+  "id" : 21,
+  "t" : "hub.config.set"
+}

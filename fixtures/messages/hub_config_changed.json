@@ -1,0 +1,17 @@
+{
+  "config" : {
+    "hostname" : "dspi-bridge-3f2a",
+    "led" : {
+      "pin" : null,
+      "type" : "none"
+    },
+    "name" : "DSPi Bridge 3F2A",
+    "uart" : {
+      "baud" : 921600,
+      "detect_baud" : true,
+      "rx_pin" : 18,
+      "tx_pin" : 17
+    }
+  },
+  "t" : "hub.config.changed"
+}

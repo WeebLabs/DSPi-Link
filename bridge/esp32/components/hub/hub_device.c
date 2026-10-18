@@ -180,6 +180,15 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
         broadcast_device(hub, "device.added");
     }
     hub->io.advertise(hub->io.context);
+
+    if (baud != hub->config.settings.uart_baud) {
+        /* Detection found the DSPi at another rate: keep it, so the next
+         * start begins there, and show it to the settings page (bridge spec
+         * 8.11). The UART already runs at this rate and stays as it is. */
+        bridge_settings_t settings = hub->config.settings;
+        settings.uart_baud = baud;
+        hub_apply_settings(hub, &settings);
+    }
     hub->snapshot.valid = false;
     start_snapshot_refresh(hub);
 }

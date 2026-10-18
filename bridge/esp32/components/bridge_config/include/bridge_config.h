@@ -81,9 +81,12 @@
 #define AUTH_PIN_DIGITS 6
 #define AUTH_PIN_SALT_BYTES 16
 
-/* Slows guessing from a copy of the flash; about 0.1 s per check on an
- * ESP32 with hardware SHA. */
-#define AUTH_PIN_PBKDF2_ITERATIONS 10000
+/* The PIN's hash keeps it from being read straight out of a copy of the
+ * flash. With only a million possible PINs no round count stops an offline
+ * search, so the rate limits below are the real defence, and the count is
+ * kept low: each check runs on the hub task, and 10,000 rounds took 1.5 s on
+ * an ESP32-S3, holding up every session. 1,000 take about 150 ms. */
+#define AUTH_PIN_PBKDF2_ITERATIONS 1000
 
 #define AUTH_TOKEN_BYTES 32
 #define AUTH_MAX_PAIRED_CLIENTS 16

@@ -1,0 +1,6 @@
+{
+  "id" : 24,
+  "mode" : "pin",
+  "pin" : "482913",
+  "t" : "hub.auth.set"
+}

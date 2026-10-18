@@ -1,0 +1,21 @@
+{
+  "clients" : [
+    {
+      "cid" : 1,
+      "created" : "2026-10-18T22:35:20Z",
+      "last_seen" : "2026-10-18T23:02:11Z",
+      "name" : "Studio Mac",
+      "online" : true,
+      "role" : "admin"
+    },
+    {
+      "cid" : 2,
+      "created" : "2026-10-18T22:40:03Z",
+      "name" : "Living Room iPad",
+      "online" : false,
+      "role" : "admin"
+    }
+  ],
+  "id" : 30,
+  "t" : "ok"
+}

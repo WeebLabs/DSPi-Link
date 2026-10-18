@@ -19,12 +19,16 @@ import {
   statusName,
 } from "./frames.js";
 import {
+  type AuthClientInfo,
   type AuthPairMessage,
   type AuthTokenMessage,
   type DeviceInfo,
   type ErrMessage,
   type HelloHubMessage,
+  type HubConfig,
+  type HubConfigChangedMessage,
   type HubLimits,
+  type HubResetLevel,
   type LinkCapability,
   type LinkErrorCode,
   type LinkMessage,
@@ -33,6 +37,8 @@ import {
   type PollGrant,
   type PollRequest,
   type PolicyDescriptor,
+  type WifiCurrent,
+  type WifiNetwork,
   decode as decodeMessage,
   encode as encodeMessage,
 } from "./messages.js";
@@ -146,12 +152,35 @@ export interface SnapshotResult {
 /** A control-plane `err` reply turned into a rejection. */
 export class LinkProtocolError extends Error {
   readonly code: LinkErrorCode;
-  constructor(code: LinkErrorCode, message?: string) {
+  /** The hub's own sentence, when it gave one. */
+  readonly detail?: string;
+  /** For a rejected hub.config.set: the offending key, as "uart.tx_pin". */
+  readonly field?: string;
+  constructor(code: LinkErrorCode, message?: string, field?: string) {
     super(message ? `${code}: ${message}` : code);
     this.name = "LinkProtocolError";
     this.code = code;
+    this.detail = message;
+    this.field = field;
   }
 }
+
+/** The reply to hub.config.get (spec 7.10). */
+export interface HubConfigResult {
+  config: HubConfig;
+  /** The permitted values of keys that come from a fixed set. */
+  options: HubConfig;
+}
+
+/** The reply to hub.wifi.scan (spec 7.11). */
+export interface WifiScanResult {
+  current: WifiCurrent | null;
+  networks: WifiNetwork[];
+}
+
+/** A Wi-Fi scan takes a few seconds and the hub answers within 10 s, so
+ * this leaves room for the round trip on top. */
+const WIFI_SCAN_TIMEOUT_MS = 15000;
 
 /** A CMD response whose status was not OK, for callers that want a throw. */
 export class LinkCommandError extends Error {
@@ -172,6 +201,8 @@ export interface LinkClientEventMap {
   poll: PollFrame;
   resync: ResyncFrame;
   message: LinkMessage;
+  /** The hub's configuration changed, by this session or another (spec 7.10). */
+  hubConfig: HubConfig;
   error: Error;
   close: LinkCloseInfo;
 }
@@ -390,11 +421,11 @@ export class LinkClient {
     this.setState("handshaking");
     this.send({
       t: "hello",
-      proto: { major: 1, minor: 1 },
+      proto: { major: 1, minor: 2 },
       client: {
         name: this.connectOptions.clientName,
         app: this.connectOptions.app ?? "dspi-link-js",
-        version: this.connectOptions.version ?? "1.1.0",
+        version: this.connectOptions.version ?? "1.2.0",
       },
     });
   }
@@ -489,6 +520,11 @@ export class LinkClient {
           this.pollSubscriptions.delete(handle);
           this.emit("devices", this.deviceList);
         }
+        return;
+      }
+      case "hub.config.changed": {
+        const config = (msg as HubConfigChangedMessage).config;
+        if (config) this.emit("hubConfig", config);
         return;
       }
       default:
@@ -731,10 +767,92 @@ export class LinkClient {
     await this.request({ t: "device.rename", id: 0, handle, name });
   }
 
+  // -- hub administration (admin role; spec 7.9 to 7.13) -------------------
+  //
+  // Each group needs its capability in the hub's hello (hasCap): "rename",
+  // "hub_config", "wifi", "auth_config" and "reset".
+
+  async renameHub(name: string): Promise<void> {
+    await this.request({ t: "hub.rename", id: 0, name });
+  }
+
+  /** The hub's counters. The bridge adds fields of its own. */
+  hubStats(): Promise<OkMessage> {
+    return this.request({ t: "hub.stats", id: 0 });
+  }
+
+  async getHubConfig(): Promise<HubConfigResult> {
+    const ok = await this.request({ t: "hub.config.get", id: 0 });
+    return { config: ok.config ?? {}, options: ok.options ?? {} };
+  }
+
+  /**
+   * Changes only the keys in `change`; nested objects merge. Resolves to the
+   * whole configuration after the change. A rejected value rejects with a
+   * LinkProtocolError whose `field` names the key.
+   */
+  async setHubConfig(change: HubConfig): Promise<HubConfig> {
+    const ok = await this.request({ t: "hub.config.set", id: 0, config: change });
+    return ok.config ?? {};
+  }
+
+  /** Nearby networks, strongest first, and the one the hub is on. */
+  async scanWifi(): Promise<WifiScanResult> {
+    const ok = await this.request({ t: "hub.wifi.scan", id: 0 }, WIFI_SCAN_TIMEOUT_MS);
+    return { current: ok.current ?? null, networks: ok.networks ?? [] };
+  }
+
+  /**
+   * Asks the hub to move to another network. Resolving means the hub took the
+   * request, not that the join worked: the hub then closes every session
+   * (code 4003) and either joins or goes back to its old network.
+   */
+  async joinWifi(ssid: string, password: string): Promise<void> {
+    await this.request({ t: "hub.wifi.join", id: 0, ssid, password });
+  }
+
+  /**
+   * Turns on a fixed PIN (a 6-digit `pin`), window PINs (`pin` left out), or
+   * open access (`mode` "none"). Every token is revoked; this session stays
+   * open and, in pin mode, gets a fresh token, which is returned and kept
+   * here for reconnecting. Store it as connect() would.
+   */
+  async setAuth(mode: "none" | "pin", pin?: string): Promise<string | null> {
+    const msg: Record<string, unknown> = { t: "hub.auth.set", id: 0, mode };
+    if (pin !== undefined) msg.pin = pin;
+    const ok = await this.request(msg);
+    this._token = typeof ok.token === "string" ? ok.token : null;
+    return this._token;
+  }
+
+  /** The paired clients, for a hub in pin mode (spec 6.2). */
+  async listClients(): Promise<AuthClientInfo[]> {
+    const ok = await this.request({ t: "auth.list", id: 0 });
+    return ok.clients ?? [];
+  }
+
+  /** Revokes one client's token; its live sessions close with code 4002. */
+  async revokeClient(cid: number): Promise<void> {
+    await this.request({ t: "auth.revoke", id: 0, cid });
+  }
+
+  /** The hub replies ok, then closes every session (4003) and restarts. */
+  async restartHub(): Promise<void> {
+    await this.request({ t: "hub.restart", id: 0 });
+  }
+
+  /** Erases the network connection only, or all hub state, then restarts. */
+  async resetHub(level: HubResetLevel): Promise<void> {
+    await this.request({ t: "hub.reset", id: 0, level });
+  }
+
   // -- plumbing -------------------------------------------------------------
 
   /** Send a request and wait for its ok/err. `id` is assigned here. */
-  request<T extends LinkMessage = LinkMessage>(msg: T | Record<string, unknown>): Promise<OkMessage> {
+  request<T extends LinkMessage = LinkMessage>(
+    msg: T | Record<string, unknown>,
+    timeoutMs = this.options.requestTimeoutMs,
+  ): Promise<OkMessage> {
     const ws = this.requireSocket();
     const id = this.nextId++;
     if (this.nextId > 0x7fffffff) this.nextId = 1;
@@ -743,7 +861,7 @@ export class LinkClient {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
         reject(new Error(`request ${String((msg as { t: string }).t)} timed out`));
-      }, this.options.requestTimeoutMs);
+      }, timeoutMs);
       this.pendingRequests.set(id, { resolve, reject, timer });
       try {
         ws.send(encodeMessage(framed));
@@ -763,7 +881,10 @@ export class LinkClient {
     this.pendingRequests.delete(id);
     clearTimeout(pending.timer);
     if (msg.t === "ok") pending.resolve(msg as OkMessage);
-    else pending.reject(new LinkProtocolError((msg as ErrMessage).code, (msg as ErrMessage).msg));
+    else {
+      const err = msg as ErrMessage;
+      pending.reject(new LinkProtocolError(err.code, err.msg, err.field));
+    }
   }
 
   private send(msg: LinkMessage): void {

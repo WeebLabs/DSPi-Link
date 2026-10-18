@@ -46,7 +46,14 @@ typedef struct {
     uint16_t close_code[HUB_MAX_SESSIONS]; /* 0 until closed */
     unsigned pings[HUB_MAX_SESSIONS];
 
-    char saved_hub_name[64];
+    bridge_settings_t applied; /* The last settings passed to apply_settings */
+    unsigned apply_count;
+    int scan_slot; /* The last start_wifi_scan, -1 if none */
+    uint16_t scan_session;
+    int scan_request;
+    char joined_ssid[33];
+    bool refuse_join;
+    int restart_level; /* -1 until restart is called */
     char saved_device_serial[17];
     char saved_device_name[64];
     unsigned advertise_count;

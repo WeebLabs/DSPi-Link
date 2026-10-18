@@ -5,18 +5,24 @@
  *   welcome     -> what the bridge found, and a Get started button
  *   network     -> nearby networks, or a name typed by hand
  *   password    -> the chosen network's password
- *   name        -> the bridge's name
+ *   name        -> the bridge's name, and whether it asks for a PIN
  *   connecting  -> polls the bridge until the join works or fails
  *   done        -> the bridge's new address, and Finish
  *
  * One `flow` object holds everything the page knows, and render() draws the
  * current step from it. Every action changes `flow` and calls render().
- * The PIN step of bridge spec 10.2 joins between name and connecting in
- * phase 5.
  */
 
 import "./setup.css";
 import { clear, el } from "../dom.js";
+import {
+  digitsOnly,
+  PIN_LENGTH,
+  PIN_REMINDER,
+  PIN_SWITCH_HELP,
+  PIN_SWITCH_LABEL,
+  pinIsValid,
+} from "../pin.js";
 import {
   apply,
   finish,
@@ -24,6 +30,7 @@ import {
   getState,
   SetupError,
   type Network,
+  type PinChange,
   type SetupState,
 } from "./api.js";
 
@@ -58,6 +65,13 @@ const flow = {
   password: "",
   showPassword: false,
   name: "",
+  // The PIN (bridge spec 10.2). `currentPin` is asked for only when the
+  // bridge already has one, as after "Forget Wi-Fi".
+  pinEnabled: false,
+  pin: "",
+  pinConfirm: "",
+  currentPin: "",
+  pinAfterApply: "", // The bridge's PIN once apply has worked, for finish
   error: null as string | null,
   finished: false,
 };
@@ -337,29 +351,167 @@ function passwordStep(): HTMLElement[] {
   );
 }
 
+/** A 6-digit PIN field. `onInput` runs after each change to `value`. */
+function pinField(
+  id: string,
+  label: string,
+  value: string,
+  onInput: (value: string) => void,
+): HTMLElement {
+  const input = el("input", {
+    type: "password",
+    id,
+    value,
+    inputMode: "numeric",
+    pattern: "[0-9]*",
+    autocomplete: "off",
+    maxLength: PIN_LENGTH,
+    oninput: (event: Event) => {
+      const field = event.target as HTMLInputElement;
+      field.value = digitsOnly(field.value);
+      onInput(field.value);
+    },
+  });
+  return el(
+    "div",
+    { class: "field" },
+    el("label", { for: id, text: label }),
+    el("div", { class: "pin-input" }, input),
+  );
+}
+
+/** The switch that turns the PIN on and off, with the wording that says
+ * what it protects. */
+function pinSwitch(): HTMLElement {
+  const input = el("input", {
+    type: "checkbox",
+    id: "pin-switch",
+    role: "switch",
+    checked: flow.pinEnabled,
+    "aria-describedby": "pin-switch-help",
+    onchange: (event: Event) => {
+      flow.pinEnabled = (event.target as HTMLInputElement).checked;
+      render();
+      document.getElementById("pin-switch")?.focus();
+    },
+  });
+  return el(
+    "div",
+    { class: "switch-row" },
+    el(
+      "label",
+      { class: "switch", for: "pin-switch" },
+      el("span", { text: PIN_SWITCH_LABEL }),
+      input,
+    ),
+    el("p", { class: "dim small", id: "pin-switch-help", text: PIN_SWITCH_HELP }),
+  );
+}
+
+/** Whether the bridge has a PIN now, before this setup changes anything. */
+function bridgeHasPin(): boolean {
+  return flow.state?.pin_required ?? false;
+}
+
+/** With a PIN already set and the switch left on, an empty new PIN keeps it. */
+function keepingCurrentPin(): boolean {
+  return bridgeHasPin() && flow.pinEnabled && flow.pin === "" && flow.pinConfirm === "";
+}
+
+/** Why the name step cannot go on yet, or null when it can. */
+function nameStepProblem(): string | null {
+  if (flow.name.trim() === "") {
+    return "Give the bridge a name.";
+  }
+  if (bridgeHasPin() && !pinIsValid(flow.currentPin)) {
+    return "Enter the bridge's current PIN.";
+  }
+  if (!flow.pinEnabled || keepingCurrentPin()) {
+    return null;
+  }
+  if (!pinIsValid(flow.pin)) {
+    return "Choose a PIN of 6 digits.";
+  }
+  if (flow.pinConfirm !== flow.pin) {
+    return flow.pinConfirm.length === PIN_LENGTH
+      ? "The two PINs don't match."
+      : "Enter the PIN again.";
+  }
+  return null;
+}
+
 function nameStep(): HTMLElement[] {
-  const field = el("input", {
+  // The fields update the Connect button and the hint as they change, without
+  // redrawing the step, so typing never loses focus.
+  const hint = el("p", { class: "dim small", role: "status" });
+  const update = (): void => {
+    const problem = nameStepProblem();
+    connectButton.disabled = problem !== null;
+    // Only the mismatch is worth saying out loud; the rest is plain from
+    // the empty fields.
+    hint.textContent = problem === "The two PINs don't match." ? problem : "";
+  };
+  const nameInput = el("input", {
     type: "text",
     id: "name",
     value: flow.name,
     maxLength: 63,
     oninput: (event: Event) => {
       flow.name = (event.target as HTMLInputElement).value;
-      connectButton.disabled = flow.name.trim() === "";
+      update();
     },
   });
-  const connectButton = button("Connect", () => connect(), {
-    primary: true,
-    disabled: flow.name.trim() === "",
-  });
+  const connectButton = button("Connect", () => connect(), { primary: true });
+
+  const currentPin = bridgeHasPin()
+    ? el(
+        "div",
+        {},
+        el("p", {
+          class: "dim small",
+          text: "This bridge already has a PIN. Enter it to change the bridge's settings.",
+        }),
+        pinField("current-pin", "Current PIN", flow.currentPin, (value) => {
+          flow.currentPin = value;
+          update();
+        }),
+      )
+    : null;
+
+  const newPin = flow.pinEnabled
+    ? el(
+        "div",
+        { class: "pin-fields" },
+        pinField("pin", bridgeHasPin() ? "New PIN" : "PIN", flow.pin, (value) => {
+          flow.pin = value;
+          update();
+        }),
+        pinField("pin-confirm", "Enter the PIN again", flow.pinConfirm, (value) => {
+          flow.pinConfirm = value;
+          update();
+        }),
+        bridgeHasPin()
+          ? el("p", { class: "dim small", text: "Leave these empty to keep the current PIN." })
+          : null,
+        el("p", { class: "small", text: PIN_REMINDER }),
+      )
+    : null;
+
+  update();
   return present(
-    el("h1", { text: "Name your bridge" }),
+    el("h1", { text: "Name and security" }),
+    el("div", { class: "field" }, el("label", { for: "name", text: "Bridge name" }), nameInput),
     el("p", {
-      class: "dim",
+      class: "dim small",
       text: "DSPi Console and other apps show this name. You can change it later.",
     }),
+    currentPin,
+    pinSwitch(),
+    newPin,
+    hint,
+    // This step is long on a phone, so a refusal (a wrong PIN, say) shows by
+    // the button that caused it rather than out of sight at the top.
     errorStatus(),
-    el("div", { class: "field" }, el("label", { for: "name", text: "Bridge name" }), field),
     connectButton,
     button("Back", () => goTo(flow.secure ? "password" : "network")),
   );
@@ -481,9 +633,33 @@ function passwordLooksValid(): boolean {
   return flow.secure ? length >= 8 && length <= 64 : length === 0 || length >= 8;
 }
 
+/** What the name step asks `apply` to do to the PIN. */
+function pinChange(): PinChange {
+  const change: PinChange = {};
+  if (bridgeHasPin()) {
+    change.current_pin = flow.currentPin;
+  }
+  if (!flow.pinEnabled) {
+    change.pin_enabled = false;
+  } else if (!keepingCurrentPin()) {
+    change.pin_enabled = true;
+    change.pin = flow.pin;
+  }
+  return change;
+}
+
+/** The PIN the bridge will have once `apply` has worked. */
+function pinOnceApplied(): string {
+  if (!flow.pinEnabled) {
+    return "";
+  }
+  return keepingCurrentPin() ? flow.currentPin : flow.pin;
+}
+
 async function connect(): Promise<void> {
   try {
-    await apply(flow.ssid, flow.password, flow.name.trim());
+    await apply(flow.ssid, flow.password, flow.name.trim(), pinChange());
+    flow.pinAfterApply = pinOnceApplied();
   } catch (error) {
     flow.error = (error as Error).message;
     render();
@@ -541,7 +717,7 @@ async function waitForJoin(): Promise<void> {
 
 async function done(): Promise<void> {
   try {
-    await finish();
+    await finish(flow.pinAfterApply);
   } catch {
     // The setup network goes off by itself two minutes after the join anyway.
   }
@@ -560,6 +736,7 @@ async function start(): Promise<void> {
     flow.error = error instanceof SetupError ? error.message : "The bridge isn't answering.";
   }
   flow.name = flow.state?.name ?? "DSPi Bridge";
+  flow.pinEnabled = flow.state?.pin_required ?? false;
   if (flow.state?.wifi.join === "connected" && flow.state.wifi.saved_ssid) {
     // The page was reopened after a join that worked.
     flow.ssid = flow.state.wifi.saved_ssid;

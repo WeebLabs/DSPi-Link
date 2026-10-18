@@ -404,3 +404,57 @@ esp_err_t settings_forget_wifi(void)
     nvs_close(nvs);
     return err;
 }
+
+/* ---------------------------------------------------------------------------
+ * The PIN and paired clients (namespace `auth`)
+ * ------------------------------------------------------------------------- */
+
+#define AUTH_NAMESPACE "auth"
+#define KEY_AUTH_STORE "store"
+
+esp_err_t settings_load_auth(void *blob, size_t size)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(AUTH_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t length = 0;
+    err = nvs_get_blob(nvs, KEY_AUTH_STORE, NULL, &length);
+    if (err == ESP_OK && length != size) {
+        ESP_LOGW(TAG, "Saved PIN data has an older layout; starting without a PIN");
+        err = ESP_ERR_NOT_FOUND;
+    } else if (err == ESP_OK) {
+        err = nvs_get_blob(nvs, KEY_AUTH_STORE, blob, &length);
+    }
+    nvs_close(nvs);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : err;
+}
+
+esp_err_t settings_save_auth(const void *blob, size_t size)
+{
+    nvs_handle_t nvs;
+    ESP_RETURN_ON_ERROR(nvs_open(AUTH_NAMESPACE, NVS_READWRITE, &nvs), TAG, "opening %s",
+                        AUTH_NAMESPACE);
+    esp_err_t err = nvs_set_blob(nvs, KEY_AUTH_STORE, blob, size);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+/* ---------------------------------------------------------------------------
+ * Factory reset
+ * ------------------------------------------------------------------------- */
+
+esp_err_t settings_erase_all(void)
+{
+    /* The NVS partition holds only the bridge's namespaces (the Wi-Fi driver
+     * keeps nothing there; see net.c), so erasing it all is exact. */
+    nvs_flash_deinit();
+    return nvs_flash_erase();
+}

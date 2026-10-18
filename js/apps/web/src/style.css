@@ -1,5 +1,6 @@
-/* Dark, plain, and entirely self-contained: no web fonts, no CDN, so the page
-   works on a LAN with no internet and on a hub that serves two files. */
+/* Plain and entirely self-contained: no web fonts, no CDN, so the page works
+   on a LAN with no internet and on a hub that serves two files. Dark by
+   default, light when the system asks for it (bridge spec 10.4). */
 
 :root {
   --bg: #131518;
@@ -9,10 +10,34 @@
   --text: #e6e8ec;
   --dim: #9aa2ad;
   --accent: #5aa9e6;
+  --accent-text: #0d1116;
   --good: #55c26a;
   --warn: #e0a33e;
   --bad: #e05a5a;
+  --good-soft: #17271b;
+  --warn-soft: #2b2213;
+  --bad-soft: #2d1718;
   color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --panel-2: #f0f2f5;
+    --line: #d9dde3;
+    --text: #16181d;
+    --dim: #5d6573;
+    --accent: #2563eb;
+    --accent-text: #ffffff;
+    --good: #15803d;
+    --warn: #a15c07;
+    --bad: #b91c1c;
+    --good-soft: #e7f6ec;
+    --warn-soft: #fdf3e2;
+    --bad-soft: #fde8e8;
+    color-scheme: light;
+  }
 }
 
 * {
@@ -115,7 +140,19 @@ button:hover:not(:disabled) {
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1116;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Destructive actions are red (bridge spec 10.4). */
+button.danger {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+dialog.confirm button.danger {
+  background: var(--bad);
+  color: #ffffff;
   font-weight: 600;
 }
 
@@ -236,4 +273,316 @@ input[type="range"] {
 
 .stat {
   font-variant-numeric: tabular-nums;
+}
+
+/* Bridge settings (bridge spec 10.3) */
+
+.settings {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.page-head {
+  margin-bottom: 16px;
+}
+
+h3 {
+  font-size: 15px;
+  margin: 20px 0 8px;
+}
+
+.small {
+  font-size: 13px;
+}
+
+.row.end {
+  justify-content: flex-end;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.status {
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+}
+
+.status strong,
+.status .detail {
+  display: block;
+}
+
+.status .detail {
+  color: var(--text);
+  opacity: 0.85;
+  font-size: 13px;
+}
+
+.status.good {
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.status.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.status.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
+.notice p {
+  margin: 0;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  margin: 4px 0 0;
+}
+
+.facts dt {
+  color: var(--dim);
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.field {
+  margin: 0 0 14px;
+}
+
+.field label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.field input,
+.field select {
+  width: 100%;
+}
+
+.field p {
+  margin: 6px 0 0;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 14px;
+}
+
+.checkbox {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 14px;
+  cursor: pointer;
+}
+
+.checkbox input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+input.pin {
+  max-width: 180px;
+  letter-spacing: 0.4em;
+  font-size: 18px;
+  text-align: center;
+}
+
+/* The PIN switch: a checkbox drawn as a switch, its label on the left. */
+.switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.switch input {
+  appearance: none;
+  flex: none;
+  position: relative;
+  width: 46px;
+  height: 28px;
+  margin: 0;
+  border-radius: 14px;
+  background: var(--line);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.switch input::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px #0004;
+  transition: transform 0.15s;
+}
+
+.switch input:checked {
+  background: var(--accent);
+}
+
+.switch input:checked::after {
+  transform: translateX(18px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch input,
+  .switch input::after {
+    transition: none;
+  }
+}
+
+.pin-form {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.network-list,
+.client-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.network-list li + li,
+.client-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.network-list button {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 12px 14px;
+  text-align: left;
+}
+
+.network-list button:hover {
+  background: var(--panel-2);
+}
+
+.client-list li {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+}
+
+.maintenance-row {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 12px 0;
+}
+
+.maintenance-row + .maintenance-row {
+  border-top: 1px solid var(--line);
+}
+
+.maintenance-row p {
+  margin: 2px 0 0;
+}
+
+/* The wiring diagram, drawn from the chosen pins. */
+.wiring svg {
+  display: block;
+  width: 100%;
+  max-width: 420px;
+  margin: 4px auto 16px;
+}
+
+.wiring .board {
+  fill: var(--panel-2);
+  stroke: var(--line);
+}
+
+.wiring .board-label {
+  fill: var(--text);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.wiring .pin {
+  fill: var(--text);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.wiring .wire {
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.wiring .wire-0 {
+  stroke: var(--accent);
+}
+
+.wiring .wire-1 {
+  stroke: var(--good);
+}
+
+.wiring .wire-2 {
+  stroke: var(--dim);
+}
+
+.wiring .wire-label {
+  fill: var(--dim);
+  font-size: 10px;
+}
+
+dialog.confirm {
+  max-width: min(440px, calc(100vw - 32px));
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+dialog.confirm::backdrop {
+  background: #000a;
+}
+
+dialog.confirm h3 {
+  margin-top: 0;
+}
+
+@media (max-width: 480px) {
+  .maintenance-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  /* Stacked, the explanation takes only the height its words need. */
+  .maintenance-row .grow {
+    flex: none;
+  }
 }

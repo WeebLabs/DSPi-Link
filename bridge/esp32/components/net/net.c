@@ -22,6 +22,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -80,6 +81,7 @@ static struct {
 
     bool dns_started;
     bool service_added;
+    bool clock_started;
 
     net_status_t status;
     portMUX_TYPE status_lock;
@@ -117,6 +119,16 @@ static void publish_status(bool connected, const char *ip)
     }
     snprintf(status->saved_ssid, sizeof(status->saved_ssid), "%s", net_state.saved.ssid);
     taskEXIT_CRITICAL(&net_state.status_lock);
+}
+
+esp_err_t net_set_hostname(const char *hostname)
+{
+    esp_netif_set_hostname(net_state.station, hostname);
+    taskENTER_CRITICAL(&net_state.status_lock);
+    snprintf(net_state.hostname, sizeof(net_state.hostname), "%s", hostname);
+    snprintf(net_state.status.hostname, sizeof(net_state.status.hostname), "%s", hostname);
+    taskEXIT_CRITICAL(&net_state.status_lock);
+    return mdns_hostname_set(hostname);
 }
 
 void net_get_status(net_status_t *status)
@@ -341,6 +353,13 @@ static void on_got_address(const ip_event_got_ip_t *event)
     net_machine_connected(&net_state.machine, now_ms());
     publish_status(true, ip);
     apply();
+
+    /* Wall-clock time, for when paired clients were created and last seen
+     * (bridge spec 8.9). Started once; it keeps itself in step. */
+    if (!net_state.clock_started) {
+        const esp_sntp_config_t clock = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        net_state.clock_started = esp_netif_sntp_init(&clock) == ESP_OK;
+    }
     ESP_LOGI(TAG, "Connected to \"%s\" as %s.local, address %s", net_state.trying.ssid,
              net_state.hostname, ip);
 }

@@ -51,14 +51,35 @@ export async function getNetworks(): Promise<Network[]> {
   return body.networks;
 }
 
-export async function apply(ssid: string, password: string, name: string): Promise<void> {
-  await request("apply", {
+/**
+ * What `apply` does to the bridge's PIN. `pin_enabled` true sets `pin`; false
+ * turns the PIN off; left out, the PIN stays as it is. `current_pin` is
+ * needed whenever the bridge already has a PIN (bridge spec 9.3).
+ */
+export interface PinChange {
+  pin_enabled?: boolean;
+  pin?: string;
+  current_pin?: string;
+}
+
+function postJson<T>(path: string, body: unknown): Promise<T> {
+  return request<T>(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ssid, password, name }),
+    body: JSON.stringify(body),
   });
 }
 
-export async function finish(): Promise<void> {
-  await request("finish", { method: "POST" });
+export async function apply(
+  ssid: string,
+  password: string,
+  name: string,
+  pin: PinChange,
+): Promise<void> {
+  await postJson("apply", { ssid, password, name, ...pin });
+}
+
+/** `currentPin` is the bridge's PIN, if it has one now. */
+export async function finish(currentPin: string): Promise<void> {
+  await postJson("finish", currentPin ? { current_pin: currentPin } : {});
 }

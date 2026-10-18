@@ -2,9 +2,9 @@
  * setup_api.c - the setup network's pages and API. See setup_api.h;
  * implements bridge spec 9.2 and 9.3.
  *
- * Phase 4 covers Wi-Fi and the bridge's name. The PIN fields of bridge spec
- * 9.3 arrive with the PIN itself in phase 5; until then `pin_required` is
- * always false.
+ * While the PIN is on, which is only possible when the setup network has
+ * come back in FALLBACK, every request that changes something must carry
+ * it as `current_pin` (bridge spec 9.2).
  */
 
 #include "setup_api.h"
@@ -18,6 +18,7 @@
 #include "dspi_uart.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "http_server.h"
 #include "hub_task.h"
 #include "net.h"
 #include "settings_model.h"
@@ -96,7 +97,7 @@ static esp_err_t get_state(httpd_req_t *request)
     cJSON_AddStringToObject(body, "name", name);
     cJSON_AddStringToObject(body, "chip", board_table()->chip_name);
     cJSON_AddStringToObject(body, "version", esp_app_get_description()->version);
-    cJSON_AddBoolToObject(body, "pin_required", false);
+    cJSON_AddBoolToObject(body, "pin_required", hub_task_pin_enabled());
 
     cJSON *dspi = cJSON_AddObjectToObject(body, "dspi");
     cJSON_AddBoolToObject(dspi, "found", link.device_present);
@@ -180,21 +181,58 @@ static const char *string_member(const cJSON *object, const char *name)
     return cJSON_IsString(item) ? item->valuestring : NULL;
 }
 
-/* {"ssid", "password", "name"}: saves the name and starts joining. The
- * network is saved once the join works (bridge spec 9.3). */
+/* While the PIN is on, a changing request must carry it. Returns true when
+ * the request may go on; otherwise the reply has been sent. */
+static bool pin_allows(httpd_req_t *request, const cJSON *json, esp_err_t *result)
+{
+    if (!hub_task_pin_enabled()) {
+        return true;
+    }
+    const char *current = json != NULL ? string_member(json, "current_pin") : NULL;
+    if (current == NULL) {
+        *result = send_error(request, "403 Forbidden", "pin_required", "Enter the bridge's PIN.");
+        return false;
+    }
+    const uint32_t address = http_server_peer_address(httpd_req_to_sockfd(request));
+    switch (hub_task_check_pin(address, current)) {
+    case HUB_AUTH_OK:
+        return true;
+    case HUB_AUTH_RATE_LIMITED:
+        *result = send_error(request, "429 Too Many Requests", "rate_limited",
+                             "Too many wrong PINs. Wait a minute and try again.");
+        return false;
+    default:
+        *result = send_error(request, "403 Forbidden", "wrong_pin", "That PIN is not right.");
+        return false;
+    }
+}
+
+/* {"ssid", "password", "name", "pin_enabled", "pin", "current_pin"}: saves
+ * the name and the PIN choice and starts joining. The network is saved once
+ * the join works (bridge spec 9.3). */
 static esp_err_t post_apply(httpd_req_t *request)
 {
     cJSON *json = read_json_body(request);
     if (json == NULL) {
         return ESP_OK;
     }
+    esp_err_t result = ESP_OK;
+    if (!pin_allows(request, json, &result)) {
+        cJSON_Delete(json);
+        return result;
+    }
     const char *ssid = string_member(json, "ssid");
     const char *password = string_member(json, "password");
     const char *name = string_member(json, "name");
+    const cJSON *pin_enabled = cJSON_GetObjectItemCaseSensitive(json, "pin_enabled");
+    const char *pin = string_member(json, "pin");
+    const bool turn_pin_on = cJSON_IsTrue(pin_enabled);
 
     /* Check everything before changing anything. */
-    esp_err_t result = ESP_OK;
-    if (ssid == NULL || password == NULL) {
+    if (turn_pin_on && !hub_auth_pin_is_valid(pin)) {
+        result =
+            send_error(request, "400 Bad Request", "bad_request", "The PIN must be six digits.");
+    } else if (ssid == NULL || password == NULL) {
         result = send_error(request, "400 Bad Request", "bad_request",
                             "Choose a network and enter its password.");
     } else if (name != NULL && !settings_name_is_valid(name)) {
@@ -208,6 +246,12 @@ static esp_err_t post_apply(httpd_req_t *request)
         if (name != NULL) {
             hub_task_rename(name);
         }
+        /* A missing pin_enabled leaves the PIN as it is. */
+        if (turn_pin_on) {
+            hub_task_set_pin(pin);
+        } else if (cJSON_IsFalse(pin_enabled) && hub_task_pin_enabled()) {
+            hub_task_set_pin(NULL);
+        }
         ESP_LOGI(TAG, "Setup page: joining \"%s\"", ssid);
         result = send_json(request, "202 Accepted", cJSON_CreateObject());
     }
@@ -217,8 +261,17 @@ static esp_err_t post_apply(httpd_req_t *request)
 
 static esp_err_t post_finish(httpd_req_t *request)
 {
-    net_finish_setup();
-    return send_json(request, "200 OK", cJSON_CreateObject());
+    esp_err_t result = ESP_OK;
+    cJSON *json = request->content_len > 0 ? read_json_body(request) : NULL;
+    if (request->content_len > 0 && json == NULL) {
+        return ESP_OK; /* read_json_body has replied */
+    }
+    if (pin_allows(request, json, &result)) {
+        net_finish_setup();
+        result = send_json(request, "200 OK", cJSON_CreateObject());
+    }
+    cJSON_Delete(json);
+    return result;
 }
 
 /* ---------------------------------------------------------------------------

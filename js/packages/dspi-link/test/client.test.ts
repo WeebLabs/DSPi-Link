@@ -10,7 +10,7 @@ import { LinkStatus } from "../src/frames.js";
 import { bytesToBase64 } from "../src/decoders.js";
 import type { DeviceInfo } from "../src/messages.js";
 import { FakeHub, settle } from "./fakeHub.js";
-import { fixtureBytes } from "./fixtures.js";
+import { fixtureBytes, fixtureJson } from "./fixtures.js";
 
 const DEVICE: DeviceInfo = {
   handle: 0,
@@ -296,6 +296,98 @@ describe("snapshot and polls", () => {
     const acquire = hub.received.find((m) => m.t === "lock.acquire");
     expect(acquire).toMatchObject({ handle: 0, reason: "Applying configuration", timeout_ms: 10000 });
     await client.releaseLock(0);
+    client.disconnect();
+  });
+});
+
+describe("hub administration (spec 7.10 to 7.13)", () => {
+  /** A bridge-like hub that answers the admin messages from the fixtures. */
+  function adminHub(onRequest: (msg: Record<string, unknown>) => Record<string, unknown> | null) {
+    return new FakeHub({ auth: "none", role: "admin", onRequest });
+  }
+
+  it("reads the configuration and its options", async () => {
+    const reply = fixtureJson<Record<string, unknown>>("messages", "hub_config_get_ok.json");
+    const hub = adminHub((msg) => (msg.t === "hub.config.get" ? reply : null));
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+
+    const { config, options } = await client.getHubConfig();
+    expect(config.name).toBe("DSPi Bridge 3F2A");
+    expect((options.uart as { baud: number[] }).baud).toContain(921600);
+    client.disconnect();
+  });
+
+  it("names the rejected key of a hub.config.set", async () => {
+    const reply = fixtureJson<Record<string, unknown>>("messages", "err_bad_field.json");
+    const hub = adminHub((msg) => (msg.t === "hub.config.set" ? reply : null));
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+
+    const error = await client.setHubConfig({ uart: { tx_pin: 3 } }).catch((e) => e);
+    expect(error).toBeInstanceOf(LinkProtocolError);
+    expect(error.code).toBe("bad_request");
+    expect(error.field).toBe("uart.tx_pin");
+    expect(error.detail).toBe("pin 3 cannot be used");
+    expect(hub.received.at(-1)).toMatchObject({ t: "hub.config.set", config: { uart: { tx_pin: 3 } } });
+    client.disconnect();
+  });
+
+  it("emits hubConfig when the hub reports a change", async () => {
+    const hub = adminHub(() => null);
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+    const seen: unknown[] = [];
+    client.on("hubConfig", (config) => seen.push(config));
+
+    hub.socket.deliverText(fixtureJson("messages", "hub_config_changed.json"));
+    await settle();
+    expect(seen).toHaveLength(1);
+    expect((seen[0] as { uart: { baud: number } }).uart.baud).toBe(921600);
+    client.disconnect();
+  });
+
+  it("keeps the fresh token from hub.auth.set, and drops it for mode none", async () => {
+    const tokenReply = fixtureJson<Record<string, unknown>>("messages", "hub_auth_set_ok.json");
+    const hub = adminHub((msg) => (msg.mode === "pin" ? tokenReply : { t: "ok" }));
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+
+    const token = await client.setAuth("pin", "482913");
+    expect(token).toBe(tokenReply.token);
+    expect(client.token).toBe(tokenReply.token);
+    expect(hub.received.at(-1)).toMatchObject({ t: "hub.auth.set", mode: "pin", pin: "482913" });
+
+    expect(await client.setAuth("none")).toBeNull();
+    expect(client.token).toBeNull();
+    expect(hub.received.at(-1)).not.toHaveProperty("pin");
+    client.disconnect();
+  });
+
+  it("scans, lists clients, and sends join, revoke, restart and reset", async () => {
+    const replies: Record<string, Record<string, unknown>> = {
+      "hub.wifi.scan": fixtureJson("messages", "hub_wifi_scan_ok.json"),
+      "auth.list": fixtureJson("messages", "auth_list_ok.json"),
+    };
+    const hub = adminHub((msg) => replies[msg.t as string] ?? { t: "ok" });
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+
+    const scan = await client.scanWifi();
+    expect(scan.current?.ssid).toBe("Home");
+    expect(scan.networks.map((n) => n.ssid)).toEqual(["Home", "Studio", "Cafe"]);
+    expect((await client.listClients()).map((c) => c.cid)).toEqual([1, 2]);
+
+    await client.joinWifi("Studio", "correct horse battery");
+    await client.revokeClient(2);
+    await client.restartHub();
+    await client.resetHub("network");
+    expect(hub.received.slice(-4)).toMatchObject([
+      { t: "hub.wifi.join", ssid: "Studio", password: "correct horse battery" },
+      { t: "auth.revoke", cid: 2 },
+      { t: "hub.restart" },
+      { t: "hub.reset", level: "network" },
+    ]);
     client.disconnect();
   });
 });

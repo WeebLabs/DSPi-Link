@@ -262,13 +262,38 @@ static void finish_client_command(hub_t *hub, const hub_pending_t *work, const d
             status == DSPI_STATUS_OK ? reply->length : 0);
 }
 
+/* Finishes one piece of work with its answer. */
+static void complete_work(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply)
+{
+    switch (work->kind) {
+    case HUB_WORK_CLIENT_COMMAND:
+        hub->client_commands_pending--;
+        if (work->is_bulk_set) {
+            hub->bulk_set_busy = false; /* The bulk buffer is free again */
+        }
+        finish_client_command(hub, work, reply);
+        break;
+    case HUB_WORK_POLL:
+        hub->poll_pending = false;
+        hub_polls_on_reply(hub, work, reply);
+        break;
+    case HUB_WORK_SNAPSHOT_BULK:
+    case HUB_WORK_SNAPSHOT_STATUS:
+        hub_snapshot_on_reply(hub, work, reply);
+        break;
+    }
+}
+
 void hub_reply(hub_t *hub, uint32_t tag, const dspi_reply_t *reply)
 {
-    /* Answers arrive in order. Anything older than `tag` will never be
-     * answered (it cannot happen, but a lost entry must not jam the queue). */
+    /* Answers arrive in order, so anything older than `tag` lost its answer
+     * on the way (a full event queue). Finish it as a timeout, so its
+     * client hears back and the hub's counts stay true. */
+    const dspi_reply_t lost_reply = {.kind = DSPI_REPLY_TIMEOUT};
     while (hub->pending_count > 0 && hub->pending[hub->pending_head].tag != tag) {
         hub_pending_t lost;
         pop_pending(hub, &lost);
+        complete_work(hub, &lost, &lost_reply);
     }
     if (hub->pending_count == 0) {
         return;
@@ -276,24 +301,7 @@ void hub_reply(hub_t *hub, uint32_t tag, const dspi_reply_t *reply)
 
     hub_pending_t work;
     pop_pending(hub, &work);
-
-    switch (work.kind) {
-    case HUB_WORK_CLIENT_COMMAND:
-        hub->client_commands_pending--;
-        if (work.is_bulk_set) {
-            hub->bulk_set_busy = false; /* The bulk buffer is free again */
-        }
-        finish_client_command(hub, &work, reply);
-        break;
-    case HUB_WORK_POLL:
-        hub->poll_pending = false;
-        hub_polls_on_reply(hub, &work, reply);
-        break;
-    case HUB_WORK_SNAPSHOT_BULK:
-    case HUB_WORK_SNAPSHOT_STATUS:
-        hub_snapshot_on_reply(hub, &work, reply);
-        break;
-    }
+    complete_work(hub, &work, reply);
 
     /* Keep the link busy: the next due poll can start now. */
     hub_polls_tick(hub);

@@ -161,11 +161,36 @@ effect without a restart where section 8.11 says so, turning the PIN on
 signs out every other browser and app, and the PIN prompt in the web client
 uses the `fixed` wording.
 
+**Status (2026-10-19):** done, with the items below left for the bench.
+On the ESP32-S3:
+
+- From the settings page: the bridge was renamed (the name reached `hello`,
+  the info endpoint and DNS-SD at once), the PIN was turned on, used to pair
+  a second browser, one paired browser was removed, and the PIN was turned
+  off again. A stored token reconnected without a prompt; a wrong PIN was
+  refused. Restart from the page came back to the settings page by itself.
+- Setting 921,600 baud with detection on: the bridge lost the DSPi, found it
+  again at 1,000,000 and the page showed the found rate. This exposed a gap,
+  now fixed: a detected rate was saved but the hub core and the page were
+  not told.
+- PIN checks took 1.5 s with 10,000 PBKDF2 rounds and held up every session
+  meanwhile; the bridge now uses 1,000 (bridge spec 8.9 says why that is
+  enough).
+- The setup page's PIN step was checked against a stand-in for the setup
+  API at phone width, for a new bridge and for one that already has a PIN.
+- Left over: the setup PIN step on a real phone; changing network, the UART
+  pins and the PIN itself from the settings page; Forget Wi-Fi and Factory
+  reset from the page, which need a fresh phone setup afterwards. The LED
+  setting is saved but nothing drives the LED until phase 6.
+- Outside this repository: DSPi Console should default to `auth: none` and
+  word its PIN prompt from `pin_source`.
+
 ## Phase 6: Updates, reset and LED
 
 - `ota` and `hub.update` (section 14), with rollback.
 - `button` and the reset levels (12.1), and `status_led` (13).
-- The Maintenance section of the settings page.
+- "Update firmware" in the settings page's Maintenance section, beside the
+  restart and reset actions phase 5 added.
 
 **Done when** an update from the settings page succeeds, a deliberately
 broken image rolls back by itself, and both BOOT button levels work with

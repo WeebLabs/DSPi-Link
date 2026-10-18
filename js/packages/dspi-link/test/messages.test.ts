@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { LinkMessageError, decode, encode, isErr, isHubHello, isOk } from "../src/messages.js";
+import {
+  type HelloHubMessage,
+  LinkMessageError,
+  decode,
+  encode,
+  isErr,
+  isHubHello,
+  isOk,
+  pinSourceOf,
+} from "../src/messages.js";
 import { fixtureJson, fixtureNames } from "./fixtures.js";
 
 const files = fixtureNames("messages", ".json");
@@ -28,6 +37,13 @@ describe("message helpers", () => {
     const client = decode(fixtureJson("messages", "hello_client.json"));
     expect(isHubHello(hub as never)).toBe(true);
     expect(isHubHello(client as never)).toBe(false);
+  });
+
+  it("reads pin_source, taking a missing one as window (spec 7.2)", () => {
+    const bridge = decode(fixtureJson("messages", "hello_hub_bridge.json")) as HelloHubMessage;
+    const console = decode(fixtureJson("messages", "hello_hub.json")) as HelloHubMessage;
+    expect(pinSourceOf(bridge)).toBe("fixed");
+    expect(pinSourceOf(console)).toBe("window");
   });
 
   it("recognises ok and err replies", () => {

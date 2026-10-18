@@ -33,7 +33,9 @@
 typedef struct {
     void *context; /* Passed first to every handler */
 
-    void (*session_opened)(void *context, int slot);
+    /* A session began, from `address` (IPv4, network byte order; 0 if not
+     * known), which the hub uses for rate limits. */
+    void (*session_opened)(void *context, int slot, uint32_t address);
 
     /* A text or binary message. The handler takes ownership of `data`, a
      * heap buffer with a NUL after the last byte, and frees it with free(). */
@@ -66,6 +68,10 @@ esp_err_t http_server_start(const http_server_config_t *config);
  * not open, is closing, or already has LINK_SESSION_QUEUE_FRAMES messages
  * waiting (bridge spec 8.2). */
 bool http_server_send(int slot, bool binary, const uint8_t *data, size_t length);
+
+/* The IPv4 address (network byte order) of the client on socket `fd`, or 0
+ * if it is not known. */
+uint32_t http_server_peer_address(int fd);
 
 /* Sends a WebSocket ping. */
 void http_server_ping(int slot);

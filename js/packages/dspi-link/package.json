@@ -1,6 +1,6 @@
 {
   "name": "@dspi/link",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "DSPi Link protocol client: binary frames, JSON control plane, device decoders",
   "license": "MIT",
   "type": "module",

@@ -21,6 +21,13 @@ export interface FakeHubConfig {
   /** Answer a decoded CMD request; return null to answer nothing. */
   onCommand?: (frame: Extract<LinkFrame, { type: "cmd_request" }>) => LinkFrame | null;
   snapshot?: Record<string, unknown>;
+  /** Sent in hello when `auth` is "pin". */
+  pinSource?: "window" | "fixed";
+  /**
+   * Answers a request the switch below does not know, such as the admin
+   * messages: return the reply's body without `id`, or null for unknown_type.
+   */
+  onRequest?: (msg: Record<string, unknown>) => Record<string, unknown> | null;
 }
 
 const soon = (fn: () => void) => setTimeout(fn, 0);
@@ -69,6 +76,7 @@ export class FakeHub {
           proto: { major: 1, minor: 0 },
           hub: { id: "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b", name: "Test Hub", kind: "console", version: "1.1.7" },
           auth: this.config.auth,
+          ...(this.config.pinSource ? { pin_source: this.config.pinSource } : {}),
           caps: this.config.caps ?? ["cmd", "notify", "poll", "snapshot", "lock", "rename"],
           limits: {
             max_frame: 65536,
@@ -121,9 +129,11 @@ export class FakeHub {
       case "device.rename":
         socket.deliverText({ t: "ok", id });
         return;
-      default:
-        socket.deliverText({ t: "err", id, code: "unknown_type" });
+      default: {
+        const reply = this.config.onRequest?.(msg) ?? { t: "err", code: "unknown_type" };
+        socket.deliverText({ ...reply, id });
         return;
+      }
     }
   }
 

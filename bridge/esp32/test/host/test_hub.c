@@ -9,6 +9,7 @@
 
 #include "cJSON.h"
 #include "check.h"
+#include "fake_crypto.h"
 #include "fake_hub_io.h"
 #include "hub.h"
 #include "link_frames.h"
@@ -30,16 +31,47 @@ static const dspi_identity_t IDENTITY = {
  * Helpers
  * ------------------------------------------------------------------------- */
 
+static uint32_t fake_unix_time(void *context)
+{
+    (void)context;
+    return 1800000000; /* 2027-01-15 */
+}
+
+static uint32_t fake_auth_now(void *context)
+{
+    (void)context;
+    return io_record.now_ms;
+}
+
+static void fake_auth_save(void *context, const hub_auth_store_t *store)
+{
+    (void)context;
+    (void)store;
+}
+
+#define CLIENT_ADDRESS 0x0A01A8C0u /* 192.168.1.10 */
+
 static void start(void)
 {
     const hub_io_t io = fake_hub_io_init(&io_record);
-    const hub_config_t config = {
-        .hub_id = "a664b936-5e26-4662-b2f5-8b18949721d6",
-        .name = "DSPi Bridge 1B34",
+    fake_crypto_reset();
+    static const uint8_t MAC[6] = {0x80, 0x45, 0x6B, 0x35, 0x1B, 0x34};
+    static const uint8_t RANDOM[16] = {1, 2, 3};
+    hub_config_t config = {
+        .board = &BOARD_TABLE_ESP32S3,
         .version = "0.1.0",
         .max_sessions = 4,
     };
-    hub_init(&hub, &io, &config);
+    settings_model_defaults(&config.settings, &BOARD_TABLE_ESP32S3, MAC, RANDOM);
+    const hub_auth_io_t auth_io = {
+        .random = fake_random,
+        .sha256 = fake_sha256,
+        .pbkdf2 = fake_pbkdf2,
+        .now_ms = fake_auth_now,
+        .unix_time = fake_unix_time,
+        .save = fake_auth_save,
+    };
+    hub_init(&hub, &io, &config, &auth_io, NULL);
 }
 
 static void forget_messages(void)
@@ -109,7 +141,7 @@ static const char *json_string(const cJSON *object, const char *name)
  * `auth: none`. Returns the session id. */
 static int open_session(int slot)
 {
-    hub_session_opened(&hub, slot);
+    hub_session_opened(&hub, slot, CLIENT_ADDRESS);
     send_json(slot,
               "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":1},"
               "\"client\":{\"name\":\"Test %d\"}}",
@@ -195,7 +227,7 @@ static void notify(uint8_t seq, uint8_t source)
 static void hello_describes_the_bridge(void)
 {
     start();
-    hub_session_opened(&hub, 0);
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
     send_json(0, "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":1}}");
 
     cJSON *hello = last_json(0, "hello");
@@ -215,7 +247,7 @@ static void hello_describes_the_bridge(void)
 static void the_first_message_must_be_hello(void)
 {
     start();
-    hub_session_opened(&hub, 0);
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
     send_json(0, "{\"t\":\"device.list\",\"id\":1}");
     CHECK(io_record.close_code[0] == 4000);
 }
@@ -248,7 +280,7 @@ static void a_full_bridge_has_no_room(void)
     start();
     for (int slot = 0; slot < 4; slot++) {
         CHECK(hub_has_room(&hub));
-        hub_session_opened(&hub, slot);
+        hub_session_opened(&hub, slot, CLIENT_ADDRESS);
     }
     CHECK(!hub_has_room(&hub));
     hub_session_closed(&hub, 2);
@@ -271,7 +303,7 @@ static void keepalive_pings_then_closes_a_silent_session(void)
 static void a_session_that_never_says_hello_is_closed(void)
 {
     start();
-    hub_session_opened(&hub, 0);
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
     io_record.now_ms += LINK_AUTH_TIMEOUT_MS;
     hub_tick(&hub);
     CHECK(io_record.close_code[0] == 4001);
@@ -664,8 +696,230 @@ static void the_hub_can_be_renamed(void)
     cJSON_Delete(err);
 
     send_json(0, "{\"t\":\"hub.rename\",\"id\":15,\"name\":\"Studio\"}");
-    CHECK(strcmp(io_record.saved_hub_name, "Studio") == 0);
+    CHECK(strcmp(io_record.applied.name, "Studio") == 0);
     CHECK(io_record.advertise_count >= 1);
+}
+
+/* ---------------------------------------------------------------------------
+ * The PIN (Link spec 6.2, bridge spec 8.9)
+ * ------------------------------------------------------------------------- */
+
+/* Says hello on `slot` with the PIN on; returns nothing, leaves the session
+ * waiting to authenticate. */
+static void hello_only(int slot)
+{
+    hub_session_opened(&hub, slot, CLIENT_ADDRESS);
+    send_json(slot, "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":2}}");
+}
+
+static void with_the_pin_on_hello_asks_for_it(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    hello_only(0);
+    cJSON *hello = last_json(0, "hello");
+    CHECK(strcmp(json_string(hello, "auth"), "pin") == 0);
+    CHECK(strcmp(json_string(hello, "pin_source"), "fixed") == 0);
+    cJSON_Delete(hello);
+
+    send_json(0, "{\"t\":\"device.list\",\"id\":2}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "unauthenticated") == 0);
+    cJSON_Delete(err);
+}
+
+static void pairing_with_the_pin_issues_a_token(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    hello_only(0);
+    send_json(0, "{\"t\":\"auth.pair\",\"id\":1,\"pin\":\"111111\",\"name\":\"Phone\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "unauthenticated") == 0);
+    cJSON_Delete(err);
+
+    send_json(0, "{\"t\":\"auth.pair\",\"id\":2,\"pin\":\"482913\",\"name\":\"Phone\"}");
+    cJSON *ok = last_json(0, "ok");
+    char token[64];
+    snprintf(token, sizeof(token), "%s", json_string(ok, "token"));
+    CHECK(strlen(token) == HUB_AUTH_TOKEN_CHARS);
+    CHECK(strcmp(json_string(ok, "role"), "admin") == 0);
+    cJSON_Delete(ok);
+
+    /* A later session presents the token instead. */
+    hello_only(1);
+    send_json(1, "{\"t\":\"auth.token\",\"id\":1,\"token\":\"%s\"}", token);
+    ok = last_json(1, "ok");
+    CHECK(ok != NULL && json_number(ok, "session") > 0);
+    cJSON_Delete(ok);
+    send_json(1, "{\"t\":\"device.list\",\"id\":2}");
+    ok = last_json(1, "ok");
+    CHECK(cJSON_GetObjectItemCaseSensitive(ok, "devices") != NULL);
+    cJSON_Delete(ok);
+}
+
+static void setting_the_pin_keeps_the_setter_and_signs_out_the_rest(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    send_json(0, "{\"t\":\"hub.auth.set\",\"id\":5,\"mode\":\"pin\",\"pin\":\"482913\"}");
+    cJSON *ok = last_json(0, "ok");
+    CHECK(strlen(json_string(ok, "token")) == HUB_AUTH_TOKEN_CHARS);
+    cJSON_Delete(ok);
+    CHECK(io_record.close_code[0] == 0);
+    CHECK(io_record.close_code[1] == 4002);
+    CHECK(hub_pin_enabled(&hub));
+
+    send_json(0, "{\"t\":\"hub.auth.set\",\"id\":6,\"mode\":\"pin\",\"pin\":\"12ab56\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "bad_request") == 0);
+    cJSON_Delete(err);
+
+    send_json(0, "{\"t\":\"hub.auth.set\",\"id\":7,\"mode\":\"none\"}");
+    CHECK(!hub_pin_enabled(&hub));
+}
+
+static void a_revoked_client_is_disconnected(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    hello_only(0);
+    send_json(0, "{\"t\":\"auth.pair\",\"id\":1,\"pin\":\"482913\",\"name\":\"Admin\"}");
+    hello_only(1);
+    send_json(1, "{\"t\":\"auth.pair\",\"id\":1,\"pin\":\"482913\",\"name\":\"Tablet\"}");
+
+    send_json(0, "{\"t\":\"auth.list\",\"id\":2}");
+    cJSON *ok = last_json(0, "ok");
+    const cJSON *clients = cJSON_GetObjectItemCaseSensitive(ok, "clients");
+    CHECK(cJSON_GetArraySize(clients) == 2);
+    int tablet = -1;
+    const cJSON *client = NULL;
+    cJSON_ArrayForEach(client, clients)
+    {
+        if (strcmp(json_string(client, "name"), "Tablet") == 0) {
+            tablet = json_number(client, "cid");
+            CHECK(strcmp(json_string(client, "created"), "2027-01-15T08:00:00Z") == 0);
+            CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(client, "online")));
+        }
+    }
+    cJSON_Delete(ok);
+
+    send_json(0, "{\"t\":\"auth.revoke\",\"id\":3,\"cid\":%d}", tablet);
+    CHECK(io_record.close_code[1] == 4002);
+    CHECK(io_record.close_code[0] == 0);
+}
+
+/* ---------------------------------------------------------------------------
+ * Administration (Link spec 7.10 to 7.13)
+ * ------------------------------------------------------------------------- */
+
+static void config_get_shows_settings_and_choices(void)
+{
+    start();
+    open_session(0);
+    send_json(0, "{\"t\":\"hub.config.get\",\"id\":20}");
+    cJSON *ok = last_json(0, "ok");
+    const cJSON *config = cJSON_GetObjectItemCaseSensitive(ok, "config");
+    const cJSON *uart = cJSON_GetObjectItemCaseSensitive(config, "uart");
+    CHECK(json_number(uart, "tx_pin") == 17);
+    CHECK(strcmp(json_string(config, "hostname"), "dspi-bridge-1b34") == 0);
+    const cJSON *options = cJSON_GetObjectItemCaseSensitive(ok, "options");
+    const cJSON *tx_choices = cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(options, "uart"), "tx_pin");
+    CHECK(cJSON_GetArraySize(tx_choices) == (int)BOARD_TABLE_ESP32S3.uart_tx_pins.count);
+    cJSON_Delete(ok);
+}
+
+static void config_set_applies_whole_changes_only(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":21,\"config\":{\"uart\":{\"baud\":921600}}}");
+    CHECK(io_record.apply_count == 1);
+    CHECK(io_record.applied.uart_baud == 921600);
+    CHECK(io_record.applied.uart_tx_pin == 17); /* Untouched keys keep their values */
+    cJSON *changed = last_json(1, "hub.config.changed");
+    CHECK(changed != NULL);
+    cJSON_Delete(changed);
+
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":22,\"config\":{\"uart\":{\"tx_pin\":19}}}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "field"), "uart.tx_pin") == 0); /* USB on the S3 */
+    cJSON_Delete(err);
+
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":23,\"config\":{\"colour\":\"red\"}}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "field"), "colour") == 0); /* Unknown keys are errors */
+    cJSON_Delete(err);
+    CHECK(io_record.apply_count == 1);
+}
+
+static void a_detected_rate_is_kept_and_shown(void)
+{
+    start();
+    open_session(0);
+    hub_device_found(&hub, &IDENTITY, 921600); /* The settings say 1,000,000 */
+    CHECK(io_record.apply_count == 1);
+    CHECK(io_record.applied.uart_baud == 921600);
+    cJSON *changed = last_json(0, "hub.config.changed");
+    CHECK(json_number(cJSON_GetObjectItemCaseSensitive(
+                          cJSON_GetObjectItemCaseSensitive(changed, "config"), "uart"),
+                      "baud") == 921600);
+    cJSON_Delete(changed);
+
+    hub_device_lost(&hub);
+    hub_device_found(&hub, &IDENTITY, 921600); /* Same rate again: nothing to save */
+    CHECK(io_record.apply_count == 1);
+}
+
+static void wifi_scans_answer_later(void)
+{
+    start();
+    open_session(0);
+    forget_messages(); /* Drop the auth reply, so "no ok yet" means something */
+    send_json(0, "{\"t\":\"hub.wifi.scan\",\"id\":30}");
+    CHECK(io_record.scan_slot == 0 && io_record.scan_request == 30);
+    CHECK(last_json(0, "ok") == NULL);
+
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddArrayToObject(body, "networks");
+    hub_reply_later(&hub, io_record.scan_slot, io_record.scan_session, io_record.scan_request,
+                    body);
+    cJSON *ok = last_json(0, "ok");
+    CHECK(json_number(ok, "id") == 30);
+    cJSON_Delete(ok);
+}
+
+static void joining_another_network_closes_every_session(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    io_record.refuse_join = true;
+    send_json(0, "{\"t\":\"hub.wifi.join\",\"id\":31,\"ssid\":\"Studio\",\"password\":\"x\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(err != NULL);
+    cJSON_Delete(err);
+
+    io_record.refuse_join = false;
+    send_json(0, "{\"t\":\"hub.wifi.join\",\"id\":32,\"ssid\":\"Studio\","
+                 "\"password\":\"studio-pass\"}");
+    CHECK(strcmp(io_record.joined_ssid, "Studio") == 0);
+    CHECK(io_record.close_code[0] == 4003 && io_record.close_code[1] == 4003);
+}
+
+static void a_factory_reset_tells_everyone_then_restarts(void)
+{
+    start();
+    open_session(0);
+    send_json(0, "{\"t\":\"hub.reset\",\"id\":33,\"level\":\"sideways\"}");
+    CHECK(io_record.restart_level == -1);
+    send_json(0, "{\"t\":\"hub.reset\",\"id\":34,\"level\":\"factory\"}");
+    CHECK(last_json(0, "ok") != NULL);
+    CHECK(io_record.close_code[0] == 4003);
+    CHECK(io_record.restart_level == HUB_RESTART_FACTORY);
 }
 
 void test_hub(void)
@@ -699,4 +953,14 @@ void test_hub(void)
     RUN(snapshots_come_from_the_cache_until_something_changes);
     RUN(a_lock_keeps_other_sessions_out);
     RUN(the_hub_can_be_renamed);
+    RUN(with_the_pin_on_hello_asks_for_it);
+    RUN(pairing_with_the_pin_issues_a_token);
+    RUN(setting_the_pin_keeps_the_setter_and_signs_out_the_rest);
+    RUN(a_revoked_client_is_disconnected);
+    RUN(config_get_shows_settings_and_choices);
+    RUN(config_set_applies_whole_changes_only);
+    RUN(a_detected_rate_is_kept_and_shown);
+    RUN(wifi_scans_answer_later);
+    RUN(joining_another_network_closes_every_session);
+    RUN(a_factory_reset_tells_everyone_then_restarts);
 }

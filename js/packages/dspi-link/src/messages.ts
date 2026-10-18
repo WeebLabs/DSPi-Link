@@ -17,6 +17,9 @@ export interface ProtoVersion {
 }
 
 export type AuthMode = "none" | "pin";
+/** Where a `pin` hub's PIN comes from, spec 6.2: shown by the hub for a
+ * moment, or chosen by the user once. Added in 1.2. */
+export type PinSource = "window" | "fixed";
 export type HubKind = "console" | "bridge";
 export type LinkRole = "viewer" | "control" | "admin";
 export type DeviceState = "online" | "offline" | "updating";
@@ -46,6 +49,12 @@ export type LinkCapability =
   | "fw_install"
   | "web"
   | "rename"
+  // 1.2: hub administration, spec 7.10 to 7.14
+  | "hub_config"
+  | "wifi"
+  | "auth_config"
+  | "reset"
+  | "hub_update"
   | (string & {});
 
 export interface HubDescriptor {
@@ -87,6 +96,8 @@ export interface HelloHubMessage extends Envelope {
   proto: ProtoVersion;
   hub: HubDescriptor;
   auth: AuthMode;
+  /** Present only when `auth` is `pin`; absent means `window` (spec 7.2). */
+  pin_source?: PinSource;
   caps: LinkCapability[];
   limits: HubLimits;
 }
@@ -96,6 +107,11 @@ export type HelloMessage = HelloClientMessage | HelloHubMessage;
 /** A hub hello carries `hub`; a client hello carries `client`. */
 export function isHubHello(msg: HelloMessage): msg is HelloHubMessage {
   return (msg as HelloHubMessage).hub !== undefined;
+}
+
+/** The hello's PIN source, with the spec's default for a hub that omits it. */
+export function pinSourceOf(hello: HelloHubMessage): PinSource {
+  return hello.pin_source ?? "window";
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +146,12 @@ export interface OkMessage extends Envelope {
   // hub.stats
   sessions?: number;
   uptime_s?: number;
+  // hub.config.get / hub.config.set
+  config?: HubConfig;
+  options?: HubConfig;
+  // hub.wifi.scan
+  current?: WifiCurrent | null;
+  networks?: WifiNetwork[];
   [key: string]: unknown;
 }
 
@@ -138,6 +160,8 @@ export interface ErrMessage extends Envelope {
   id?: number;
   code: LinkErrorCode;
   msg?: string;
+  /** For a rejected hub.config.set: the offending key as a dotted path. */
+  field?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +363,110 @@ export interface HubRenameMessage extends Envelope {
   name: string;
 }
 
+// ---------------------------------------------------------------------------
+// Hub settings, spec 7.10
+
+/**
+ * A hub's configuration. Its keys belong to the hub kind; this spec defines
+ * only `name`. The bridge's keys are in esp32_bridge_spec.md.
+ */
+export interface HubConfig {
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface HubConfigGetMessage extends Envelope {
+  t: "hub.config.get";
+  id: number;
+}
+
+/** Only the keys being changed; nested objects merge. */
+export interface HubConfigSetMessage extends Envelope {
+  t: "hub.config.set";
+  id: number;
+  config: HubConfig;
+}
+
+/** Sent to every admin session after any change. */
+export interface HubConfigChangedMessage extends Envelope {
+  t: "hub.config.changed";
+  config: HubConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Wi-Fi, spec 7.11
+
+export interface WifiNetwork {
+  ssid: string;
+  rssi: number;
+  secure: boolean;
+}
+
+export interface WifiCurrent {
+  ssid: string;
+  rssi: number;
+  ip: string;
+}
+
+export interface HubWifiScanMessage extends Envelope {
+  t: "hub.wifi.scan";
+  id: number;
+}
+
+export interface HubWifiJoinMessage extends Envelope {
+  t: "hub.wifi.join";
+  id: number;
+  ssid: string;
+  /** Empty for an open network. */
+  password: string;
+}
+
+// ---------------------------------------------------------------------------
+// Authentication settings, spec 7.12
+
+/** `mode: "pin"` with a 6-digit `pin` sets a fixed PIN; without one, window PINs. */
+export interface HubAuthSetMessage extends Envelope {
+  t: "hub.auth.set";
+  id: number;
+  mode: AuthMode;
+  pin?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Restart and reset, spec 7.13
+
+export type HubResetLevel = "network" | "factory";
+
+export interface HubRestartMessage extends Envelope {
+  t: "hub.restart";
+  id: number;
+}
+
+export interface HubResetMessage extends Envelope {
+  t: "hub.reset";
+  id: number;
+  level: HubResetLevel;
+}
+
+// ---------------------------------------------------------------------------
+// Hub firmware update, spec 7.14
+
+export interface HubUpdateMessage extends Envelope {
+  t: "hub.update";
+  id: number;
+  size: number;
+  /** Lowercase hex. */
+  sha256: string;
+  version?: string;
+}
+
+export interface HubUpdateDoneMessage extends Envelope {
+  t: "hub.update.done";
+  ok: boolean;
+  version?: string;
+  msg?: string;
+}
+
 /** Anything this version does not model, kept addressable rather than dropped. */
 export interface UnknownMessage extends Envelope {
   t: string;
@@ -371,6 +499,16 @@ export type LinkMessage =
   | FwDoneMessage
   | HubStatsMessage
   | HubRenameMessage
+  | HubConfigGetMessage
+  | HubConfigSetMessage
+  | HubConfigChangedMessage
+  | HubWifiScanMessage
+  | HubWifiJoinMessage
+  | HubAuthSetMessage
+  | HubRestartMessage
+  | HubResetMessage
+  | HubUpdateMessage
+  | HubUpdateDoneMessage
   | UnknownMessage;
 
 export class LinkMessageError extends Error {

@@ -1,0 +1,7 @@
+{
+  "code" : "bad_request",
+  "field" : "uart.tx_pin",
+  "id" : 21,
+  "msg" : "pin 3 cannot be used",
+  "t" : "err"
+}

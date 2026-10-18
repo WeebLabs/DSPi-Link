@@ -32,11 +32,13 @@ static const char *TAG = "dspi_uart";
 /* The heartbeat asks for the interface status, the cheapest read there is. */
 #define REQ_GET_CTRL_IFACE_STATUS 0xF9
 
-/* One queued request. */
+/* One queued item: a request for the DSPi, or new link settings. */
 typedef struct {
+    bool reconfigure; /* True: apply `settings`; false: send `request` */
     dspi_request_t request;
     bool may_retry;
     uint32_t tag;
+    dspi_uart_config_t settings; /* Pins, rate and detection; handlers unused */
 } queued_request_t;
 
 /* Everything the uart task owns. Only the task touches it after start,
@@ -151,6 +153,45 @@ static void relay_notification(void *context, const uint8_t *packet, size_t leng
     }
 }
 
+/* Moves the UART to new pins and rate. Whatever device was there is
+ * reported lost; the task looks for it again on the new link. */
+static void apply_reconfigure(const dspi_uart_config_t *settings)
+{
+    dspi_uart_config_t *config = &uart_task_state.config;
+    const bool same_link = settings->tx_pin == config->tx_pin &&
+                           settings->rx_pin == config->rx_pin &&
+                           settings->baud == dspi_link_baud(&uart_task_state.link);
+    if (same_link) {
+        /* Already running like this: the usual case is the hub saving a rate
+         * that detection has just found. Nothing to move, nothing lost. */
+        config->baud = settings->baud;
+        config->detect_baud = settings->detect_baud;
+        return;
+    }
+
+    config->tx_pin = settings->tx_pin;
+    config->rx_pin = settings->rx_pin;
+    config->baud = settings->baud;
+    config->detect_baud = settings->detect_baud;
+
+    uart_driver_delete(UART_PORT);
+    const esp_err_t err = install_uart(config->tx_pin, config->rx_pin, config->baud);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART setup on TX %u, RX %u failed: %s", config->tx_pin, config->rx_pin,
+                 esp_err_to_name(err));
+    }
+    dspi_link_set_baud(&uart_task_state.link, config->baud);
+    ESP_LOGI(TAG, "Link moved to TX GPIO %u, RX GPIO %u, %lu baud", config->tx_pin, config->rx_pin,
+             (unsigned long)config->baud);
+
+    if (uart_task_state.device_present) {
+        uart_task_state.device_present = false;
+        if (config->handlers.device_lost != NULL) {
+            config->handlers.device_lost(config->handlers.context);
+        }
+    }
+}
+
 static void deliver_reply(const queued_request_t *item, const dspi_reply_t *reply)
 {
     const dspi_uart_handlers_t *handlers = &uart_task_state.config.handlers;
@@ -167,6 +208,10 @@ static void refuse_requests(uint32_t wait_ms)
     queued_request_t item;
     TickType_t wait = pdMS_TO_TICKS(wait_ms);
     while (xQueueReceive(uart_task_state.queue, &item, wait) == pdTRUE) {
+        if (item.reconfigure) {
+            apply_reconfigure(&item.settings);
+            return; /* Look on the new link straight away */
+        }
         deliver_reply(&item, &no_device);
         wait = 0;
     }
@@ -223,6 +268,10 @@ static void serve_device(void)
 
     if (xQueueReceive(uart_task_state.queue, &item, pdMS_TO_TICKS(DSPI_UART_LISTEN_SLICE_MS)) ==
         pdTRUE) {
+        if (item.reconfigure) {
+            apply_reconfigure(&item.settings);
+            return;
+        }
         const dspi_reply_t reply = dspi_link_transact(link, &item.request, item.may_retry);
         deliver_reply(&item, &reply);
     } else if (dspi_link_idle_ms(link) >= DSPI_UART_HEARTBEAT_IDLE_MS) {
@@ -282,6 +331,17 @@ esp_err_t dspi_uart_start(const dspi_uart_config_t *config)
     }
     ESP_LOGI(TAG, "Looking for a DSPi on TX GPIO %u, RX GPIO %u", config->tx_pin, config->rx_pin);
     return ESP_OK;
+}
+
+esp_err_t dspi_uart_reconfigure(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud, bool detect_baud)
+{
+    const queued_request_t item = {
+        .reconfigure = true,
+        .settings = {.tx_pin = tx_pin, .rx_pin = rx_pin, .baud = baud, .detect_baud = detect_baud},
+    };
+    return xQueueSend(uart_task_state.queue, &item, pdMS_TO_TICKS(1000)) == pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t dspi_uart_submit(const dspi_request_t *request, bool may_retry, uint32_t tag)

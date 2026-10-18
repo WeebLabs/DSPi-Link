@@ -9,7 +9,9 @@
  *   the loop   the hub task, which takes one event at a time and calls the
  *              hub, and calls hub_tick() every HUB_TICK_MS
  *   hub_io     the functions the hub calls back through, which reach the
- *              HTTP server, the uart task, flash and mDNS
+ *              HTTP server, the uart task, flash, Wi-Fi and mDNS
+ *   calls      hub_task_*() functions other tasks use (the setup page),
+ *              which run a function on the hub task and wait for it
  */
 
 #include "hub_task.h"
@@ -24,6 +26,8 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -32,7 +36,9 @@
 #include "http_server.h"
 #include "hub.h"
 #include "net.h"
+#include "psa/crypto.h"
 #include "settings.h"
+#include <time.h>
 
 static const char *TAG = "hub";
 
@@ -40,6 +46,15 @@ static const char *TAG = "hub";
 #define HUB_TASK_PRIORITY 5
 #define HUB_EVENT_QUEUE_DEPTH 64
 #define HUB_EVENT_POST_TIMEOUT_MS 1000
+#define HUB_CALL_TIMEOUT_MS 5000 /* Most a caller waits to queue its call */
+#define SCAN_TASK_STACK_BYTES 4096
+#define SCAN_MAX_NETWORKS 24
+
+/* A restart waits this long so the replies and close frames go out first. */
+#define RESTART_DELAY_MS 500
+
+/* Clock readings before this (2024-01-01) mean SNTP has not set the time. */
+#define CLOCK_SET_AFTER 1704067200
 
 /* ---------------------------------------------------------------------------
  * Events
@@ -54,8 +69,16 @@ typedef enum {
     EVENT_DEVICE_LOST,
     EVENT_NOTIFICATION,
     EVENT_REPLY,
-    EVENT_RENAME, /* `data` holds the new name */
+    EVENT_REPLY_LATER, /* A Wi-Fi scan's result, for hub_reply_later() */
+    EVENT_CALL,        /* Run `call` on the hub task (hub_task_*() functions) */
 } event_type_t;
+
+/* A function to run on the hub task for another task, and its result. */
+typedef struct {
+    void (*run)(hub_t *hub, void *argument);
+    void *argument;
+    SemaphoreHandle_t done;
+} hub_call_t;
 
 /* One event. `data` is a heap buffer the hub task frees after handling. */
 typedef struct {
@@ -68,6 +91,11 @@ typedef struct {
     dspi_reply_t reply;        /* EVENT_REPLY; its payload is `data` */
     dspi_identity_t *identity; /* EVENT_DEVICE_FOUND, heap */
     uint32_t baud;
+    uint32_t address;    /* EVENT_SESSION_OPENED */
+    uint16_t session_id; /* EVENT_REPLY_LATER */
+    int request_id;      /* EVENT_REPLY_LATER */
+    cJSON *body;         /* EVENT_REPLY_LATER, handed to the hub */
+    hub_call_t *call;    /* EVENT_CALL */
 } hub_event_t;
 
 static struct {
@@ -80,7 +108,21 @@ static struct {
     char *info_json;
     char name[SETTINGS_NAME_MAX_BYTES + 1];
     SemaphoreHandle_t info_lock;
+
+    SemaphoreHandle_t scan_lock; /* One Wi-Fi scan at a time */
+    esp_timer_handle_t restart_timer;
+    hub_restart_level_t restart_level;
 } task_state;
+
+/* The PIN and paired clients as saved: a layout number, then the store. A
+ * firmware that changes hub_auth_store_t changes the size, and the old blob
+ * is then ignored (settings_load_auth). */
+typedef struct {
+    uint32_t layout;
+    hub_auth_store_t store;
+} saved_auth_t;
+
+#define SAVED_AUTH_LAYOUT 1
 
 /* Copies `length` bytes onto the heap, or returns NULL for 0 bytes. */
 static uint8_t *copy_bytes(const uint8_t *data, size_t length)
@@ -108,10 +150,10 @@ static void post(hub_event_t *event)
  * Producers: the HTTP server's handlers (on its task)
  * ------------------------------------------------------------------------- */
 
-static void on_session_opened(void *context, int slot)
+static void on_session_opened(void *context, int slot, uint32_t address)
 {
     (void)context;
-    post(&(hub_event_t){.type = EVENT_SESSION_OPENED, .slot = slot});
+    post(&(hub_event_t){.type = EVENT_SESSION_OPENED, .slot = slot, .address = address});
 }
 
 static void on_session_message(void *context, int slot, bool binary, uint8_t *data, size_t length)
@@ -231,14 +273,180 @@ static uint32_t io_now_ms(void *context)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-static void io_save_hub_name(void *context, const char *name)
+/* Saves and applies new settings (bridge spec 8.11). Only what changed is
+ * touched: the UART moves for new pins or rate, mDNS for a new hostname.
+ * The name reaches DNS-SD through the hub's advertise() that follows. */
+static void io_apply_settings(void *context, const bridge_settings_t *settings)
 {
     (void)context;
-    snprintf(task_state.settings.name, sizeof(task_state.settings.name), "%s", name);
-    const esp_err_t err = settings_save(&task_state.settings);
+    const bridge_settings_t old = task_state.settings;
+    task_state.settings = *settings;
+    const esp_err_t err = settings_save(settings);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Could not save the hub name: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Could not save the settings: %s", esp_err_to_name(err));
     }
+
+    const bool link_changed =
+        old.uart_tx_pin != settings->uart_tx_pin || old.uart_rx_pin != settings->uart_rx_pin ||
+        old.uart_baud != settings->uart_baud || old.uart_detect_baud != settings->uart_detect_baud;
+    if (link_changed) {
+        dspi_uart_reconfigure(settings->uart_tx_pin, settings->uart_rx_pin, settings->uart_baud,
+                              settings->uart_detect_baud);
+    }
+    if (strcmp(old.hostname, settings->hostname) != 0) {
+        net_set_hostname(settings->hostname);
+    }
+}
+
+/* Runs one scan off the hub task, which must not wait seconds for it, and
+ * posts the answer back (Link spec 7.11). */
+typedef struct {
+    int slot;
+    uint16_t session_id;
+    int request_id;
+} scan_request_t;
+
+static void scan_task(void *argument)
+{
+    scan_request_t request = *(scan_request_t *)argument;
+    free(argument);
+
+    net_network_t *networks = calloc(SCAN_MAX_NETWORKS, sizeof(net_network_t));
+    xSemaphoreTake(task_state.scan_lock, portMAX_DELAY);
+    const size_t count = networks != NULL ? net_scan(networks, SCAN_MAX_NETWORKS) : 0;
+    xSemaphoreGive(task_state.scan_lock);
+
+    net_status_t network;
+    net_get_status(&network);
+    cJSON *body = cJSON_CreateObject();
+    cJSON *current = cJSON_AddObjectToObject(body, "current");
+    cJSON_AddStringToObject(current, "ssid", network.ssid);
+    cJSON_AddNumberToObject(current, "rssi", network.rssi);
+    cJSON_AddStringToObject(current, "ip", network.ip);
+    cJSON *list = cJSON_AddArrayToObject(body, "networks");
+    for (size_t i = 0; i < count; i++) {
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "ssid", networks[i].ssid);
+        cJSON_AddNumberToObject(entry, "rssi", networks[i].rssi);
+        cJSON_AddBoolToObject(entry, "secure", networks[i].secure);
+        cJSON_AddItemToArray(list, entry);
+    }
+    free(networks);
+
+    hub_event_t event = {.type = EVENT_REPLY_LATER,
+                         .slot = request.slot,
+                         .session_id = request.session_id,
+                         .request_id = request.request_id,
+                         .body = body};
+    if (xQueueSend(task_state.events, &event, pdMS_TO_TICKS(HUB_EVENT_POST_TIMEOUT_MS)) != pdTRUE) {
+        cJSON_Delete(body);
+    }
+    vTaskDelete(NULL);
+}
+
+static void io_start_wifi_scan(void *context, int slot, uint16_t session_id, int request_id)
+{
+    (void)context;
+    scan_request_t *request = malloc(sizeof(*request));
+    if (request == NULL) {
+        return;
+    }
+    *request = (scan_request_t){.slot = slot, .session_id = session_id, .request_id = request_id};
+    if (xTaskCreate(scan_task, "wifi_scan", SCAN_TASK_STACK_BYTES, request, tskIDLE_PRIORITY + 2,
+                    NULL) != pdPASS) {
+        free(request);
+    }
+}
+
+static bool io_wifi_join(void *context, const char *ssid, const char *password)
+{
+    (void)context;
+    return net_join(ssid, password) == ESP_OK;
+}
+
+/* Erases what the level says, then restarts (Link spec 7.13). Runs from a
+ * timer, so the replies and close frames have gone out first. */
+static void restart_now(void *argument)
+{
+    (void)argument;
+    switch (task_state.restart_level) {
+    case HUB_RESTART_ONLY:
+        break;
+    case HUB_RESTART_NETWORK:
+        settings_forget_wifi();
+        break;
+    case HUB_RESTART_FACTORY:
+        settings_erase_all();
+        break;
+    }
+    ESP_LOGW(TAG, "Restarting");
+    esp_restart();
+}
+
+static void io_restart(void *context, hub_restart_level_t level)
+{
+    (void)context;
+    task_state.restart_level = level;
+    esp_timer_start_once(task_state.restart_timer, (uint64_t)RESTART_DELAY_MS * 1000);
+}
+
+/* ---------------------------------------------------------------------------
+ * hub_auth_io: randomness, hashing, time and saving for the PIN
+ * ------------------------------------------------------------------------- */
+
+static void auth_random(void *context, uint8_t *out, size_t length)
+{
+    (void)context;
+    esp_fill_random(out, length); /* A true random source once Wi-Fi runs */
+}
+
+static void auth_sha256(void *context, const uint8_t *data, size_t length, uint8_t out[32])
+{
+    (void)context;
+    size_t written = 0;
+    psa_hash_compute(PSA_ALG_SHA_256, data, length, out, 32, &written);
+}
+
+static void auth_pbkdf2(void *context, const char *pin, const uint8_t salt[AUTH_PIN_SALT_BYTES],
+                        uint8_t out[32])
+{
+    (void)context;
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_key_derivation_setup(&operation, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
+    psa_key_derivation_input_integer(&operation, PSA_KEY_DERIVATION_INPUT_COST,
+                                     AUTH_PIN_PBKDF2_ITERATIONS);
+    psa_key_derivation_input_bytes(&operation, PSA_KEY_DERIVATION_INPUT_SALT, salt,
+                                   AUTH_PIN_SALT_BYTES);
+    psa_key_derivation_input_bytes(&operation, PSA_KEY_DERIVATION_INPUT_PASSWORD,
+                                   (const uint8_t *)pin, strlen(pin));
+    if (psa_key_derivation_output_bytes(&operation, out, 32) != PSA_SUCCESS) {
+        memset(out, 0, 32); /* Matches no PIN; logged once below */
+        ESP_LOGE(TAG, "PBKDF2 failed");
+    }
+    psa_key_derivation_abort(&operation);
+}
+
+static uint32_t auth_unix_time(void *context)
+{
+    (void)context;
+    const time_t now = time(NULL);
+    return now > CLOCK_SET_AFTER ? (uint32_t)now : 0;
+}
+
+static void auth_save(void *context, const hub_auth_store_t *store)
+{
+    (void)context;
+    const saved_auth_t saved = {.layout = SAVED_AUTH_LAYOUT, .store = *store};
+    const esp_err_t err = settings_save_auth(&saved, sizeof(saved));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save the PIN data: %s", esp_err_to_name(err));
+    }
+}
+
+static uint32_t auth_now_ms(void *context)
+{
+    (void)context;
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 static void io_save_device_name(void *context, const char *serial, const char *name)
@@ -323,7 +531,7 @@ static void handle_event(hub_event_t *event)
     hub_t *hub = &task_state.hub;
     switch (event->type) {
     case EVENT_SESSION_OPENED:
-        hub_session_opened(hub, event->slot);
+        hub_session_opened(hub, event->slot, event->address);
         break;
     case EVENT_SESSION_MESSAGE:
         if (event->binary) {
@@ -341,12 +549,6 @@ static void handle_event(hub_event_t *event)
         break;
     case EVENT_DEVICE_FOUND:
         hub_device_found(hub, event->identity, event->baud);
-        if (event->baud != task_state.settings.uart_baud) {
-            /* Detection found a new rate; start there next time (bridge
-             * spec 7.5 and 8.11). */
-            task_state.settings.uart_baud = event->baud;
-            settings_save(&task_state.settings);
-        }
         break;
     case EVENT_DEVICE_LOST:
         hub_device_lost(hub);
@@ -358,8 +560,12 @@ static void handle_event(hub_event_t *event)
         event->reply.payload = event->data;
         hub_reply(hub, event->tag, &event->reply);
         break;
-    case EVENT_RENAME:
-        hub_rename(hub, (const char *)event->data);
+    case EVENT_REPLY_LATER:
+        hub_reply_later(hub, event->slot, event->session_id, event->request_id, event->body);
+        break;
+    case EVENT_CALL:
+        event->call->run(hub, event->call->argument);
+        xSemaphoreGive(event->call->done);
         break;
     }
     free(event->data);
@@ -391,17 +597,21 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
     task_state.settings = *settings;
     task_state.events = xQueueCreate(HUB_EVENT_QUEUE_DEPTH, sizeof(hub_event_t));
     task_state.info_lock = xSemaphoreCreateMutex();
-    if (task_state.events == NULL || task_state.info_lock == NULL) {
+    task_state.scan_lock = xSemaphoreCreateMutex();
+    if (task_state.events == NULL || task_state.info_lock == NULL || task_state.scan_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
+    const esp_timer_create_args_t restart = {.callback = restart_now, .name = "restart"};
+    ESP_RETURN_ON_ERROR(esp_timer_create(&restart, &task_state.restart_timer), TAG,
+                        "restart timer");
+    ESP_RETURN_ON_FALSE(psa_crypto_init() == PSA_SUCCESS, ESP_FAIL, TAG, "starting PSA crypto");
 
-    hub_config_t config = {
+    const hub_config_t config = {
+        .settings = *settings,
+        .board = board_table(),
         .version = esp_app_get_description()->version,
         .max_sessions = board_max_sessions(),
     };
-    snprintf(config.hub_id, sizeof(config.hub_id), "%s", settings->hub_id);
-    snprintf(config.name, sizeof(config.name), "%s", settings->name);
-
     const hub_io_t io = {
         .send_text = io_send_text,
         .send_binary = io_send_binary,
@@ -409,13 +619,28 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
         .close = io_close,
         .submit = io_submit,
         .now_ms = io_now_ms,
-        .save_hub_name = io_save_hub_name,
+        .apply_settings = io_apply_settings,
+        .start_wifi_scan = io_start_wifi_scan,
+        .wifi_join = io_wifi_join,
+        .restart = io_restart,
         .save_device_name = io_save_device_name,
         .load_device_name = io_load_device_name,
         .advertise = io_advertise,
         .describe_bridge = io_describe_bridge,
     };
-    hub_init(&task_state.hub, &io, &config);
+    const hub_auth_io_t auth_io = {
+        .random = auth_random,
+        .sha256 = auth_sha256,
+        .pbkdf2 = auth_pbkdf2,
+        .now_ms = auth_now_ms,
+        .unix_time = auth_unix_time,
+        .save = auth_save,
+    };
+    static saved_auth_t saved; /* Too big for app_main's stack */
+    const bool have_saved =
+        settings_load_auth(&saved, sizeof(saved)) == ESP_OK && saved.layout == SAVED_AUTH_LAYOUT;
+    hub_init(&task_state.hub, &io, &config, &auth_io, have_saved ? &saved.store : NULL);
+    ESP_LOGI(TAG, "Authentication: %s", hub_pin_enabled(&task_state.hub) ? "PIN" : "none");
     io_advertise(NULL); /* The service exists from the start, with n=0 */
 
     if (xTaskCreate(hub_task, "hub", HUB_TASK_STACK_BYTES, NULL, HUB_TASK_PRIORITY, NULL) !=
@@ -433,7 +658,6 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
                      .notification = on_notification,
                      .reply = on_reply},
     };
-
     return dspi_uart_start(&uart);
 }
 
@@ -448,18 +672,95 @@ http_server_handlers_t hub_task_http_handlers(void)
     };
 }
 
-esp_err_t hub_task_rename(const char *name)
+/* ---------------------------------------------------------------------------
+ * Calls from other tasks
+ * ------------------------------------------------------------------------- */
+
+/* Runs `run` on the hub task and waits for it to finish, so another task
+ * can use the hub without sharing its state. */
+static esp_err_t run_on_hub_task(void (*run)(hub_t *hub, void *argument), void *argument)
 {
-    if (!settings_name_is_valid(name)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const size_t length = strlen(name) + 1;
-    hub_event_t event = {.type = EVENT_RENAME, .data = copy_bytes((const uint8_t *)name, length)};
-    if (event.data == NULL) {
+    hub_call_t call = {.run = run, .argument = argument, .done = xSemaphoreCreateBinary()};
+    if (call.done == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    post(&event);
+    hub_event_t event = {.type = EVENT_CALL, .call = &call};
+    if (xQueueSend(task_state.events, &event, pdMS_TO_TICKS(HUB_CALL_TIMEOUT_MS)) != pdTRUE) {
+        vSemaphoreDelete(call.done);
+        return ESP_ERR_TIMEOUT;
+    }
+    /* Once queued, the hub task always runs the call, and `call` lives on
+     * this stack, so wait for it however long it takes. */
+    xSemaphoreTake(call.done, portMAX_DELAY);
+    vSemaphoreDelete(call.done);
     return ESP_OK;
+}
+
+typedef struct {
+    const char *name;
+    bool ok;
+} rename_call_t;
+
+static void rename_on_hub(hub_t *hub, void *argument)
+{
+    rename_call_t *call = argument;
+    call->ok = hub_rename(hub, call->name);
+}
+
+esp_err_t hub_task_rename(const char *name)
+{
+    rename_call_t call = {.name = name};
+    ESP_RETURN_ON_ERROR(run_on_hub_task(rename_on_hub, &call), TAG, "renaming");
+    return call.ok ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+static void pin_enabled_on_hub(hub_t *hub, void *argument)
+{
+    *(bool *)argument = hub_pin_enabled(hub);
+}
+
+bool hub_task_pin_enabled(void)
+{
+    bool enabled = false;
+    run_on_hub_task(pin_enabled_on_hub, &enabled);
+    return enabled;
+}
+
+typedef struct {
+    uint32_t address;
+    const char *pin;
+    hub_auth_result_t result;
+} check_pin_call_t;
+
+static void check_pin_on_hub(hub_t *hub, void *argument)
+{
+    check_pin_call_t *call = argument;
+    call->result = hub_check_pin(hub, call->address, call->pin);
+}
+
+hub_auth_result_t hub_task_check_pin(uint32_t address, const char *pin)
+{
+    check_pin_call_t call = {.address = address, .pin = pin, .result = HUB_AUTH_WRONG};
+    run_on_hub_task(check_pin_on_hub, &call);
+    return call.result;
+}
+
+typedef struct {
+    const char *pin;
+    bool ok;
+} set_pin_call_t;
+
+static void set_pin_on_hub(hub_t *hub, void *argument)
+{
+    set_pin_call_t *call = argument;
+    call->ok = hub_set_pin(hub, call->pin);
+}
+
+esp_err_t hub_task_set_pin(const char *pin)
+{
+    set_pin_call_t call = {.pin = pin};
+    ESP_RETURN_ON_ERROR(run_on_hub_task(set_pin_on_hub, &call), TAG, "setting the PIN");
+    return call.ok ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
 void hub_task_name(char *name, size_t size)

@@ -616,7 +616,11 @@ found, which gives `wire_version` for the device object.
 - With the PIN on, the bridge is in `pin` mode with `pin_source: "fixed"`.
   Every paired client is granted `admin`, whatever role it asks for.
 - The PIN is stored as PBKDF2-HMAC-SHA256 with a 16-byte random salt and
-  10,000 iterations.
+  1,000 iterations. The hash keeps the PIN from being read straight out of
+  a copy of the flash; with only a million possible PINs, no iteration count
+  would stop an offline search, so the rate limits are the real defence.
+  The count is kept low because each check runs on the hub task: 10,000
+  iterations took 1.5 s on an ESP32-S3 and held up every session.
 - Tokens are 32 bytes from the hardware random number generator. The bridge
   stores their SHA-256 hashes for up to 16 clients. When the list is full,
   pairing a new client evicts the one seen least recently.
@@ -745,6 +749,7 @@ POST /setup/v1/apply
 202  {}
 
 POST /setup/v1/finish
+     {"current_pin": null}
 200  {}
 ```
 
@@ -755,7 +760,10 @@ POST /setup/v1/finish
   network stays up so the page can show the result.
 - `finish` turns the setup network off, 5 s later. If the user never sends
   it, the setup network goes off 2 minutes after the join succeeds.
-- `current_pin` is required when `pin_required` is true.
+- `pin_enabled` true sets `pin`, six digits; false turns the PIN off; left
+  out, the PIN stays as it is, which is how the page keeps an existing PIN.
+- `current_pin` is required by `apply` and `finish` when the bridge has a
+  PIN. After an `apply` that changed the PIN, `finish` takes the new one.
 - Errors are `4xx` with `{"error": "<code>", "msg": "<plain sentence>"}`.
   The codes are `bad_request`, `pin_required`, `wrong_pin`, `rate_limited`
   and `busy`.

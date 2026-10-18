@@ -60,6 +60,10 @@ esp_err_t net_advertise(const char *instance_name, const net_txt_entry_t *txt, s
 
 void net_get_status(net_status_t *status);
 
+/* Takes a new mDNS hostname at once; DHCP reports it from the next lease
+ * (bridge spec 8.11). */
+esp_err_t net_set_hostname(const char *hostname);
+
 /*
  * Lists nearby 2.4 GHz networks, strongest first and each name once, into
  * `networks` (room for `capacity`). Takes a few seconds. Returns how many

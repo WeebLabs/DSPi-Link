@@ -15,6 +15,7 @@ void test_link_frames(void);
 void test_hub(void);
 void test_net(void);
 void test_ws_header(void);
+void test_hub_auth(void);
 
 int main(void)
 {
@@ -27,6 +28,7 @@ int main(void)
     test_hub();
     test_net();
     test_ws_header();
+    test_hub_auth();
 
     const int failures = check_failure_count();
     if (failures == 0) {

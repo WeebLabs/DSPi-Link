@@ -1,8 +1,8 @@
 /*
  * settings.h - loads and saves the bridge's settings in flash (NVS).
  *
- * Implements bridge spec 11 for the `bridge`, `devices` and `wifi`
- * namespaces; the `auth` namespace joins them in phase 5. This is the only module
+ * Implements bridge spec 11: the `bridge`, `wifi`, `auth` and `devices`
+ * namespaces. This is the only module
  * that touches NVS. Call settings_init() once at boot before anything else
  * uses flash storage. The load and save functions may be called from any
  * task, because NVS serialises access itself; in practice the hub task is
@@ -63,5 +63,18 @@ esp_err_t settings_save_wifi(const char *ssid, const char *password);
 
 /* Erases the saved network: "Forget Wi-Fi" (bridge spec 12.1). */
 esp_err_t settings_forget_wifi(void);
+
+/*
+ * The PIN and paired clients, in the `auth` namespace (bridge spec 11), as
+ * one opaque blob that hub_task.c lays out. ESP_ERR_NOT_FOUND when nothing
+ * is saved or the saved blob has a different size, which happens only after
+ * a firmware changes its layout; the bridge then starts with no PIN.
+ */
+esp_err_t settings_load_auth(void *blob, size_t size);
+esp_err_t settings_save_auth(const void *blob, size_t size);
+
+/* Erases everything the bridge has saved: "Factory reset" (bridge spec
+ * 12.1). The caller restarts straight afterwards. */
+esp_err_t settings_erase_all(void);
 
 #endif /* SETTINGS_H */

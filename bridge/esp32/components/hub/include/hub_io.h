@@ -19,6 +19,14 @@
 
 #include "cJSON.h"
 #include "dspi_frame.h"
+#include "settings_model.h"
+
+/* What hub.restart and hub.reset erase before restarting (Link spec 7.13). */
+typedef enum {
+    HUB_RESTART_ONLY,    /* hub.restart: erase nothing */
+    HUB_RESTART_NETWORK, /* hub.reset "network": forget the home network */
+    HUB_RESTART_FACTORY, /* hub.reset "factory": erase everything */
+} hub_restart_level_t;
 
 typedef struct {
     void *context;
@@ -44,8 +52,22 @@ typedef struct {
     /* Milliseconds from any fixed point; wraps after 49 days. */
     uint32_t (*now_ms)(void *context);
 
-    /* Saves the hub's name after hub.rename (bridge spec 8.11). */
-    void (*save_hub_name)(void *context, const char *name);
+    /* Saves new settings and puts them into effect: the UART is restarted on
+     * new pins or rate, mDNS takes a new hostname (bridge spec 8.11). Called
+     * only with settings that pass settings_model_find_problem(). */
+    void (*apply_settings)(void *context, const bridge_settings_t *settings);
+
+    /* Starts a Wi-Fi scan in the background (Link spec 7.11). The result
+     * comes back through hub_reply_later() with these three values. */
+    void (*start_wifi_scan)(void *context, int slot, uint16_t session_id, int request_id);
+
+    /* Tries a new Wi-Fi network, keeping the old one to return to (Link spec
+     * 7.11). False if the name or password cannot be used. */
+    bool (*wifi_join)(void *context, const char *ssid, const char *password);
+
+    /* Restarts the bridge shortly, after erasing what `level` says (Link
+     * spec 7.13). Called once every session has been told. */
+    void (*restart)(void *context, hub_restart_level_t level);
 
     /* Saves and loads device names by serial (bridge spec 8.7). load returns
      * false when no name is saved. */

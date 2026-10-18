@@ -10,6 +10,9 @@
  *   hub_device.c    the device record and its events, notifications,
  *                   snapshots, locks, names
  *   hub_polls.c     poll subscriptions and their schedule
+ *   hub_admin.c     administering the hub: settings, Wi-Fi, the PIN and
+ *                   paired clients, restart and reset
+ *   hub_config.c    the settings as hub.config JSON (hub_config.h)
  */
 
 #ifndef HUB_INTERNAL_H
@@ -17,6 +20,13 @@
 
 #include "cJSON.h"
 #include "hub.h"
+
+/* WebSocket close codes the hub sends (Link spec 5). */
+#define CLOSE_KEEPALIVE_FAILURE 1001
+#define CLOSE_PROTOCOL_ERROR 4000
+#define CLOSE_AUTH_TIMEOUT 4001
+#define CLOSE_TOKEN_REVOKED 4002
+#define CLOSE_SHUTTING_DOWN 4003
 
 /* ---------------------------------------------------------------------------
  * hub.c
@@ -46,6 +56,35 @@ void hub_reply_error(hub_t *hub, int slot, int id, const char *code, const char 
 
 /* Reads an integer member. False if absent or not a number. */
 bool hub_json_int(const cJSON *object, const char *name, int *value);
+
+/* Asks the network side to close a session with `code`, and stops serving
+ * it at once. */
+void hub_close_session(hub_t *hub, int slot, uint16_t code);
+
+/* Closes every live session except `except_slot` (-1 for none). */
+void hub_close_sessions(hub_t *hub, uint16_t code, int except_slot);
+
+/* "pin" or "none", as hello, the TXT record and the info endpoint say. */
+const char *hub_auth_mode(const hub_t *hub);
+
+/* ---------------------------------------------------------------------------
+ * hub_admin.c
+ * ------------------------------------------------------------------------- */
+
+/* Makes `settings` current: saves and applies them through the I/O,
+ * advertises, and tells every session with hub.config.changed. */
+void hub_apply_settings(hub_t *hub, const bridge_settings_t *settings);
+
+void hub_handle_auth_list(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_auth_revoke(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_auth_set_role(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_config_get(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_config_set(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_wifi_scan(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_wifi_join(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_restart(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_reset(hub_t *hub, int slot, int id, const cJSON *message);
 
 /* ---------------------------------------------------------------------------
  * hub_commands.c

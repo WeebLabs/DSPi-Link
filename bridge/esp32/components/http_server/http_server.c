@@ -496,6 +496,25 @@ static esp_err_t before_handshake(httpd_req_t *request)
     return ESP_FAIL;
 }
 
+/* The server listens on IPv6, so IPv4 clients appear as ::ffff:a.b.c.d. */
+uint32_t http_server_peer_address(int fd)
+{
+    struct sockaddr_storage peer;
+    socklen_t length = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &length) != 0) {
+        return 0;
+    }
+    if (peer.ss_family == AF_INET) {
+        return ((const struct sockaddr_in *)&peer)->sin_addr.s_addr;
+    }
+    uint32_t address = 0;
+    if (peer.ss_family == AF_INET6) {
+        memcpy(&address, &((const struct sockaddr_in6 *)&peer)->sin6_addr.s6_addr[12],
+               sizeof(address));
+    }
+    return address;
+}
+
 /* After the handshake: the session begins. ESP-IDF calls this, not the
  * frame handler, once the 101 response has gone out. */
 static esp_err_t after_handshake(httpd_req_t *request)
@@ -510,7 +529,7 @@ static esp_err_t after_handshake(httpd_req_t *request)
      * meter frame back waiting for the client's acknowledgement. */
     const int no_delay = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-    handlers->session_opened(handlers->context, slot);
+    handlers->session_opened(handlers->context, slot, http_server_peer_address(fd));
     return ESP_OK;
 }
 

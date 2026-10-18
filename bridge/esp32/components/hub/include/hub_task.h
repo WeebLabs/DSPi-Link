@@ -11,10 +11,13 @@
 #ifndef HUB_TASK_H
 #define HUB_TASK_H
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 #include "http_server.h"
+#include "hub_auth.h"
 #include "settings_model.h"
 
 /*
@@ -28,9 +31,25 @@ esp_err_t hub_task_start(const bridge_settings_t *settings);
  * pass them to http_server_start(). */
 http_server_handlers_t hub_task_http_handlers(void);
 
-/* Renames the hub from another task (the setup page): posts the request to
- * the hub task, which saves and advertises the name. */
+/*
+ * Functions other tasks (the setup page) use. Each runs on the hub task and
+ * waits for it, so the hub's state stays the hub task's alone.
+ */
+
+/* Renames the hub: saves and advertises the name. ESP_ERR_INVALID_ARG for a
+ * name that is not 1 to 63 bytes of UTF-8. */
 esp_err_t hub_task_rename(const char *name);
+
+/* True when the PIN is on (bridge spec 9.2). */
+bool hub_task_pin_enabled(void);
+
+/* Checks a PIN typed on the setup page, under the pairing rate limits. */
+hub_auth_result_t hub_task_check_pin(uint32_t address, const char *pin);
+
+/* Turns the PIN on with `pin`, or off with NULL; every paired client is
+ * forgotten (bridge spec 9.3). ESP_ERR_INVALID_ARG for a PIN that is not
+ * six digits. */
+esp_err_t hub_task_set_pin(const char *pin);
 
 /* Copies the hub's current name. Safe from any task. */
 void hub_task_name(char *name, size_t size);

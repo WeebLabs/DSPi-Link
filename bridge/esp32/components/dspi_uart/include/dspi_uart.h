@@ -58,6 +58,11 @@ esp_err_t dspi_uart_start(const dspi_uart_config_t *config);
  */
 esp_err_t dspi_uart_submit(const dspi_request_t *request, bool may_retry, uint32_t tag);
 
+/* Moves the link to new pins and a new rate, from hub.config.set (bridge
+ * spec 8.11). The device is reported lost and then found again on the new
+ * link, if it answers there. Queued behind any requests already waiting. */
+esp_err_t dspi_uart_reconfigure(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud, bool detect_baud);
+
 /* What hub.stats reports about the link (bridge spec 8.7). */
 typedef struct {
     uint8_t tx_pin;

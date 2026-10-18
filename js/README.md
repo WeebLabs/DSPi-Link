@@ -54,7 +54,12 @@ Four modules, each usable on its own:
   unknown `t` into a bare envelope instead of throwing, per spec 10.3.
 - `client.ts` - `LinkClient`: handshake, tag and id correlation, the device
   inventory kept current from events, poll subscriptions, locks, keepalive,
-  close-code mapping and backoff reconnection.
+  close-code mapping and backoff reconnection. Since 1.2 it also has the hub
+  administration calls of spec 7.9 to 7.13 (`getHubConfig`, `setHubConfig`,
+  `scanWifi`, `joinWifi`, `setAuth`, `listClients`, `revokeClient`,
+  `restartHub`, `resetHub`) and a `hubConfig` event for
+  `hub.config.changed`. A rejected `hub.config.set` rejects with a
+  `LinkProtocolError` whose `field` names the key.
 - `decoders.ts` - the firmware payloads Link carries verbatim: the bulk header,
   master volume and global preamp accessors, the combined status frame, the
   platform reply and v2 notification packets. Every offset is documented with
@@ -66,12 +71,14 @@ tests drive it against an in-process fake hub.
 
 ## The web app
 
-Three screens: connect, device list, one device.
+Four screens: connect, device list, one device, and a bridge's settings.
 
 - **Connect.** Defaults to the origin that served the page, so a hub serving
   this bundle needs no configuration. `GET /dspi/v1/info` fills in the hub's
   name and kind; another `host:port` can be typed instead. When the hub wants a
-  PIN, a pairing panel appears and the token it returns is kept in
+  PIN, a pairing panel appears, worded from the hello's `pin_source`: a hub
+  with a fixed PIN (a bridge) asks for the PIN the user chose, any other hub
+  for the one its pairing window shows. The token it returns is kept in
   `localStorage` keyed on the hub id, never on the address.
 - **Device list.** From `device.list`, kept current from `device.added`,
   `device.changed` and `device.removed`.
@@ -82,6 +89,15 @@ Three screens: connect, device list, one device.
   notification for the master volume offset moves the slider when another
   client makes the change; frames whose `origin` is our own session id are
   dropped. `RESYNC` and `BULK_INVALIDATED` re-read the snapshot.
+- **Bridge settings** (`settings.ts`). Shown to an `admin` session when the
+  hub has `hub_config`: status, the DSPi connection with a wiring diagram,
+  Wi-Fi, the PIN and paired clients, name, hostname and LED, and restart,
+  forget Wi-Fi and factory reset. Everything goes through the admin
+  messages; the layout is in `esp32_bridge_spec.md` section 10.3.
+
+`apps/web` also builds a second page, `setup.html`, which only a bridge
+serves, on its setup network (bridge spec 10.2). It talks to the bridge's
+small HTTP setup API rather than Link.
 
 No web fonts, no CDN, no external requests of any kind: the page has to work on
 a LAN with no internet.
@@ -109,5 +125,6 @@ alongside the protocol on one port (spec 4.2):
 A hub that serves it advertises `web` in `hello.caps` and `web=1` in its
 DNS-SD TXT record.
 
-The whole bundle is a little over 11 kB gzipped, which is small enough for a
-microcontroller hub to hold in flash and serve from a static table.
+The control page is about 19 kB gzipped and the setup page about 7 kB,
+small enough for a microcontroller hub to hold in flash and serve from a
+static table.

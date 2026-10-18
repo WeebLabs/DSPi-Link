@@ -1,0 +1,36 @@
+{
+  "auth" : "pin",
+  "caps" : [
+    "cmd",
+    "notify",
+    "poll",
+    "snapshot",
+    "lock",
+    "web",
+    "rename",
+    "hub_config",
+    "wifi",
+    "auth_config",
+    "reset",
+    "hub_update"
+  ],
+  "hub" : {
+    "id" : "0d6c41e2-93b7-4f0a-b5a8-3c2e7f19a4d0",
+    "kind" : "bridge",
+    "name" : "DSPi Bridge 3F2A",
+    "version" : "1.0.0"
+  },
+  "limits" : {
+    "max_frame" : 16384,
+    "max_inflight" : 4,
+    "max_payload" : 8192,
+    "poll_budget_bps" : 40000,
+    "poll_max_hz" : 20
+  },
+  "pin_source" : "fixed",
+  "proto" : {
+    "major" : 1,
+    "minor" : 2
+  },
+  "t" : "hello"
+}
