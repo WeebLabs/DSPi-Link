@@ -11,4 +11,3 @@ bridge/esp32/dependencies.lock
 bridge/esp32/sdkconfig
 bridge/esp32/sdkconfig.old
 bridge/esp32/build-host/
-bridge/esp32/components/net/local_wifi.h

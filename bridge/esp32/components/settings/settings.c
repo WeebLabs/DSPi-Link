@@ -340,3 +340,67 @@ esp_err_t settings_save_device_name(const char *serial, const char *name)
     nvs_close(nvs);
     return err;
 }
+
+/* ---------------------------------------------------------------------------
+ * The home network (namespace `wifi`)
+ * ------------------------------------------------------------------------- */
+
+#define WIFI_NAMESPACE "wifi"
+#define KEY_WIFI_SSID "ssid"
+#define KEY_WIFI_PASSWORD "password"
+
+esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
+                             char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1])
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t length = SETTINGS_WIFI_SSID_MAX_BYTES + 1;
+    err = nvs_get_str(nvs, KEY_WIFI_SSID, ssid, &length);
+    if (err == ESP_OK) {
+        length = SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1;
+        err = nvs_get_str(nvs, KEY_WIFI_PASSWORD, password, &length);
+    }
+    nvs_close(nvs);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : err;
+}
+
+esp_err_t settings_save_wifi(const char *ssid, const char *password)
+{
+    if (strlen(ssid) == 0 || strlen(ssid) > SETTINGS_WIFI_SSID_MAX_BYTES ||
+        strlen(password) > SETTINGS_WIFI_PASSWORD_MAX_BYTES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    ESP_RETURN_ON_ERROR(nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs), TAG, "opening %s",
+                        WIFI_NAMESPACE);
+    esp_err_t err = nvs_set_str(nvs, KEY_WIFI_SSID, ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs, KEY_WIFI_PASSWORD, password);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t settings_forget_wifi(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_all(nvs);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}

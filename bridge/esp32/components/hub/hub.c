@@ -365,16 +365,24 @@ static void handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message)
     hub_reply_ok(hub, slot, id, body);
 }
 
+bool hub_rename(hub_t *hub, const char *name)
+{
+    if (!settings_name_is_valid(name)) {
+        return false;
+    }
+    snprintf(hub->config.name, sizeof(hub->config.name), "%s", name);
+    hub->io.save_hub_name(hub->io.context, hub->config.name);
+    hub->io.advertise(hub->io.context);
+    return true;
+}
+
 static void handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message)
 {
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
-    if (!cJSON_IsString(name) || !settings_name_is_valid(name->valuestring)) {
+    if (!cJSON_IsString(name) || !hub_rename(hub, name->valuestring)) {
         hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
         return;
     }
-    snprintf(hub->config.name, sizeof(hub->config.name), "%s", name->valuestring);
-    hub->io.save_hub_name(hub->io.context, hub->config.name);
-    hub->io.advertise(hub->io.context);
     hub_reply_ok(hub, slot, id, NULL);
 }
 

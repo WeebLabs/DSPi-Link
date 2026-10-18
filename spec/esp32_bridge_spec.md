@@ -366,8 +366,11 @@ step:
    otherwise the setup network. mDNS starts here, so the hub has somewhere
    to advertise from its first moment.
 5. Start the hub task, which starts the uart task with the saved pins and
-   baud rate and then the HTTP servers that feed it.
-6. If this image is new, start the rollback confirmation timer (section 14.2).
+   baud rate.
+6. Start the HTTP servers, with Link sessions going to the hub task and the
+   setup network's requests to the setup API. `app_main` connects the two so
+   that neither component depends on the other.
+7. If this image is new, start the rollback confirmation timer (section 14.2).
 
 ---
 
@@ -520,10 +523,19 @@ notifications.
 - The bridge accepts up to 4 sessions, or 8 on a board with PSRAM. Beyond
   that it answers the WebSocket upgrade with HTTP 503.
 - Keepalive and close codes follow Link spec 4 and 5.
-- Each session has an outbound queue of 32 frames. When the queue is full,
-  the hub drops notifications for that session and, once there is room
-  again, sends RESYNC with reason 0. A session whose socket stays unwritable
-  for 10 s is closed with code 1011.
+- Each session has an outbound queue of 32 frames. One job on the HTTP
+  server's task sends what waits: each session's frames encoded into one
+  batch, written without waiting, so a socket takes what fits and the rest
+  goes on the next pass. Batching keeps fast meter polls from flooding the
+  TCP stack with tiny writes, and never waiting means a client that reads
+  slowly, or sits on a weak Wi-Fi link, falls behind on its own without
+  holding up anyone else.
+- When a session's queue is full, the hub drops notifications and poll
+  frames for it and, once there is room again, sends RESYNC with reason 0.
+  A session that has sent nothing for 10 s while frames wait is closed with
+  code 1011.
+- Pongs and close replies join the same queue, since writing them straight
+  to the socket could split a batch that is part sent.
 - The Link WebSocket also answers on the setup network, so a phone on the
   setup network can control the DSPi before any home network is set up.
 
@@ -556,8 +568,10 @@ with reason 0 to every session and marks the snapshot cache stale.
 ### 8.5 Polls
 
 Poll subscriptions follow Link spec 7.6. Identical polls (same `req`, `val`,
-`idx` and `len`) from several sessions run once and fan out. The hub stops
-polling as soon as no session subscribes.
+`idx` and `len`) from several sessions run once, at the fastest rate any of
+them was granted, and fan out. Each session still receives answers only at
+its own granted rate. The hub stops polling as soon as no session
+subscribes.
 
 ### 8.6 Snapshot
 
@@ -670,7 +684,16 @@ is found again, which the settings page explains before saving.
 | `SETUP` | Setup network only | No home network is saved. | The setup page saves one: `CONNECTING`. |
 | `CONNECTING` | Station, plus the setup network if it was already up | A home network is saved (boot, setup, `hub.wifi.join`). | Connected: `ONLINE`. Not connected within 3 minutes: `FALLBACK`. |
 | `ONLINE` | Station only | The station has an IP address. | Disconnected: `CONNECTING`, and after 3 minutes without a connection, `FALLBACK`. |
-| `FALLBACK` | Station and setup network | A saved home network has been unreachable for 3 minutes. | Connected: `ONLINE`, with the setup network kept up until no phone has been on it for 60 s. |
+| `FALLBACK` | Station and setup network | A saved home network has been unreachable for 3 minutes. | Connected: `ONLINE`, with the setup network kept up for a while (below). |
+
+Once `ONLINE`, a setup network that is still up goes off at the first of:
+5 s after the setup page sends `finish`, 2 minutes after the join, or 60 s
+with no phone or computer on it.
+
+A new network's credentials are saved only once the bridge has an address
+on it. A join fails when the password is refused twice in a row (one
+refusal can be a handshake that merely timed out), or when 30 s pass
+without an address; the bridge then returns to the network it had, if any.
 
 In `CONNECTING` and `FALLBACK` the station retries with growing delays (5 s,
 10 s, 20 s, then every 30 s). The setup network must share the station's
@@ -700,17 +723,18 @@ network. A user who wants that window protected turns the PIN on.
 
 ### 9.3 The setup API
 
-Plain HTTP and JSON under `/setup/v1/`, answered only on the setup network.
-Each handler checks which interface the request arrived on and answers 404
-on the home network. These paths are outside the Link protocol (Link spec
-4.2) and carry no device commands.
+Plain HTTP and JSON under `/setup/v1/`, answered only on the setup network:
+port 80 checks which interface each request arrived on, and from the home
+network it only ever redirects to the Link port. These paths are outside
+the Link protocol (Link spec 4.2) and carry no device commands.
 
 ```
 GET  /setup/v1/state
 200  {"name": "DSPi Bridge 3F2A", "chip": "esp32s3", "version": "1.0.0",
       "pin_required": false,
       "dspi": {"found": true, "serial": "E46058388B1A2E2C", "baud": 1000000, "notify_enable": true},
-      "wifi": {"saved_ssid": null, "join": "idle", "ip": null, "hostname": "dspi-bridge-3f2a"}}
+      "wifi": {"saved_ssid": null, "join": "idle", "ip": null, "hostname": "dspi-bridge-3f2a",
+               "setup_ssid": "DSPi Bridge 3F2A"}}
 
 GET  /setup/v1/networks
 200  {"networks": [{"ssid": "Home", "rssi": -52, "secure": true}]}
@@ -724,8 +748,9 @@ POST /setup/v1/finish
 200  {}
 ```
 
-- `wifi.join` in `state` is `idle`, `connecting`, `connected` or `failed`.
-  The setup page polls `state` once a second after `apply`.
+- `wifi.join` in `state` is `idle`, `connecting`, `connected` or `failed`;
+  when `failed`, `wifi.failure` says why: `wrong_password`, `not_found` or
+  `timed_out`. The setup page polls `state` once a second after `apply`.
 - `apply` saves the name and PIN choice and starts `CONNECTING`. The setup
   network stays up so the page can show the result.
 - `finish` turns the setup network off, 5 s later. If the user never sends

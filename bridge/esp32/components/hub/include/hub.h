@@ -63,7 +63,8 @@ typedef struct {
 typedef struct {
     bool active;
     hub_poll_key_t key;
-    uint8_t hz; /* The granted rate */
+    uint8_t hz;            /* The granted rate */
+    uint32_t last_sent_ms; /* So a faster group never exceeds that rate */
 } hub_poll_slot_t;
 
 typedef struct {
@@ -240,6 +241,10 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
 void hub_device_lost(hub_t *hub);
 void hub_notification(hub_t *hub, const uint8_t *packet, size_t length);
 void hub_reply(hub_t *hub, uint32_t tag, const dspi_reply_t *reply);
+
+/* Renames the hub, as hub.rename does: saves the name and advertises it.
+ * False if the name is not 1 to 63 bytes of UTF-8 (bridge spec 8.11). */
+bool hub_rename(hub_t *hub, const char *name);
 
 /* ---------------------------------------------------------------------------
  * What the hub publishes

@@ -6,7 +6,8 @@
  *   port 11915  /dspi/v1        the Link WebSocket (sub-protocol dspi-link-1)
  *               /dspi/v1/info   the discovery document
  *               everything else the web pages (web_assets)
- *   port 80     a redirect to port 11915 (the setup page joins in phase 4)
+ *   port 80     on the setup network: the setup page and its API
+ *               on the home network: a redirect to port 11915
  *
  * Sessions are numbered by slot. A slot's life is FREE, then OPEN at the
  * WebSocket handshake, then CLOSING when the socket closes, then FREE again
@@ -27,6 +28,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_http_server.h"
 
 typedef struct {
     void *context; /* Passed first to every handler */
@@ -50,6 +52,10 @@ typedef struct {
 typedef struct {
     size_t max_sessions; /* At most LINK_MAX_SESSIONS_WITH_PSRAM */
     http_server_handlers_t handlers;
+
+    /* Answers any request that reaches port 80 from the setup network
+     * (setup_api.h). Requests from the home network get the redirect. */
+    esp_err_t (*setup_request)(httpd_req_t *request);
 } http_server_config_t;
 
 /* Starts both servers. They listen on every interface from the start, so
@@ -57,7 +63,8 @@ typedef struct {
 esp_err_t http_server_start(const http_server_config_t *config);
 
 /* Queues one WebSocket message; the bytes are copied. False when the slot is
- * not open or already has LINK_SESSION_QUEUE_FRAMES messages waiting. */
+ * not open, is closing, or already has LINK_SESSION_QUEUE_FRAMES messages
+ * waiting (bridge spec 8.2). */
 bool http_server_send(int slot, bool binary, const uint8_t *data, size_t length);
 
 /* Sends a WebSocket ping. */
@@ -69,9 +76,9 @@ void http_server_close(int slot, uint16_t code);
 /* The hub has finished with a closed session; the slot may be reused. */
 void http_server_release_slot(int slot);
 
-/* Closes, with code 1011, any session whose socket has accepted nothing for
- * LINK_UNWRITABLE_TIMEOUT_MS while messages wait (Link spec 5). Call
- * regularly. */
-void http_server_close_stalled(void);
+/* Keeps the send queues moving: restarts sending if an earlier attempt
+ * could not, and closes any session that has sent nothing for
+ * LINK_UNWRITABLE_TIMEOUT_MS while frames wait. Call regularly. */
+void http_server_service(void);
 
 #endif /* HTTP_SERVER_H */

@@ -227,8 +227,13 @@ void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *messag
         hz = hz < 1 ? 1 : hz;
         used += cost * hz;
 
-        session->polls[requests[i].slot] =
-            (hub_poll_slot_t){.active = true, .key = requests[i].key, .hz = (uint8_t)hz};
+        /* last_sent_ms starts a period back, so the first answer goes out. */
+        session->polls[requests[i].slot] = (hub_poll_slot_t){
+            .active = true,
+            .key = requests[i].key,
+            .hz = (uint8_t)hz,
+            .last_sent_ms = hub_now(hub) - 1000u / hz,
+        };
         cJSON *grant = cJSON_CreateObject();
         cJSON_AddNumberToObject(grant, "slot", requests[i].slot);
         cJSON_AddNumberToObject(grant, "hz", hz);
@@ -357,16 +362,25 @@ void hub_polls_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_
     group->failures_in_a_row = 0;
 
     /* Fan out the verbatim answer to every subscriber, under each one's own
-     * slot number and sequence. */
+     * slot number and sequence. The group runs at its fastest subscriber's
+     * rate, so a slower subscriber is sent an answer only when its own
+     * period is due, give or take half the group's period. */
+    const uint32_t now = hub_now(hub);
     for (size_t s = 0; s < hub->config.max_sessions; s++) {
         hub_session_t *session = &hub->sessions[s];
         if (session->state != HUB_SESSION_OPEN) {
             continue;
         }
         for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-            if (!session->polls[p].active || !same_key(&session->polls[p].key, &group->key)) {
+            hub_poll_slot_t *poll = &session->polls[p];
+            if (!poll->active || !same_key(&poll->key, &group->key)) {
                 continue;
             }
+            const uint32_t own_period_ms = 1000u / poll->hz;
+            if (now - poll->last_sent_ms + group->period_ms / 2 < own_period_ms) {
+                continue;
+            }
+            poll->last_sent_ms = now;
             const size_t length =
                 link_encode_poll(hub->frame, sizeof(hub->frame), session->poll_sequence++,
                                  HUB_DEVICE_HANDLE, (uint8_t)p, reply->payload, reply->length);

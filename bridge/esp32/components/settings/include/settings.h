@@ -1,8 +1,8 @@
 /*
  * settings.h - loads and saves the bridge's settings in flash (NVS).
  *
- * Implements bridge spec 11 for the `bridge` and `devices` namespaces; the
- * `wifi` and `auth` namespaces join them in later phases. This is the only module
+ * Implements bridge spec 11 for the `bridge`, `devices` and `wifi`
+ * namespaces; the `auth` namespace joins them in phase 5. This is the only module
  * that touches NVS. Call settings_init() once at boot before anything else
  * uses flash storage. The load and save functions may be called from any
  * task, because NVS serialises access itself; in practice the hub task is
@@ -45,5 +45,23 @@ esp_err_t settings_save(const bridge_settings_t *settings);
 esp_err_t settings_load_device_name(const char *serial, char *name, size_t size);
 
 esp_err_t settings_save_device_name(const char *serial, const char *name);
+
+/*
+ * The home network, in the `wifi` namespace (bridge spec 11). The bridge
+ * keeps Wi-Fi credentials itself rather than in the Wi-Fi driver, so
+ * forgetting a network is one explicit erase.
+ */
+
+#define SETTINGS_WIFI_SSID_MAX_BYTES 32
+#define SETTINGS_WIFI_PASSWORD_MAX_BYTES 64
+
+/* ESP_ERR_NOT_FOUND when no network is saved. */
+esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
+                             char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1]);
+
+esp_err_t settings_save_wifi(const char *ssid, const char *password);
+
+/* Erases the saved network: "Forget Wi-Fi" (bridge spec 12.1). */
+esp_err_t settings_forget_wifi(void);
 
 #endif /* SETTINGS_H */

@@ -2,7 +2,7 @@
 # components.
 idf_component_register(
     SRCS "app_main.c"
-    PRIV_REQUIRES board hub net settings esp_app_format esp_hw_support spi_flash log)
+    PRIV_REQUIRES board http_server hub net settings setup_api esp_app_format esp_hw_support spi_flash log)
 
 # Bridge code builds with extra warnings, all fatal (bridge spec 16).
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wextra -Werror)

@@ -6,11 +6,11 @@ that DSPi over the network. What it does and why is in
 [`spec/esp32_bridge_spec.md`](../../spec/esp32_bridge_spec.md); the build
 order is in [`PLAN.md`](PLAN.md).
 
-**Status:** phase 3 of 8. The bridge is a working Link hub: it finds the
-wired DSPi, joins Wi-Fi, advertises itself by DNS-SD, and serves DSPi
-Console and the web client over the Link WebSocket, with the `auth: none`
-default. Until phase 4 adds the setup page, it joins the network named in a
-local file (see below).
+**Status:** phase 4 of 8. The bridge is a working Link hub that sets itself
+up: on first power-up it shows the setup network `DSPi Bridge XXXX`, a phone
+that joins it gets the setup page by itself, and from there the bridge joins
+the home network, advertises itself by DNS-SD, and serves DSPi Console and
+the web client with the `auth: none` default.
 
 Supported chips: ESP32, ESP32-S3, ESP32-C3 and ESP32-C6, with at least 4 MB
 of flash.
@@ -22,14 +22,6 @@ change under `js/`:
 
 ```bash
 cd ../../js && npm ci && npm run build
-```
-
-Until phase 4, the bridge joins the Wi-Fi network named in
-`components/net/local_wifi.h`. Copy the template and fill it in; the copy is
-git-ignored:
-
-```bash
-cp components/net/local_wifi.example.h components/net/local_wifi.h
 ```
 
 Builds run in Espressif's official Docker image of the ESP-IDF version in
@@ -65,6 +57,15 @@ To start again from factory state, erase the flash first:
 ```bash
 python3 -m esptool --chip esp32s3 -p /dev/cu.usbmodem1101 erase-flash
 ```
+
+## First use
+
+On first power-up the bridge shows an open Wi-Fi network named
+`DSPi Bridge XXXX`. Join it from a phone and the setup page opens by itself;
+if it does not, browse to `http://192.168.4.1/`. Choose your 2.4 GHz home
+network, enter its password and a name, and the page shows the bridge's
+address once it has joined. If the home network disappears for 3 minutes,
+the setup network comes back by itself.
 
 ## Test
 
@@ -125,8 +126,9 @@ python3 tools/gen_policy.py
 | `components/link_codec/` | Link binary frames and base64. |
 | `components/hub/` | The Link hub state machine, and the hub task that runs it. |
 | `components/http_server/` | The Link WebSocket, the info endpoint, the web pages and the port 80 redirect. |
-| `components/net/` | Wi-Fi and the DNS-SD advertisement. |
+| `components/net/` | The Wi-Fi state machine, the setup network and its DNS answers, and the DNS-SD advertisement. |
 | `components/web_assets/` | The built web pages, gzipped into the firmware at build time. |
+| `components/setup_api/` | The setup network's page and API. |
 | `test/host/` | Host tests for the portable components. |
 | `tools/build.sh` | The Docker build used locally and in CI. |
 | `tools/qemu_smoke.sh` | Boots a built image twice in QEMU, used locally and in CI. |

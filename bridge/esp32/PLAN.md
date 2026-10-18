@@ -126,6 +126,26 @@ Android phone without typing any address, falls back to the setup network
 3 minutes after its home network disappears, and returns to the home network
 when it comes back.
 
+**Status (2026-10-18):** done on an iPhone, with three items left over.
+On the ESP32-S3:
+
+- The phone opened the setup page by itself, scanned, joined the home
+  network in about 5 s, and saved it; after a restart the bridge rejoined
+  directly. The setup network went off by itself 2 minutes after the join.
+- The first try showed a white page: the phone's captive-portal browser
+  opens several connections at once and the port 80 server, limited to 4
+  and never dropping idle ones, stalled the page's script. Port 80 now
+  allows 7 and drops the idlest.
+- Load testing then found the send path wrong under pressure: every frame
+  was its own small write and its own entry in the HTTP server's six-entry
+  work queue. Sends are now batched per session and never wait (bridge spec
+  8.2). Two clients polling three meters at 20 Hz each, plus snapshots and
+  the end-to-end test, ran without a dropped frame.
+- Left over: the Android check, and the fallback after 3 minutes without
+  the home network, which the host tests cover but the bench did not. The
+  PIN step of the setup page arrives with the PIN in phase 5.
+
+
 ## Phase 5: Settings and security
 
 - `hub_auth` (section 8.9) and the `pin` mode with a fixed PIN, with host

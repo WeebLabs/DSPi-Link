@@ -64,6 +64,7 @@ typedef struct {
     uint8_t rx_pin;
     uint32_t baud;
     bool device_present;
+    dspi_identity_t identity; /* Valid while device_present */
     dspi_link_counters_t counters;
 } dspi_uart_status_t;
 

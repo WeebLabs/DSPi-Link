@@ -1,12 +1,15 @@
 /*
- * net.h - the bridge's Wi-Fi connection and its DNS-SD advertisement.
+ * net.h - the bridge's Wi-Fi: its home network, its setup network, and its
+ * DNS-SD advertisement.
  *
- * Implements the station side of bridge spec 9.1 and the discovery of 8.8.
- * Phase 3 joins one network whose credentials are compiled in from a
- * git-ignored local_wifi.h; the setup network, the setup page and saved
- * credentials replace that in phase 4.
+ * Implements bridge spec 9.1 and 9.2 and the advertisement of 8.8. The
+ * decisions (when to join, when to show the setup network) live in the
+ * portable net_machine.h; this module applies them to the Wi-Fi driver,
+ * runs the setup network's DNS answers (captive_dns.h) and keeps the home
+ * network's credentials in settings.
  *
- * Every function may be called from any task.
+ * Every function may be called from any task. Changes are carried out on
+ * ESP-IDF's event task, one at a time.
  */
 
 #ifndef NET_H
@@ -16,6 +19,7 @@
 #include <stddef.h>
 
 #include "esp_err.h"
+#include "net_machine.h"
 
 /* One DNS-SD TXT record entry (Link spec 3.1). */
 typedef struct {
@@ -23,17 +27,31 @@ typedef struct {
     const char *value;
 } net_txt_entry_t;
 
-/* What hub.stats reports about the network (bridge spec 8.7). */
+/* The network as the setup API and hub.stats report it. */
 typedef struct {
+    net_state_t state;
+    bool setup_network_on;
+    net_join_t join;
+    net_join_failure_t join_failure;
     bool connected;
-    char ssid[33];
+    char saved_ssid[33]; /* "" when no network is saved */
+    char ssid[33];       /* The network joined, when connected */
     int rssi;
     char ip[16];
     char mac[18];
+    char hostname[64];
+    char setup_ssid[33]; /* "DSPi Bridge XXXX" */
 } net_status_t;
 
-/* Starts Wi-Fi in station mode and mDNS with `hostname`, and keeps
- * reconnecting with the delays of bridge spec 9.1. */
+/* One network found by a scan. */
+typedef struct {
+    char ssid[33];
+    int rssi;
+    bool secure;
+} net_network_t;
+
+/* Starts Wi-Fi with `hostname`: joins the saved home network, or shows the
+ * setup network if none is saved (bridge spec 9.1). */
 esp_err_t net_start(const char *hostname);
 
 /* Advertises, or updates, the bridge's one _dspi._tcp service on the Link
@@ -41,5 +59,30 @@ esp_err_t net_start(const char *hostname);
 esp_err_t net_advertise(const char *instance_name, const net_txt_entry_t *txt, size_t count);
 
 void net_get_status(net_status_t *status);
+
+/*
+ * Lists nearby 2.4 GHz networks, strongest first and each name once, into
+ * `networks` (room for `capacity`). Takes a few seconds. Returns how many
+ * were written.
+ */
+size_t net_scan(net_network_t *networks, size_t capacity);
+
+/*
+ * Tries a new home network. The credentials are saved only once the bridge
+ * has an address on it; until then the previous network, if any, is kept to
+ * fall back to (Link spec 7.11, bridge spec 9.3). ESP_ERR_INVALID_ARG for an
+ * empty or over-long name, or a password that WPA2 cannot use.
+ */
+esp_err_t net_join(const char *ssid, const char *password);
+
+/* The setup page has finished: switch the setup network off shortly. */
+void net_finish_setup(void);
+
+/* True when the socket `fd` was accepted on the setup network rather than
+ * the home network. The setup API answers only there (bridge spec 9.3). */
+bool net_socket_is_on_setup_network(int fd);
+
+/* The setup network's address, "192.168.4.1". */
+const char *net_setup_address(void);
 
 #endif /* NET_H */

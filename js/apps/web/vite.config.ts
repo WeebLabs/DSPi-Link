@@ -9,7 +9,16 @@ export default defineConfig({
     assetsDir: "assets",
     target: "es2020",
     sourcemap: false,
-    // One JS file and one CSS file keeps a bridge's static file table trivial.
-    cssCodeSplit: false,
+    rollupOptions: {
+      // Two pages: the control page every hub serves, and the setup page a
+      // bridge serves on its setup network (bridge spec 10.1). Paths are
+      // relative to this folder, which is Vite's root.
+      input: {
+        index: "index.html",
+        setup: "setup.html",
+      },
+    },
+    // Each page gets only its own stylesheet; they do not share a look.
+    cssCodeSplit: true,
   },
 });

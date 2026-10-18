@@ -545,6 +545,34 @@ static void identical_polls_run_once_and_fan_out(void)
     CHECK(poll1 != NULL && poll1->data[5] == 5);
 }
 
+static void a_slower_subscriber_gets_only_its_own_rate(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    send_json(0, "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":"
+                 "[{\"slot\":0,\"req\":80,\"val\":9,\"idx\":2,\"len\":41,\"hz\":20}]}");
+    send_json(1, METER_POLL, 0); /* The same poll at 10 Hz */
+
+    static const uint8_t meters[41] = {7};
+    unsigned fast = 0;
+    unsigned slow = 0;
+    for (int tick = 0; tick < 20; tick++) { /* One second at 20 Hz */
+        forget_messages();
+        forget_submissions();
+        hub_tick(&hub);
+        if (io_record.submission_count == 1) {
+            answer_last(0, meters, sizeof(meters));
+        }
+        fast += last_frame(0, LINK_FRAME_POLL) != NULL ? 1 : 0;
+        slow += last_frame(1, LINK_FRAME_POLL) != NULL ? 1 : 0;
+        io_record.now_ms += 50;
+    }
+    CHECK(fast == 20);
+    CHECK(slow == 10);
+}
+
 static void commands_go_before_polls(void)
 {
     start();
@@ -664,6 +692,7 @@ void test_hub(void)
     RUN(a_seq_gap_makes_everyone_resync);
     RUN(a_full_queue_owes_a_resync);
     RUN(identical_polls_run_once_and_fan_out);
+    RUN(a_slower_subscriber_gets_only_its_own_rate);
     RUN(commands_go_before_polls);
     RUN(polling_stops_when_nobody_subscribes);
     RUN(only_reads_may_be_polled);

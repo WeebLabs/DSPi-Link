@@ -2,13 +2,15 @@
  * http_server.c - the Link port and port 80. See http_server.h; implements
  * bridge spec 8.2 and 8.8 and Link spec 3.2, 4 and 4.2.
  *
- * The slot table is the only state shared between tasks here: the HTTP
- * server's task opens and closes slots, while the hub task sends to them.
- * Every access takes `slots_lock` for a few instructions.
+ * The slot table, with each session's queue of frames to send, is the only
+ * state shared between tasks here: the HTTP server's task opens, closes and
+ * sends, while the hub task queues frames. Every access takes `slots_lock`
+ * for a few instructions; nothing is allocated or sent while it is held.
  */
 
 #include "http_server.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,13 +21,15 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "lwip/sockets.h"
+#include "net.h"
 #include "web_assets.h"
+#include "ws_header.h"
 
 static const char *TAG = "http_server";
 
 #define LINK_SUBPROTOCOL "dspi-link-1"
 #define CLOSE_PROTOCOL_ERROR 4000
-#define CLOSE_CLIENT_STOPPED_READING 1011
 
 /* Sockets the Link server keeps beside its sessions, for page loads and the
  * info endpoint. */
@@ -42,11 +46,31 @@ typedef enum {
     SLOT_CLOSING, /* Socket closed; waiting for http_server_release_slot() */
 } slot_state_t;
 
+/* One frame waiting to be sent. */
+typedef struct {
+    uint8_t opcode; /* WS_OPCODE_* */
+    size_t length;
+    uint8_t data[];
+} outgoing_t;
+
 typedef struct {
     slot_state_t state;
     int fd;
-    uint32_t queued;          /* Messages handed to the server, not yet sent */
-    int64_t last_progress_us; /* When the queue last moved, while not empty */
+    bool close_queued;    /* A close frame is waiting; nothing more is accepted */
+    bool close_requested; /* The socket has been asked to close; ask only once */
+
+    /* Frames waiting to be sent, oldest first (bridge spec 8.2). */
+    outgoing_t *queue[LINK_SESSION_QUEUE_FRAMES];
+    size_t queue_head;
+    size_t queue_count;
+    int64_t last_progress_us; /* When bytes last went out, while any wait */
+
+    /* The batch being sent: frames already encoded, of which `partial_sent`
+     * bytes have gone. Created and freed only on the server's task. */
+    uint8_t *partial;
+    size_t partial_length;
+    size_t partial_sent;
+    bool partial_ends_with_close;
 } slot_t;
 
 static struct {
@@ -54,6 +78,8 @@ static struct {
     httpd_handle_t link_server;
     httpd_handle_t redirect_server;
     slot_t slots[LINK_MAX_SESSIONS_WITH_PSRAM];
+    bool pump_scheduled; /* send_pump() is queued on the server's task */
+    size_t pump_next_slot;
     portMUX_TYPE slots_lock;
 } server_state = {.slots_lock = portMUX_INITIALIZER_UNLOCKED};
 
@@ -101,22 +127,35 @@ static int open_slot(int fd)
     return slot;
 }
 
-/* The fd of an open slot, or -1. */
-static int slot_fd(int slot)
+static bool valid_slot(int slot)
 {
-    if (slot < 0 || (size_t)slot >= server_state.config.max_sessions) {
-        return -1;
+    return slot >= 0 && (size_t)slot < server_state.config.max_sessions;
+}
+
+/* Takes every waiting frame off a slot's queue into `out` (room for
+ * LINK_SESSION_QUEUE_FRAMES), for freeing outside the lock. Call with
+ * slots_lock held. Returns how many. */
+static size_t take_queue_locked(slot_t *slot, outgoing_t **out)
+{
+    const size_t count = slot->queue_count;
+    for (size_t i = 0; i < count; i++) {
+        out[i] = slot->queue[(slot->queue_head + i) % LINK_SESSION_QUEUE_FRAMES];
     }
-    taskENTER_CRITICAL(&server_state.slots_lock);
-    const slot_t *entry = &server_state.slots[slot];
-    const int fd = entry->state == SLOT_OPEN ? entry->fd : -1;
-    taskEXIT_CRITICAL(&server_state.slots_lock);
-    return fd;
+    slot->queue_head = 0;
+    slot->queue_count = 0;
+    return count;
+}
+
+static void free_frames(outgoing_t **frames, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        free(frames[i]);
+    }
 }
 
 void http_server_release_slot(int slot)
 {
-    if (slot < 0 || (size_t)slot >= server_state.config.max_sessions) {
+    if (!valid_slot(slot)) {
         return;
     }
     taskENTER_CRITICAL(&server_state.slots_lock);
@@ -130,14 +169,23 @@ void http_server_release_slot(int slot)
 static void on_socket_closed(httpd_handle_t server, int fd)
 {
     (void)server;
-    int slot = -1;
+    outgoing_t *unsent[LINK_SESSION_QUEUE_FRAMES];
+    size_t unsent_count = 0;
+
+    uint8_t *partial = NULL;
     taskENTER_CRITICAL(&server_state.slots_lock);
-    slot = find_slot_locked(fd);
+    const int slot = find_slot_locked(fd);
     if (slot >= 0) {
-        server_state.slots[slot].state = SLOT_CLOSING;
+        slot_t *entry = &server_state.slots[slot];
+        entry->state = SLOT_CLOSING;
+        unsent_count = take_queue_locked(entry, unsent);
+        partial = entry->partial;
+        entry->partial = NULL;
     }
     taskEXIT_CRITICAL(&server_state.slots_lock);
 
+    free_frames(unsent, unsent_count);
+    free(partial);
     if (slot >= 0) {
         server_state.config.handlers.session_closed(server_state.config.handlers.context, slot);
     }
@@ -146,111 +194,290 @@ static void on_socket_closed(httpd_handle_t server, int fd)
 
 /* ---------------------------------------------------------------------------
  * Sending
+ *
+ * Each session has its own queue. One job on the server's task,
+ * send_pump(), moves frames to the sockets:
+ *
+ *   - A session's waiting frames are encoded into one batch and written
+ *     together, which keeps the TCP stack from drowning in tiny writes when
+ *     meters are polled fast.
+ *   - Writes never wait. A socket takes what fits; the rest of the batch
+ *     waits for the next pass, and the pump moves on to the next session.
+ *     A client that reads slowly, or sits on a weak Wi-Fi link, therefore
+ *     falls behind on its own: its queue fills, the hub drops its
+ *     notifications and owes it a RESYNC, and after
+ *     LINK_UNWRITABLE_TIMEOUT_MS without progress it is closed (bridge
+ *     spec 8.2). Nobody else waits for it.
+ *   - The pump runs until a pass moves nothing. http_server_service(),
+ *     called every hub tick, starts it again for anything still waiting.
  * ------------------------------------------------------------------------- */
 
-/* One message on its way out; freed when the server reports it sent. */
-typedef struct {
-    int slot;
-    int fd;
-    size_t length;
-    uint8_t data[];
-} outgoing_t;
+/* Most bytes one batch carries, and most bytes one run of the pump sends
+ * before giving the server back its task for incoming frames. */
+#define BATCH_MAX_BYTES 16384
+#define PUMP_BYTES_PER_RUN 32768
 
-static void on_sent(esp_err_t err, int fd, void *argument)
+static void send_pump(void *argument);
+
+/* Asks the socket to close, once. Call with slots_lock held; returns the fd
+ * to close outside the lock, or -1 if a close was already asked for. */
+static int request_close_locked(slot_t *slot)
 {
-    (void)err; /* A failed send closes the socket, which on_socket_closed handles */
-    outgoing_t *message = argument;
-    taskENTER_CRITICAL(&server_state.slots_lock);
-    slot_t *slot = &server_state.slots[message->slot];
-    if (slot->fd == fd && slot->queued > 0) {
-        slot->queued--;
-        slot->last_progress_us = esp_timer_get_time();
+    if (slot->state != SLOT_OPEN || slot->close_requested) {
+        return -1;
     }
-    taskEXIT_CRITICAL(&server_state.slots_lock);
-    free(message);
+    slot->close_requested = true;
+    slot->close_queued = true;
+    return slot->fd;
 }
 
-/* Queues one frame of any type for a slot, within its queue limit. */
-static bool queue_frame(int slot, httpd_ws_type_t type, const uint8_t *data, size_t length)
+static void trigger_close(int fd)
 {
-    const int fd = slot_fd(slot);
-    if (fd < 0) {
+    if (fd >= 0) {
+        httpd_sess_trigger_close(server_state.link_server, fd);
+    }
+}
+
+/* Queues send_pump() unless it already is. Call without slots_lock. */
+static void schedule_pump(void)
+{
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    const bool needed = !server_state.pump_scheduled;
+    server_state.pump_scheduled = true;
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+
+    if (needed && httpd_queue_work(server_state.link_server, send_pump, NULL) != ESP_OK) {
+        /* The work queue is full; http_server_service() tries again soon. */
+        taskENTER_CRITICAL(&server_state.slots_lock);
+        server_state.pump_scheduled = false;
+        taskEXIT_CRITICAL(&server_state.slots_lock);
+    }
+}
+
+/* Encodes a slot's waiting frames, up to BATCH_MAX_BYTES, as its new
+ * partial batch. False if nothing waits or memory ran out. */
+static bool start_batch(slot_t *slot)
+{
+    outgoing_t *frames[LINK_SESSION_QUEUE_FRAMES];
+    size_t count = 0;
+    size_t bytes = 0;
+
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    while (slot->queue_count > 0) {
+        outgoing_t *frame = slot->queue[slot->queue_head];
+        const size_t size = WS_HEADER_MAX_BYTES + frame->length;
+        if (count > 0 && bytes + size > BATCH_MAX_BYTES) {
+            break; /* The rest go in the next batch */
+        }
+        frames[count++] = frame;
+        bytes += size;
+        slot->queue_head = (slot->queue_head + 1) % LINK_SESSION_QUEUE_FRAMES;
+        slot->queue_count--;
+    }
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    if (count == 0) {
         return false;
+    }
+
+    uint8_t *buffer = malloc(bytes);
+    size_t length = 0;
+    bool ends_with_close = false;
+    for (size_t i = 0; i < count; i++) {
+        if (buffer != NULL) {
+            length += ws_header_encode(frames[i]->opcode, frames[i]->length, buffer + length);
+            memcpy(buffer + length, frames[i]->data, frames[i]->length);
+            length += frames[i]->length;
+        }
+        ends_with_close = frames[i]->opcode == WS_OPCODE_CLOSE;
+        free(frames[i]);
+    }
+    if (buffer == NULL) {
+        return false; /* The frames are lost; the hub's sequence gaps show it */
+    }
+
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    slot->partial = buffer;
+    slot->partial_length = length;
+    slot->partial_sent = 0;
+    slot->partial_ends_with_close = ends_with_close;
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    return true;
+}
+
+/* The session's socket failed, so its stream is broken: drop what waits and
+ * close it. */
+static void fail_session(slot_t *slot)
+{
+    outgoing_t *unsent[LINK_SESSION_QUEUE_FRAMES];
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    const size_t unsent_count = take_queue_locked(slot, unsent);
+    uint8_t *partial = slot->partial;
+    slot->partial = NULL;
+    const int fd = request_close_locked(slot);
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+
+    free_frames(unsent, unsent_count);
+    free(partial);
+    trigger_close(fd);
+}
+
+/* Sends as much of one session's output as its socket takes now. Returns
+ * the bytes sent. */
+static size_t service_slot(slot_t *slot)
+{
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    const bool sendable = slot->state == SLOT_OPEN && !slot->close_requested;
+    const int fd = slot->fd;
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    if (!sendable || (slot->partial == NULL && !start_batch(slot))) {
+        return 0;
+    }
+
+    /* The socket's own send, not httpd_socket_send(): that wrapper logs a
+     * warning for every full socket, which here is routine back-pressure. */
+    const ssize_t result = send(fd, slot->partial + slot->partial_sent,
+                                slot->partial_length - slot->partial_sent, MSG_DONTWAIT);
+    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0; /* The socket is full: try again on the next pass */
+    }
+    if (result <= 0) {
+        ESP_LOGW(TAG, "A session's socket failed (errno %d); closing it", errno);
+        fail_session(slot);
+        return 0;
+    }
+
+    int close_fd = -1;
+    uint8_t *finished = NULL;
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    slot->last_progress_us = esp_timer_get_time();
+    slot->partial_sent += (size_t)result;
+    if (slot->partial_sent == slot->partial_length) {
+        finished = slot->partial;
+        slot->partial = NULL;
+        if (slot->partial_ends_with_close) {
+            close_fd = request_close_locked(slot); /* The close frame has gone */
+        }
+    }
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    free(finished);
+    trigger_close(close_fd);
+    return (size_t)result;
+}
+
+/* Runs on the server's task. */
+static void send_pump(void *argument)
+{
+    (void)argument;
+    size_t sent_this_run = 0;
+    for (;;) {
+        size_t sent_this_pass = 0;
+        for (size_t i = 0; i < server_state.config.max_sessions; i++) {
+            sent_this_pass += service_slot(&server_state.slots[i]);
+        }
+        sent_this_run += sent_this_pass;
+
+        const bool idle = sent_this_pass == 0;
+        if (idle || sent_this_run >= PUMP_BYTES_PER_RUN) {
+            taskENTER_CRITICAL(&server_state.slots_lock);
+            server_state.pump_scheduled = false;
+            taskEXIT_CRITICAL(&server_state.slots_lock);
+            if (!idle) {
+                schedule_pump(); /* Give the task back for incoming frames, then carry on */
+            }
+            return;
+        }
+    }
+}
+
+/* Queues one frame of any type for an open slot, within its queue limit. */
+static bool queue_frame(int slot, uint8_t opcode, const uint8_t *data, size_t length)
+{
+    if (!valid_slot(slot)) {
+        return false;
+    }
+    outgoing_t *frame = malloc(sizeof(outgoing_t) + length);
+    if (frame == NULL) {
+        return false;
+    }
+    frame->opcode = opcode;
+    frame->length = length;
+    if (length > 0) {
+        memcpy(frame->data, data, length);
     }
 
     taskENTER_CRITICAL(&server_state.slots_lock);
     slot_t *entry = &server_state.slots[slot];
-    const bool room = entry->queued < LINK_SESSION_QUEUE_FRAMES;
-    if (room) {
-        if (entry->queued == 0) {
+    const bool accepted = entry->state == SLOT_OPEN && !entry->close_queued &&
+                          entry->queue_count < LINK_SESSION_QUEUE_FRAMES;
+    if (accepted) {
+        if (entry->queue_count == 0) {
             entry->last_progress_us = esp_timer_get_time();
         }
-        entry->queued++;
+        entry->queue[(entry->queue_head + entry->queue_count) % LINK_SESSION_QUEUE_FRAMES] = frame;
+        entry->queue_count++;
+        entry->close_queued = opcode == WS_OPCODE_CLOSE;
     }
     taskEXIT_CRITICAL(&server_state.slots_lock);
-    if (!room) {
+
+    if (!accepted) {
+        free(frame);
         return false;
     }
-
-    outgoing_t *message = malloc(sizeof(outgoing_t) + length);
-    if (message != NULL) {
-        message->slot = slot;
-        message->fd = fd;
-        message->length = length;
-        memcpy(message->data, data, length);
-        httpd_ws_frame_t frame = {
-            .final = true, .type = type, .payload = message->data, .len = length};
-        if (httpd_ws_send_data_async(server_state.link_server, fd, &frame, on_sent, message) ==
-            ESP_OK) {
-            return true;
-        }
-        free(message);
-    }
-
-    taskENTER_CRITICAL(&server_state.slots_lock);
-    entry->queued--;
-    taskEXIT_CRITICAL(&server_state.slots_lock);
-    return false;
+    schedule_pump();
+    return true;
 }
 
 bool http_server_send(int slot, bool binary, const uint8_t *data, size_t length)
 {
-    return queue_frame(slot, binary ? HTTPD_WS_TYPE_BINARY : HTTPD_WS_TYPE_TEXT, data, length);
+    return queue_frame(slot, binary ? WS_OPCODE_BINARY : WS_OPCODE_TEXT, data, length);
 }
 
 void http_server_ping(int slot)
 {
-    queue_frame(slot, HTTPD_WS_TYPE_PING, NULL, 0);
+    queue_frame(slot, WS_OPCODE_PING, NULL, 0);
 }
 
 void http_server_close(int slot, uint16_t code)
 {
-    const int fd = slot_fd(slot);
-    if (fd < 0) {
+    /* The close frame waits its turn behind the frames already queued; the
+     * pump closes the socket once it has gone out. */
+    const uint8_t payload[2] = {(uint8_t)(code >> 8), (uint8_t)(code & 0xFF)};
+    if (queue_frame(slot, WS_OPCODE_CLOSE, payload, sizeof(payload)) || !valid_slot(slot)) {
         return;
     }
-    /* The close frame and the close itself are queued on the server's task
-     * in this order, so the frame goes out first. */
-    const uint8_t payload[2] = {(uint8_t)(code >> 8), (uint8_t)(code & 0xFF)};
-    queue_frame(slot, HTTPD_WS_TYPE_CLOSE, payload, sizeof(payload));
-    httpd_sess_trigger_close(server_state.link_server, fd);
+    /* The queue is full or closing already: close without the frame. */
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    const int fd = request_close_locked(&server_state.slots[slot]);
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    trigger_close(fd);
 }
 
-void http_server_close_stalled(void)
+void http_server_service(void)
 {
     const int64_t now_us = esp_timer_get_time();
+    const int64_t limit_us = (int64_t)LINK_UNWRITABLE_TIMEOUT_MS * 1000;
+    bool anything_waiting = false;
+
     for (size_t i = 0; i < server_state.config.max_sessions; i++) {
+        int close_fd = -1;
         taskENTER_CRITICAL(&server_state.slots_lock);
-        const slot_t entry = server_state.slots[i];
+        slot_t *slot = &server_state.slots[i];
+        const bool waiting =
+            slot->state == SLOT_OPEN && (slot->queue_count > 0 || slot->partial != NULL);
+        if (waiting && now_us - slot->last_progress_us >= limit_us) {
+            close_fd = request_close_locked(slot);
+        }
         taskEXIT_CRITICAL(&server_state.slots_lock);
 
-        const bool stalled =
-            entry.state == SLOT_OPEN && entry.queued > 0 &&
-            now_us - entry.last_progress_us >= (int64_t)LINK_UNWRITABLE_TIMEOUT_MS * 1000;
-        if (stalled) {
-            ESP_LOGW(TAG, "Session %u stopped reading; closing it", (unsigned)i);
-            http_server_close((int)i, CLOSE_CLIENT_STOPPED_READING);
+        anything_waiting = anything_waiting || waiting;
+        if (close_fd >= 0) {
+            ESP_LOGW(TAG, "Session %u has sent nothing for %d ms; closing it", (unsigned)i,
+                     LINK_UNWRITABLE_TIMEOUT_MS);
+            trigger_close(close_fd);
         }
+    }
+    if (anything_waiting) {
+        schedule_pump(); /* In case an earlier attempt found the work queue full */
     }
 }
 
@@ -274,34 +501,37 @@ static esp_err_t before_handshake(httpd_req_t *request)
 static esp_err_t after_handshake(httpd_req_t *request)
 {
     const http_server_handlers_t *handlers = &server_state.config.handlers;
-    const int slot = open_slot(httpd_req_to_sockfd(request));
+    const int fd = httpd_req_to_sockfd(request);
+    const int slot = open_slot(fd);
     if (slot < 0) {
         return ESP_FAIL; /* The server closes the socket */
     }
+    /* Frames go out in batches already; Nagle's delay would only hold a
+     * meter frame back waiting for the client's acknowledgement. */
+    const int no_delay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
     handlers->session_opened(handlers->context, slot);
     return ESP_OK;
 }
 
 /* Answers a client's control frame: a pong for a ping, a close for a close. */
-static void answer_control_frame(httpd_req_t *request, int slot, const httpd_ws_frame_t *frame)
+/* Answers a client's control frame: a pong for a ping, a close for a
+ * close. The answers join the session's queue like any frame, because
+ * writing straight to the socket could land in the middle of a batch the
+ * pump is part way through. */
+static void answer_control_frame(int slot, const httpd_ws_frame_t *frame)
 {
     const http_server_handlers_t *handlers = &server_state.config.handlers;
     if (frame->type == HTTPD_WS_TYPE_PING) {
-        httpd_ws_frame_t pong = {.final = true,
-                                 .type = HTTPD_WS_TYPE_PONG,
-                                 .payload = frame->payload,
-                                 .len = frame->len};
-        httpd_ws_send_frame(request, &pong);
+        queue_frame(slot, WS_OPCODE_PONG, frame->payload, frame->len);
         handlers->session_activity(handlers->context, slot);
     } else if (frame->type == HTTPD_WS_TYPE_PONG) {
         handlers->session_activity(handlers->context, slot);
     } else if (frame->type == HTTPD_WS_TYPE_CLOSE) {
-        httpd_ws_frame_t reply = {.final = true,
-                                  .type = HTTPD_WS_TYPE_CLOSE,
-                                  .payload = frame->payload,
-                                  .len = frame->len >= 2 ? 2 : 0};
-        httpd_ws_send_frame(request, &reply);
-        httpd_sess_trigger_close(server_state.link_server, httpd_req_to_sockfd(request));
+        /* Echo the client's close code; the pump closes once it has gone. */
+        if (!queue_frame(slot, WS_OPCODE_CLOSE, frame->payload, frame->len >= 2 ? 2 : 0)) {
+            http_server_close(slot, 1000);
+        }
     }
 }
 
@@ -348,7 +578,7 @@ static esp_err_t on_link_socket(httpd_req_t *request)
                                   frame.len);
         return ESP_OK;
     }
-    answer_control_frame(request, slot, &frame);
+    answer_control_frame(slot, &frame);
     free(data);
     return ESP_OK;
 }
@@ -409,10 +639,19 @@ static esp_err_t on_web_page(httpd_req_t *request)
  * Port 80
  * ------------------------------------------------------------------------- */
 
-/* Sends a browser that typed the plain hostname to the Link port (bridge
- * spec 8.8). */
-static esp_err_t on_redirect(httpd_req_t *request)
+/* Port 80. From the setup network, the setup page and API; from the home
+ * network, a browser that typed the plain hostname goes to the Link port
+ * (bridge spec 8.8). */
+static esp_err_t on_port_80(httpd_req_t *request)
 {
+    if (server_state.config.setup_request != NULL &&
+        net_socket_is_on_setup_network(httpd_req_to_sockfd(request))) {
+        return server_state.config.setup_request(request);
+    }
+    if (request->method != HTTP_GET) {
+        return httpd_resp_send_err(request, HTTPD_405_METHOD_NOT_ALLOWED, NULL);
+    }
+
     char host[72] = "";
     if (httpd_req_get_hdr_value_str(request, "Host", host, sizeof(host)) != ESP_OK) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "No Host header");
@@ -475,15 +714,22 @@ static esp_err_t start_redirect_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = HTTP_REDIRECT_PORT;
     config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1; /* Each server needs its own */
-    config.max_open_sockets = 2;
+    /* A phone's captive-portal browser opens several connections at once and
+     * keeps them open; when all are taken, drop the idlest rather than stall
+     * the next request. No WebSocket lives on this port, so that is safe. */
+    config.max_open_sockets = 7;
+    config.lru_purge_enable = true;
+    config.stack_size = SERVER_STACK_BYTES;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     esp_err_t err = httpd_start(&server_state.redirect_server, &config);
     if (err != ESP_OK) {
         return err;
     }
-    const httpd_uri_t redirect = {.uri = "/*", .method = HTTP_GET, .handler = on_redirect};
-    return httpd_register_uri_handler(server_state.redirect_server, &redirect);
+    const httpd_uri_t get = {.uri = "/*", .method = HTTP_GET, .handler = on_port_80};
+    const httpd_uri_t post = {.uri = "/*", .method = HTTP_POST, .handler = on_port_80};
+    err = httpd_register_uri_handler(server_state.redirect_server, &get);
+    return err == ESP_OK ? httpd_register_uri_handler(server_state.redirect_server, &post) : err;
 }
 
 esp_err_t http_server_start(const http_server_config_t *config)

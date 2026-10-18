@@ -3,7 +3,7 @@
  *
  * Implements bridge spec 6.5. Each step starts one component; the
  * components hold all behaviour. The LED and button (step 3) and the
- * rollback timer (step 6) join in phase 6 of bridge/esp32/PLAN.md.
+ * rollback timer (step 7) join in phase 6 of bridge/esp32/PLAN.md.
  */
 
 #include <inttypes.h>
@@ -13,9 +13,11 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_log.h"
+#include "http_server.h"
 #include "hub_task.h"
 #include "net.h"
 #include "settings.h"
+#include "setup_api.h"
 
 static const char *TAG = "bridge";
 
@@ -56,7 +58,15 @@ void app_main(void)
     /* 4. Join Wi-Fi and start mDNS, so the hub has somewhere to advertise. */
     ESP_ERROR_CHECK(net_start(settings.hostname));
 
-    /* 5. Start the hub task, which starts the uart task and the HTTP
-     *    servers that feed it. */
+    /* 5. Start the hub task, which starts the uart task that feeds it. */
     ESP_ERROR_CHECK(hub_task_start(&settings));
+
+    /* 6. Start the HTTP servers: Link sessions go to the hub task, and the
+     *    setup network's requests to the setup API. */
+    const http_server_config_t http = {
+        .max_sessions = board_max_sessions(),
+        .handlers = hub_task_http_handlers(),
+        .setup_request = setup_api_handle,
+    };
+    ESP_ERROR_CHECK(http_server_start(&http));
 }

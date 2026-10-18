@@ -13,6 +13,8 @@ void test_dspi_link(void);
 void test_link_policy(void);
 void test_link_frames(void);
 void test_hub(void);
+void test_net(void);
+void test_ws_header(void);
 
 int main(void)
 {
@@ -23,6 +25,8 @@ int main(void)
     test_link_policy();
     test_link_frames();
     test_hub();
+    test_net();
+    test_ws_header();
 
     const int failures = check_failure_count();
     if (failures == 0) {

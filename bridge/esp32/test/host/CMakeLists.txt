@@ -47,6 +47,8 @@ add_executable(host_tests
     test_link_policy.c
     test_link_frames.c
     test_hub.c
+    test_net.c
+    test_ws_header.c
     fake_hub_io.c
     ${COMPONENTS}/board/board_tables.c
     ${COMPONENTS}/dspi_frame/dspi_frame.c
@@ -59,6 +61,9 @@ add_executable(host_tests
     ${COMPONENTS}/hub/hub_commands.c
     ${COMPONENTS}/hub/hub_device.c
     ${COMPONENTS}/hub/hub_polls.c
+    ${COMPONENTS}/net/net_machine.c
+    ${COMPONENTS}/net/captive_dns.c
+    ${COMPONENTS}/http_server/ws_header.c
     ${COMPONENTS}/settings/settings_model.c)
 
 target_include_directories(host_tests PRIVATE
@@ -71,6 +76,8 @@ target_include_directories(host_tests PRIVATE
     ${COMPONENTS}/link_policy/include
     ${COMPONENTS}/link_codec/include
     ${COMPONENTS}/hub/include
+    ${COMPONENTS}/net/include
+    ${COMPONENTS}/http_server/include
     ${COMPONENTS}/hub)
 target_link_libraries(host_tests PRIVATE cjson)
 

@@ -54,6 +54,7 @@ typedef enum {
     EVENT_DEVICE_LOST,
     EVENT_NOTIFICATION,
     EVENT_REPLY,
+    EVENT_RENAME, /* `data` holds the new name */
 } event_type_t;
 
 /* One event. `data` is a heap buffer the hub task frees after handling. */
@@ -74,9 +75,10 @@ static struct {
     bridge_settings_t settings;
     QueueHandle_t events;
 
-    /* The /dspi/v1/info document, rebuilt on the hub task whenever the hub
-     * advertises and copied by the HTTP server's task. */
+    /* The /dspi/v1/info document and the hub's name, refreshed on the hub
+     * task whenever the hub advertises, and copied by other tasks. */
     char *info_json;
+    char name[SETTINGS_NAME_MAX_BYTES + 1];
     SemaphoreHandle_t info_lock;
 } task_state;
 
@@ -278,6 +280,7 @@ static void io_advertise(void *context)
     xSemaphoreTake(task_state.info_lock, portMAX_DELAY);
     cJSON_free(task_state.info_json);
     task_state.info_json = info;
+    snprintf(task_state.name, sizeof(task_state.name), "%s", advert.name);
     xSemaphoreGive(task_state.info_lock);
 }
 
@@ -355,6 +358,9 @@ static void handle_event(hub_event_t *event)
         event->reply.payload = event->data;
         hub_reply(hub, event->tag, &event->reply);
         break;
+    case EVENT_RENAME:
+        hub_rename(hub, (const char *)event->data);
+        break;
     }
     free(event->data);
     free(event->identity);
@@ -374,7 +380,7 @@ static void hub_task(void *argument)
         }
         if (esp_timer_get_time() >= next_tick_us) {
             hub_tick(&task_state.hub);
-            http_server_close_stalled();
+            http_server_service();
             next_tick_us += (int64_t)HUB_TICK_MS * 1000;
         }
     }
@@ -427,15 +433,38 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
                      .notification = on_notification,
                      .reply = on_reply},
     };
-    ESP_RETURN_ON_ERROR(dspi_uart_start(&uart), TAG, "starting the uart task");
 
-    const http_server_config_t http = {
-        .max_sessions = config.max_sessions,
-        .handlers = {.session_opened = on_session_opened,
-                     .session_message = on_session_message,
-                     .session_activity = on_session_activity,
-                     .session_closed = on_session_closed,
-                     .info_json = copy_info_json},
+    return dspi_uart_start(&uart);
+}
+
+http_server_handlers_t hub_task_http_handlers(void)
+{
+    return (http_server_handlers_t){
+        .session_opened = on_session_opened,
+        .session_message = on_session_message,
+        .session_activity = on_session_activity,
+        .session_closed = on_session_closed,
+        .info_json = copy_info_json,
     };
-    return http_server_start(&http);
+}
+
+esp_err_t hub_task_rename(const char *name)
+{
+    if (!settings_name_is_valid(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const size_t length = strlen(name) + 1;
+    hub_event_t event = {.type = EVENT_RENAME, .data = copy_bytes((const uint8_t *)name, length)};
+    if (event.data == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    post(&event);
+    return ESP_OK;
+}
+
+void hub_task_name(char *name, size_t size)
+{
+    xSemaphoreTake(task_state.info_lock, portMAX_DELAY);
+    snprintf(name, size, "%s", task_state.name);
+    xSemaphoreGive(task_state.info_lock);
 }

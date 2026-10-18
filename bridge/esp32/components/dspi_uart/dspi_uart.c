@@ -45,6 +45,7 @@ static struct {
     dspi_uart_config_t config;
     dspi_link_t link;
     bool device_present;
+    dspi_identity_t identity; /* Of the device present, for dspi_uart_get_status() */
     QueueHandle_t queue;
 } uart_task_state;
 
@@ -191,6 +192,7 @@ static void look_for_device(void)
         return;
     }
 
+    uart_task_state.identity = identity;
     uart_task_state.device_present = true;
     ESP_LOGI(TAG, "Found DSPi %s at %lu baud", identity.serial,
              (unsigned long)dspi_link_baud(link));
@@ -294,5 +296,6 @@ void dspi_uart_get_status(dspi_uart_status_t *status)
     status->rx_pin = uart_task_state.config.rx_pin;
     status->baud = dspi_link_baud(&uart_task_state.link);
     status->device_present = uart_task_state.device_present;
+    status->identity = uart_task_state.identity;
     status->counters = *dspi_link_counters(&uart_task_state.link);
 }

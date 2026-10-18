@@ -1,0 +1,64 @@
+/*
+ * The bridge's setup API (bridge spec 9.3): plain HTTP and JSON under
+ * /setup/v1/, answered only on the setup network.
+ */
+
+export interface SetupState {
+  name: string;
+  chip: string;
+  version: string;
+  pin_required: boolean;
+  dspi: { found: boolean; serial?: string; baud?: number; notify_enable?: boolean };
+  wifi: {
+    saved_ssid: string | null;
+    join: "idle" | "connecting" | "connected" | "failed";
+    failure?: "wrong_password" | "not_found" | "timed_out";
+    ip: string | null;
+    hostname: string;
+    setup_ssid: string;
+  };
+}
+
+export interface Network {
+  ssid: string;
+  rssi: number;
+  secure: boolean;
+}
+
+/** An error the bridge explained, with a sentence fit to show the user. */
+export class SetupError extends Error {}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`/setup/v1/${path}`, { cache: "no-store", ...init });
+  } catch {
+    throw new SetupError("The bridge isn't answering. Check this device is still on its network.");
+  }
+  const body = (await response.json().catch(() => ({}))) as T & { msg?: string };
+  if (!response.ok) {
+    throw new SetupError(body.msg ?? `The bridge answered ${response.status}.`);
+  }
+  return body;
+}
+
+export function getState(): Promise<SetupState> {
+  return request<SetupState>("state");
+}
+
+export async function getNetworks(): Promise<Network[]> {
+  const body = await request<{ networks: Network[] }>("networks");
+  return body.networks;
+}
+
+export async function apply(ssid: string, password: string, name: string): Promise<void> {
+  await request("apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ssid, password, name }),
+  });
+}
+
+export async function finish(): Promise<void> {
+  await request("finish", { method: "POST" });
+}
