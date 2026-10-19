@@ -15,7 +15,7 @@
 #include "hub_config.h"
 #include "hub_internal.h"
 
-static bool require_admin(hub_t *hub, int slot, int id)
+bool hub_require_admin(hub_t *hub, int slot, int id)
 {
     if (hub->sessions[slot].role != LINK_ROLE_ADMIN) {
         hub_reply_error(hub, slot, id, "denied", "admin role required");
@@ -43,7 +43,7 @@ void hub_apply_settings(hub_t *hub, const bridge_settings_t *settings)
 void hub_handle_config_get(hub_t *hub, int slot, int id, const cJSON *message)
 {
     (void)message;
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     cJSON *body = cJSON_CreateObject();
@@ -54,7 +54,7 @@ void hub_handle_config_get(hub_t *hub, int slot, int id, const cJSON *message)
 
 void hub_handle_config_set(hub_t *hub, int slot, int id, const cJSON *message)
 {
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     bridge_settings_t updated;
@@ -87,7 +87,7 @@ void hub_handle_config_set(hub_t *hub, int slot, int id, const cJSON *message)
 void hub_handle_wifi_scan(hub_t *hub, int slot, int id, const cJSON *message)
 {
     (void)message;
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     /* A scan takes seconds; the I/O runs it in the background and answers
@@ -97,7 +97,7 @@ void hub_handle_wifi_scan(hub_t *hub, int slot, int id, const cJSON *message)
 
 void hub_handle_wifi_join(hub_t *hub, int slot, int id, const cJSON *message)
 {
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(message, "ssid");
@@ -156,7 +156,7 @@ static bool client_online(const hub_t *hub, uint16_t cid)
 void hub_handle_auth_list(hub_t *hub, int slot, int id, const cJSON *message)
 {
     (void)message;
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     size_t count = 0;
@@ -189,7 +189,7 @@ void hub_handle_auth_list(hub_t *hub, int slot, int id, const cJSON *message)
 
 void hub_handle_auth_revoke(hub_t *hub, int slot, int id, const cJSON *message)
 {
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     int cid = 0;
@@ -216,7 +216,7 @@ void hub_handle_auth_set_role(hub_t *hub, int slot, int id, const cJSON *message
 
 void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message)
 {
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     const cJSON *mode = cJSON_GetObjectItemCaseSensitive(message, "mode");
@@ -259,24 +259,29 @@ void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message)
  * Restart and reset (Link spec 7.13)
  * ------------------------------------------------------------------------- */
 
+void hub_restart(hub_t *hub, hub_restart_level_t level)
+{
+    hub_close_sessions(hub, CLOSE_SHUTTING_DOWN, -1);
+    hub->io.restart(hub->io.context, level);
+}
+
 static void restart(hub_t *hub, int slot, int id, hub_restart_level_t level)
 {
     hub_reply_ok(hub, slot, id, NULL);
-    hub_close_sessions(hub, CLOSE_SHUTTING_DOWN, -1);
-    hub->io.restart(hub->io.context, level);
+    hub_restart(hub, level);
 }
 
 void hub_handle_restart(hub_t *hub, int slot, int id, const cJSON *message)
 {
     (void)message;
-    if (require_admin(hub, slot, id)) {
+    if (hub_require_admin(hub, slot, id)) {
         restart(hub, slot, id, HUB_RESTART_ONLY);
     }
 }
 
 void hub_handle_reset(hub_t *hub, int slot, int id, const cJSON *message)
 {
-    if (!require_admin(hub, slot, id)) {
+    if (!hub_require_admin(hub, slot, id)) {
         return;
     }
     const cJSON *level = cJSON_GetObjectItemCaseSensitive(message, "level");

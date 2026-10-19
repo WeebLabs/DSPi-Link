@@ -196,6 +196,28 @@ On the ESP32-S3:
 broken image rolls back by itself, and both BOOT button levels work with
 the LED showing each stage.
 
+**Status (2026-10-19):** done, with the items below left for the bench.
+On the ESP32-S3:
+
+- Updates over Link with the library's `updateHub()`, the call the
+  settings page makes: a 983 KB image took 4 to 7 s to send and check, and
+  the bridge was back on the new version about 7 s later. Going down a
+  version works the same way.
+- A new image confirmed itself after 60 s and survived a restart. A restart
+  41 s after an update went back to the previous image, as it should, and
+  an image built to abort 20 s after boot rolled back by itself.
+- Refused, with the bridge still on its firmware: an ESP32-C3 image ("not
+  firmware for this chip"), random bytes, and a second update while a new
+  image was still on trial ("try again in a minute"). The page also refuses
+  a file that is not bridge firmware before sending it.
+- The BOOT button, held 35 s: the serial log showed each stage at 5, 15 and
+  30 s and the release did nothing. The bridge now logs every stage, for
+  boards without an LED.
+- Left over: the page's own file picker (the browser pane cannot drive it;
+  the code path behind it was run with a file handed to it), releasing BOOT
+  at the forget-Wi-Fi and factory-reset stages, and the LED itself, since
+  this board has none. The LED patterns have host tests.
+
 ## Phase 7: Release tooling and documentation
 
 - Release CI: per-chip merged and update images attached to a GitHub release.

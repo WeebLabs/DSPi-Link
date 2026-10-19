@@ -50,6 +50,7 @@ add_executable(host_tests
     test_net.c
     test_ws_header.c
     test_hub_auth.c
+    test_button_led.c
     fake_crypto.c
     fake_hub_io.c
     ${COMPONENTS}/board/board_tables.c
@@ -63,18 +64,23 @@ add_executable(host_tests
     ${COMPONENTS}/hub/hub_commands.c
     ${COMPONENTS}/hub/hub_device.c
     ${COMPONENTS}/hub/hub_polls.c
+    ${COMPONENTS}/hub/hub_update.c
     ${COMPONENTS}/hub/hub_admin.c
     ${COMPONENTS}/hub/hub_config.c
     ${COMPONENTS}/net/net_machine.c
     ${COMPONENTS}/net/captive_dns.c
     ${COMPONENTS}/http_server/ws_header.c
     ${COMPONENTS}/hub_auth/hub_auth.c
-    ${COMPONENTS}/settings/settings_model.c)
+    ${COMPONENTS}/settings/settings_model.c
+    ${COMPONENTS}/button/button_machine.c
+    ${COMPONENTS}/status_led/led_pattern.c)
 
 target_include_directories(host_tests PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${COMPONENTS}/bridge_config/include
     ${COMPONENTS}/board/include
+    ${COMPONENTS}/button/include
+    ${COMPONENTS}/status_led/include
     ${COMPONENTS}/settings/include
     ${COMPONENTS}/dspi_frame/include
     ${COMPONENTS}/dspi_uart/include

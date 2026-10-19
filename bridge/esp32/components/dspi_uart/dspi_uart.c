@@ -49,6 +49,7 @@ static struct {
     bool device_present;
     dspi_identity_t identity; /* Of the device present, for dspi_uart_get_status() */
     QueueHandle_t queue;
+    int64_t last_loop_us; /* For dspi_uart_is_alive() */
 } uart_task_state;
 
 /* Holds one received payload, up to a whole bulk blob. Static so the task
@@ -288,6 +289,7 @@ static void uart_task(void *argument)
 {
     (void)argument;
     for (;;) {
+        uart_task_state.last_loop_us = esp_timer_get_time();
         if (uart_task_state.device_present) {
             serve_device();
         } else {
@@ -358,4 +360,11 @@ void dspi_uart_get_status(dspi_uart_status_t *status)
     status->device_present = uart_task_state.device_present;
     status->identity = uart_task_state.identity;
     status->counters = *dspi_link_counters(&uart_task_state.link);
+}
+
+bool dspi_uart_is_alive(void)
+{
+    /* One pass of the loop can take a full search of every baud rate. */
+    return esp_timer_get_time() - uart_task_state.last_loop_us <
+           (int64_t)DSPI_UART_ALIVE_WITHIN_MS * 1000;
 }

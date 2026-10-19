@@ -341,16 +341,16 @@ the same source compiles into the firmware and into the host tests.
 | `link_policy` | `link_policy_class(bRequest, dir)`, generated from `policy/commands.json` with the spec version it came from. Unknown codes are `config`. | nothing |
 | `dspi_frame` | Builds DSPi UART requests and parses responses and notifications byte by byte (firmware spec 3). | nothing |
 | `dspi_uart` | The link engine (`dspi_link.c`, portable): one request at a time, the idle gap, retries, recovery after timeouts, baud detection and the device's identity. The uart task (`dspi_uart.c`) runs it on the real UART and reports the device found or lost. | `dspi_frame` |
-| `hub` | The hub state machine (portable): sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration, with JSON through cJSON. The hub task (`hub_task.c`) runs it and connects it to the HTTP server, the uart task, flash and mDNS. | `link_codec`, `link_policy`, `hub_auth`, cJSON |
+| `hub` | The hub state machine (portable): sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration, the hub's own update, with JSON through cJSON. The hub task (`hub_task.c`) runs it and connects it to the HTTP server, the uart task, the ota task, flash and mDNS. | `link_codec`, `link_policy`, `hub_auth`, cJSON |
 | `hub_auth` | PIN hashing and checking, token creation and hashing, rate limits. | mbedtls (behind an interface) |
 | `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, and hands frames to its caller through callbacks, so it does not depend on the hub. | `web_assets`, `setup_api` |
 | `setup_api` | The setup network's endpoints, answering only on the setup network. | `net`, `settings`, `hub` |
 | `net` | Wi-Fi states (section 9.1), setup network, captive DNS, mDNS records, SNTP. | `settings`, `board` |
 | `settings` | Reads and writes every saved value through typed functions, with defaults and a schema version. | `nvs_flash` |
 | `board` | The pin table for the chip the image was built for, and PSRAM detection. | `soc` |
-| `ota` | Receives an image in chunks, verifies it, switches partitions and confirms a new image after a healthy start. | `app_update` |
-| `button` | Reports how long BOOT was held. | `driver/gpio` |
-| `status_led` | Shows the patterns in section 13. | `led_strip` |
+| `ota` | Writes an image in chunks on its own task, verifies it, switches partitions and confirms a new image after a healthy start. | `app_update` |
+| `button` | Times how long BOOT is held (`button_machine.c`, portable) and samples the pin on a timer. | `driver/gpio` |
+| `status_led` | Chooses the pattern of section 13 (`led_pattern.c`, portable) and drives a plain LED through LEDC or a WS2812. | `led_strip` |
 
 ### 6.5 Boot sequence
 
@@ -910,6 +910,12 @@ release would trigger at that moment. Holding for more than 30 s cancels
 both, for a user who changes their mind. The settings page's Maintenance
 section offers both actions too.
 
+The pin is read every 20 ms, and a press or release counts only after three
+readings in a row agree, which hides contact bounce. The button counts only
+after it has been seen released once, so a pin that reads pressed from the
+start, on a board without the button, never triggers anything. Each stage
+is also written to the serial log, for boards without an LED.
+
 ### 12.2 Forgotten PIN
 
 A forgotten PIN is fixed with a factory reset. There is deliberately no
@@ -936,7 +942,11 @@ Off by default (section 8.11). When fitted:
 | Fast amber blink | BOOT held 5 to 15 s. |
 | Solid red | BOOT held 15 to 30 s. |
 
-A single-colour LED shows the same timing in its one colour.
+A single-colour LED shows the same timing in its one colour, at the
+brightness of the colour's brightest part. Fast blinks run 4 times a
+second; slow blinks and pulses take 2 s. The LED is redrawn 50 times a
+second, a plain LED through LEDC so that a pulse can fade, and a WS2812 is
+dimmed to about a fifth of its full brightness, which is glaring.
 
 ---
 
@@ -960,16 +970,29 @@ that the margin covers future growth. CI fails a build that exceeds it.
 ### 14.2 Updating and rollback
 
 - The settings page uploads a firmware file through `hub.update` (Link spec
-  7.14), as FWDATA chunks of up to 16 KB written straight into the inactive
-  partition.
-- The bridge checks the SHA-256 and lets ESP-IDF check the image header,
-  which rejects an image built for another chip.
-- On success it switches the boot partition and restarts.
+  7.14), as FWDATA chunks of `max_frame - 8` bytes (16,376) written straight
+  into the inactive partition.
+- The ota task writes the chunks, away from the hub task, which keeps
+  serving sessions meanwhile. It holds at most 2 chunks waiting to be
+  written, and the hub acknowledges each chunk only once it is in flash, so
+  a client keeps at most 2 chunks unanswered and never sends faster than
+  the flash takes them. An update with no progress for 30 s is abandoned.
+- The bridge checks the SHA-256 and lets ESP-IDF check the image, which
+  rejects a file that is not firmware or was built for another chip. It
+  then checks that the image is bridge firmware (its project name), so a
+  wrong file cannot leave the board without the bridge.
+- On success it switches the boot partition and restarts. Every refusal
+  ends with `hub.update.done` carrying a plain sentence, and the bridge
+  keeps running its current firmware.
 - With rollback enabled in the bootloader, the new image starts in a
   pending state. It confirms itself only after it has run for 60 s with the
-  hub task, the uart task and Wi-Fi (or the setup network) all up. If it
-  crashes or restarts before that, the bootloader returns to the previous
-  image.
+  hub task and the uart task both still going round their loops (Wi-Fi
+  started, or the boot would not have got that far). If it crashes or
+  restarts before that, the bootloader returns to the previous image.
+- While a new image is still on trial, another update is refused ("try
+  again in a minute"), because ESP-IDF keeps the image it would return to.
+- On the ESP32-S3, a 983 KB image took about 4 to 7 s to send and check,
+  and the bridge was back 7 s later.
 
 ---
 

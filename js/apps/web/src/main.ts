@@ -120,6 +120,9 @@ let settingsOpen = false;
 let settingsPage: SettingsPageHandles | null = null;
 /** Why the connection went away on purpose, shown on the connect screen. */
 let notice: string | null = null;
+/** The firmware a bridge was told to restart into, until a hello shows
+ * whether it did (Link spec 7.14). */
+let expectedFirmware: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Rendering
@@ -442,8 +445,26 @@ function canOpenSettings(): boolean {
   return client.hasCap("hub_config") && client.role === "admin";
 }
 
+/** How a firmware update went, judged from the hello after it. */
+function firmwareOutcome(): { tone: "good" | "bad"; text: string } | undefined {
+  if (!expectedFirmware) return undefined;
+  const running = client.hub?.hub.version ?? "";
+  const expected = expectedFirmware;
+  expectedFirmware = null;
+  return running === expected
+    ? { tone: "good", text: `Firmware ${expected} is installed.` }
+    : {
+        tone: "bad",
+        text: `The bridge is running firmware ${running}: firmware ${expected} did not start properly, so the bridge went back.`,
+      };
+}
+
 function renderSettings(): void {
   settingsPage = createSettingsPage(client, {
+    announce: firmwareOutcome(),
+    onFirmwareInstalled: (version) => {
+      expectedFirmware = version;
+    },
     onBack: () => {
       settingsOpen = false;
       render();

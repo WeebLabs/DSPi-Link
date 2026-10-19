@@ -78,4 +78,8 @@ typedef struct {
  * moments but never holds a torn value. Good enough for statistics. */
 void dspi_uart_get_status(dspi_uart_status_t *status);
 
+/* True when the uart task has gone round its loop recently; for the check
+ * that confirms a new firmware (bridge spec 14.2). */
+bool dspi_uart_is_alive(void);
+
 #endif /* DSPI_UART_H */

@@ -4,12 +4,12 @@
  *
  * Three kinds of code meet here:
  *
- *   producers  the HTTP server's handlers and the uart task's handlers,
+ *   producers  the HTTP server's, uart task's and ota task's handlers,
  *              which only copy what they receive into an event and post it
  *   the loop   the hub task, which takes one event at a time and calls the
  *              hub, and calls hub_tick() every HUB_TICK_MS
  *   hub_io     the functions the hub calls back through, which reach the
- *              HTTP server, the uart task, flash, Wi-Fi and mDNS
+ *              HTTP server, the uart task, flash, Wi-Fi, mDNS and updates
  *   calls      hub_task_*() functions other tasks use (the setup page),
  *              which run a function on the hub task and wait for it
  */
@@ -36,8 +36,10 @@
 #include "http_server.h"
 #include "hub.h"
 #include "net.h"
+#include "ota.h"
 #include "psa/crypto.h"
 #include "settings.h"
+#include "status_led.h"
 #include <time.h>
 
 static const char *TAG = "hub";
@@ -52,6 +54,10 @@ static const char *TAG = "hub";
 
 /* A restart waits this long so the replies and close frames go out first. */
 #define RESTART_DELAY_MS 500
+
+/* The hub task counts as alive if its loop has run this recently. It runs
+ * every HUB_TICK_MS, so this allows for a long burst of work. */
+#define HUB_ALIVE_WITHIN_MS 2000
 
 /* Clock readings before this (2024-01-01) mean SNTP has not set the time. */
 #define CLOCK_SET_AFTER 1704067200
@@ -69,8 +75,10 @@ typedef enum {
     EVENT_DEVICE_LOST,
     EVENT_NOTIFICATION,
     EVENT_REPLY,
-    EVENT_REPLY_LATER, /* A Wi-Fi scan's result, for hub_reply_later() */
-    EVENT_CALL,        /* Run `call` on the hub task (hub_task_*() functions) */
+    EVENT_REPLY_LATER,    /* A Wi-Fi scan's result, for hub_reply_later() */
+    EVENT_CALL,           /* Run `call` on the hub task (hub_task_*() functions) */
+    EVENT_UPDATE_WRITTEN, /* The ota task wrote a chunk */
+    EVENT_UPDATE_DONE,    /* The ota task checked the whole image; `data` is its text */
 } event_type_t;
 
 /* A function to run on the hub task for another task, and its result. */
@@ -96,6 +104,8 @@ typedef struct {
     int request_id;      /* EVENT_REPLY_LATER */
     cJSON *body;         /* EVENT_REPLY_LATER, handed to the hub */
     hub_call_t *call;    /* EVENT_CALL */
+    uint32_t offset;     /* EVENT_UPDATE_WRITTEN */
+    bool ok;             /* EVENT_UPDATE_DONE */
 } hub_event_t;
 
 static struct {
@@ -112,6 +122,7 @@ static struct {
     SemaphoreHandle_t scan_lock; /* One Wi-Fi scan at a time */
     esp_timer_handle_t restart_timer;
     hub_restart_level_t restart_level;
+    int64_t last_loop_us; /* For hub_task_is_alive() */
 } task_state;
 
 /* The PIN and paired clients as saved: a layout number, then the store. A
@@ -188,6 +199,22 @@ static char *copy_info_json(void *context)
     }
     xSemaphoreGive(task_state.info_lock);
     return copy;
+}
+
+/* ---------------------------------------------------------------------------
+ * Producers: the ota task's handlers (on its task)
+ * ------------------------------------------------------------------------- */
+
+static void on_update_written(void *context, uint32_t offset)
+{
+    (void)context;
+    post(&(hub_event_t){.type = EVENT_UPDATE_WRITTEN, .offset = offset});
+}
+
+static void on_update_finished(void *context, bool ok, const char *text)
+{
+    (void)context;
+    post(&(hub_event_t){.type = EVENT_UPDATE_DONE, .ok = ok, .data = (uint8_t *)strdup(text)});
 }
 
 /* ---------------------------------------------------------------------------
@@ -274,7 +301,8 @@ static uint32_t io_now_ms(void *context)
 }
 
 /* Saves and applies new settings (bridge spec 8.11). Only what changed is
- * touched: the UART moves for new pins or rate, mDNS for a new hostname.
+ * touched: the UART moves for new pins or rate, mDNS for a new hostname,
+ * the status LED for a new type or pin.
  * The name reaches DNS-SD through the hub's advertise() that follows. */
 static void io_apply_settings(void *context, const bridge_settings_t *settings)
 {
@@ -295,6 +323,9 @@ static void io_apply_settings(void *context, const bridge_settings_t *settings)
     }
     if (strcmp(old.hostname, settings->hostname) != 0) {
         net_set_hostname(settings->hostname);
+    }
+    if (old.led_type != settings->led_type || old.led_pin != settings->led_pin) {
+        status_led_configure(settings->led_type, settings->led_pin);
     }
 }
 
@@ -522,6 +553,31 @@ static void io_describe_bridge(void *context, cJSON *bridge)
     cJSON_AddNumberToObject(uart, "retries", link.counters.retries);
 }
 
+/* Firmware updates go straight to the ota task (bridge spec 14.2). */
+static uint32_t io_update_capacity(void *context)
+{
+    (void)context;
+    return ota_capacity();
+}
+
+static bool io_update_begin(void *context, uint32_t size, const uint8_t sha256[32])
+{
+    (void)context;
+    return ota_begin(size, sha256);
+}
+
+static bool io_update_write(void *context, uint32_t offset, const uint8_t *data, size_t length)
+{
+    (void)context;
+    return ota_write(offset, data, length);
+}
+
+static void io_update_abort(void *context)
+{
+    (void)context;
+    ota_abort();
+}
+
 /* ---------------------------------------------------------------------------
  * The loop
  * ------------------------------------------------------------------------- */
@@ -567,6 +623,13 @@ static void handle_event(hub_event_t *event)
         event->call->run(hub, event->call->argument);
         xSemaphoreGive(event->call->done);
         break;
+    case EVENT_UPDATE_WRITTEN:
+        hub_update_written(hub, event->offset);
+        break;
+    case EVENT_UPDATE_DONE:
+        hub_update_finished(hub, event->ok,
+                            event->data != NULL ? (const char *)event->data : "out of memory");
+        break;
     }
     free(event->data);
     free(event->identity);
@@ -580,6 +643,7 @@ static void hub_task(void *argument)
         const int64_t wait_us = next_tick_us - esp_timer_get_time();
         const TickType_t wait = wait_us > 0 ? pdMS_TO_TICKS((uint32_t)(wait_us / 1000)) : 0;
 
+        task_state.last_loop_us = esp_timer_get_time();
         hub_event_t event;
         if (xQueueReceive(task_state.events, &event, wait) == pdTRUE) {
             handle_event(&event);
@@ -627,6 +691,10 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
         .load_device_name = io_load_device_name,
         .advertise = io_advertise,
         .describe_bridge = io_describe_bridge,
+        .update_capacity = io_update_capacity,
+        .update_begin = io_update_begin,
+        .update_write = io_update_write,
+        .update_abort = io_update_abort,
     };
     const hub_auth_io_t auth_io = {
         .random = auth_random,
@@ -647,6 +715,8 @@ esp_err_t hub_task_start(const bridge_settings_t *settings)
         pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    const ota_handlers_t updates = {.written = on_update_written, .finished = on_update_finished};
+    ESP_RETURN_ON_ERROR(ota_start(&updates), TAG, "starting the ota task");
 
     const dspi_uart_config_t uart = {
         .tx_pin = settings->uart_tx_pin,
@@ -761,6 +831,21 @@ esp_err_t hub_task_set_pin(const char *pin)
     set_pin_call_t call = {.pin = pin};
     ESP_RETURN_ON_ERROR(run_on_hub_task(set_pin_on_hub, &call), TAG, "setting the PIN");
     return call.ok ? ESP_OK : ESP_ERR_INVALID_ARG;
+}
+
+bool hub_task_is_alive(void)
+{
+    return esp_timer_get_time() - task_state.last_loop_us < (int64_t)HUB_ALIVE_WITHIN_MS * 1000;
+}
+
+static void restart_on_hub(hub_t *hub, void *argument)
+{
+    hub_restart(hub, *(const hub_restart_level_t *)argument);
+}
+
+esp_err_t hub_task_restart(hub_restart_level_t level)
+{
+    return run_on_hub_task(restart_on_hub, &level);
 }
 
 void hub_task_name(char *name, size_t size)

@@ -28,6 +28,9 @@ export interface FakeHubConfig {
    * messages: return the reply's body without `id`, or null for unknown_type.
    */
   onRequest?: (msg: Record<string, unknown>) => Record<string, unknown> | null;
+  /** Answers a FWDATA chunk; return null to answer later (or never). By
+   * default every chunk is acknowledged at once. */
+  onFwData?: (frame: Extract<LinkFrame, { type: "fwdata" }>) => LinkFrame | null;
 }
 
 const soon = (fn: () => void) => setTimeout(fn, 0);
@@ -141,6 +144,13 @@ export class FakeHub {
     const frame = decodeFrame(bytes);
     if (!frame) return;
     this.receivedFrames.push(frame);
+    if (frame.type === "fwdata") {
+      const ack = this.config.onFwData
+        ? this.config.onFwData(frame)
+        : ({ type: "fwdata_ack", tag: frame.tag, offset: frame.offset, status: 0 } as LinkFrame);
+      if (ack) socket.deliverFrame(ack);
+      return;
+    }
     if (frame.type !== "cmd_request") return;
     const reply = this.config.onCommand
       ? this.config.onCommand(frame)

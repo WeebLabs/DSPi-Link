@@ -9,7 +9,7 @@
  *   Wi-Fi            the current network, and moving to another one
  *   Security         the PIN, and the browsers and apps paired with it
  *   Bridge           name, hostname and status LED
- *   Maintenance      restart, forget Wi-Fi, factory reset
+ *   Maintenance      update firmware, restart, forget Wi-Fi, factory reset
  *
  * Each section draws into its own element from the `page` state below, so
  * redrawing one (new stats, a saved change) never disturbs a field being
@@ -26,6 +26,7 @@ import {
 } from "@dspi/link";
 import { confirmAction } from "./dialog.js";
 import { clear, el } from "./dom.js";
+import { chipLabel, readFirmwareInfo } from "./firmware.js";
 import {
   digitsOnly,
   PIN_LENGTH,
@@ -117,6 +118,10 @@ export interface SettingsPageOptions {
   onToken(token: string | null): void;
   /** The bridge is about to close this session; `message` says why and what next. */
   onLeaving(message: string, willReconnect: boolean): void;
+  /** The bridge accepted firmware `version` and is restarting into it. */
+  onFirmwareInstalled(version: string): void;
+  /** A line to show at the top of the page once, such as how an update went. */
+  announce?: { tone: "good" | "bad"; text: string };
 }
 
 export interface SettingsPageHandles {
@@ -158,6 +163,9 @@ export function createSettingsPage(
     // Per section: a request in flight, and the last thing that went wrong.
     busy: new Set<SectionName>(),
     errors: new Map<SectionName, string>(),
+    // Firmware update: the share of the image acknowledged, 0 to 1, or null
+    // when no update is running.
+    updateProgress: null as number | null,
     // Set once the bridge is restarting, so nothing more is sent.
     leaving: false,
   };
@@ -244,6 +252,9 @@ export function createSettingsPage(
   // -- Status -------------------------------------------------------------
 
   function drawStatus(): void {
+    if (options.announce) {
+      add("status", statusLine(options.announce.tone, options.announce.text));
+    }
     if (page.loadError) {
       add("status", statusLine("bad", "Couldn't read the bridge's settings.", page.loadError));
       return;
@@ -902,6 +913,7 @@ export function createSettingsPage(
     const busy = page.busy.has("maintenance");
     add(
       "maintenance",
+      client.hasCap("hub_update") ? updateRow(busy) : null,
       maintenanceRow(
         "Restart",
         "Restarts the bridge. Everything is kept, and this page reconnects in about 10 seconds.",
@@ -935,6 +947,118 @@ export function createSettingsPage(
         }),
       ),
     );
+  }
+
+  /** "Update firmware": a file picker, then progress while it uploads. */
+  function updateRow(busy: boolean): HTMLElement {
+    if (page.updateProgress !== null) {
+      const percent = Math.round(page.updateProgress * 100);
+      return el(
+        "div",
+        { class: "maintenance-row" },
+        el(
+          "div",
+          { class: "grow" },
+          el("strong", { text: "Updating firmware" }),
+          el("p", {
+            class: "dim small",
+            role: "status",
+            text:
+              percent < 100
+                ? `Sending the firmware: ${percent}%. Keep this page open.`
+                : "Checking the firmware…",
+          }),
+          el("progress", { max: 100, value: percent, "aria-label": "Update progress" }),
+        ),
+      );
+    }
+    const picker = el("input", {
+      type: "file",
+      accept: ".bin,application/octet-stream",
+      hidden: true,
+      onChange: (event: Event) => {
+        const file = (event.target as HTMLInputElement).files?.[0];
+        if (file) void installFirmware(file);
+      },
+    });
+    return maintenanceRow(
+      "Update firmware",
+      "Installs a new version of the bridge firmware from a .bin file. Everything else is kept.",
+      el(
+        "div",
+        {},
+        picker,
+        el("button", {
+          type: "button",
+          text: "Choose file…",
+          disabled: busy,
+          onClick: () => picker.click(),
+        }),
+      ),
+    );
+  }
+
+  /** Why `image` cannot go on this bridge, or null if it can. */
+  function firmwareProblem(image: Uint8Array): string | null {
+    const info = readFirmwareInfo(image);
+    if (!info) {
+      return "That file is not ESP32 firmware. Choose the .bin file made for the DSPi bridge.";
+    }
+    if (info.project !== "dspi_bridge") {
+      return `That file is firmware for something else ("${info.project}"), not the DSPi bridge.`;
+    }
+    const chip = page.stats?.chip;
+    if (chip && info.chip !== chip) {
+      return `That file is for the ${chipLabel(info.chip)}, but this bridge is an ${chipLabel(chip)}.`;
+    }
+    return null;
+  }
+
+  async function installFirmware(file: File): Promise<void> {
+    const image = new Uint8Array(await file.arrayBuffer());
+    const problem = firmwareProblem(image);
+    if (problem) {
+      page.errors.set("maintenance", problem);
+      draw("maintenance");
+      return;
+    }
+    const version = readFirmwareInfo(image)!.version;
+    const current = client.hub?.hub.version;
+    const sure = await confirmAction({
+      title: `Install firmware ${version}?`,
+      body: [
+        `${current ? `The bridge runs firmware ${current} now. ` : ""}Installing takes about a ` +
+          "minute, and the bridge restarts at the end, which disconnects every app for a moment.",
+        "Everything else is kept: Wi-Fi, settings, the PIN and paired browsers and apps.",
+        "If the new firmware does not start properly, the bridge goes back to this one by itself.",
+      ],
+      confirmLabel: "Install",
+    });
+    if (!sure) return;
+
+    page.updateProgress = 0;
+    let installed = "";
+    const worked = await run("maintenance", async () => {
+      installed = await client.updateHub(image, {
+        version,
+        onProgress: (written, total) => {
+          page.updateProgress = written / total;
+          draw("maintenance");
+        },
+      });
+    });
+    page.updateProgress = null;
+    if (worked) {
+      page.leaving = true;
+      options.onFirmwareInstalled(installed);
+      options.onLeaving(
+        `The bridge is restarting into firmware ${installed}. This page reconnects when it's ` +
+          "back, in about 15 seconds.",
+        true,
+      );
+    } else {
+      draw("maintenance");
+    }
   }
 
   async function restart(): Promise<void> {

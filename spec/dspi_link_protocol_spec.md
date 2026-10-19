@@ -844,6 +844,11 @@ The hub answers each chunk with type 0x84, same `tag`, body `[offset u32]
 [status u8]` (0 = accepted). Chunks must be sequential from 0. The hub
 verifies the SHA-256 when the last byte lands and only then proceeds.
 
+A hub may send a chunk's ack only once it has stored the chunk, so acks
+also pace the client: a client sends no more than a few chunks ahead of
+the acks. Two is always safe; a hub that holds fewer than two chunks
+waiting says so in its own documentation.
+
 ### 8.6 RESYNC
 
 Type 0x05, body `[handle u8][reason u8]`. The 2-byte header `tag` is

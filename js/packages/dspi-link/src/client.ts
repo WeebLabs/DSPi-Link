@@ -9,6 +9,7 @@
 import {
   type CmdRequestFrame,
   type CmdResponseFrame,
+  type FwDataAckFrame,
   type NotifyFrame,
   type PollFrame,
   type ResyncFrame,
@@ -27,6 +28,7 @@ import {
   type HelloHubMessage,
   type HubConfig,
   type HubConfigChangedMessage,
+  type HubUpdateDoneMessage,
   type HubLimits,
   type HubResetLevel,
   type LinkCapability,
@@ -43,6 +45,7 @@ import {
   encode as encodeMessage,
 } from "./messages.js";
 import { base64ToBytes } from "./decoders.js";
+import { sha256Hex } from "./sha256.js";
 
 export const LINK_SUBPROTOCOL = "dspi-link-1";
 export const LINK_DEFAULT_PORT = 11915;
@@ -182,6 +185,31 @@ export interface WifiScanResult {
  * this leaves room for the round trip on top. */
 const WIFI_SCAN_TIMEOUT_MS = 15000;
 
+export interface HubUpdateOptions {
+  /** The new firmware's version, for the hub's log; optional (spec 7.14). */
+  version?: string;
+  /** Called as chunks are acknowledged, with the bytes written so far. */
+  onProgress?: (written: number, total: number) => void;
+}
+
+/** FWDATA chunks sent ahead of their acks. A bridge holds two waiting to be
+ * written (bridge spec 14.2), so a third would be refused. */
+const UPDATE_WINDOW = 2;
+
+/** The longest a chunk may wait for its ack. Writing to flash can pause
+ * for a few seconds; the hub gives up on a stalled update after 30 s. */
+const UPDATE_ACK_TIMEOUT_MS = 35000;
+
+/** How long hub.update.done may take after the last ack: the hub checks
+ * the whole image first. */
+const UPDATE_DONE_TIMEOUT_MS = 30000;
+
+interface PendingAck {
+  resolve: () => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 /** A CMD response whose status was not OK, for callers that want a throw. */
 export class LinkCommandError extends Error {
   readonly status: number;
@@ -243,6 +271,9 @@ export class LinkClient {
   private nextTag = 1;
   private pendingRequests = new Map<number, PendingRequest>();
   private pendingCommands = new Map<number, PendingCommand>();
+
+  /** FWDATA chunks waiting for their acks, keyed "xfer:offset". */
+  private pendingAcks = new Map<string, PendingAck>();
 
   /** Remembered so a reconnect restores the same meter feeds. */
   private pollSubscriptions = new Map<number, Map<number, PollRequest>>();
@@ -561,9 +592,22 @@ export class LinkClient {
       case "resync":
         this.emit("resync", frame);
         return;
+      case "fwdata_ack":
+        this.settleAck(frame);
+        return;
       default:
         return;
     }
+  }
+
+  private settleAck(frame: FwDataAckFrame): void {
+    const key = `${frame.tag}:${frame.offset}`;
+    const pending = this.pendingAcks.get(key);
+    if (!pending) return;
+    this.pendingAcks.delete(key);
+    clearTimeout(pending.timer);
+    if (frame.status === 0) pending.resolve();
+    else pending.reject(new Error(`the hub refused the chunk at offset ${frame.offset}`));
   }
 
   private onHubHello(hello: HelloHubMessage): void {
@@ -846,6 +890,118 @@ export class LinkClient {
     await this.request({ t: "hub.reset", id: 0, level });
   }
 
+  /**
+   * Installs new firmware on the hub itself (spec 7.14; capability
+   * "hub_update"). Sends `image` as FWDATA chunks, a few ahead of their
+   * acks, and resolves with the new version once the hub has checked it.
+   * The hub then closes every session (4003) and restarts into it; the
+   * `hello` after reconnecting shows which firmware is running. Rejects
+   * with the hub's reason if it refuses the image.
+   */
+  async updateHub(image: Uint8Array, options: HubUpdateOptions = {}): Promise<string> {
+    const request: Record<string, unknown> = {
+      t: "hub.update",
+      id: 0,
+      size: image.length,
+      sha256: sha256Hex(image),
+    };
+    if (options.version) request.version = options.version;
+    const done = this.nextMessage<HubUpdateDoneMessage>("hub.update.done");
+    const ok = await this.request(request);
+    const xfer = ok.xfer as number;
+
+    // A refusal can arrive at any point; it ends the upload with the hub's
+    // own reason rather than a bare "chunk refused".
+    const refused = done.promise.then((message) => {
+      if (!message.ok) throw new LinkProtocolError("internal", message.msg ?? "update refused");
+      return new Promise<never>(() => {}); // A success settles nothing here
+    });
+    refused.catch(() => {}); // Handled below; never an unhandled rejection
+
+    try {
+      await Promise.race([this.sendImage(xfer, image, options.onProgress), refused]);
+      const result = await withTimeout(done.promise, UPDATE_DONE_TIMEOUT_MS, "hub.update.done");
+      if (!result.ok) throw new LinkProtocolError("internal", result.msg ?? "update refused");
+      return result.version ?? options.version ?? "";
+    } catch (error) {
+      // Prefer the hub's explanation if it follows right behind.
+      const message = await withTimeout(done.promise, 2000, "").catch(() => null);
+      if (message && !message.ok) {
+        throw new LinkProtocolError("internal", message.msg ?? "update refused");
+      }
+      throw error;
+    } finally {
+      done.cancel();
+      this.dropAcks(xfer);
+    }
+  }
+
+  /** Forgets the chunks of `xfer` still waiting for acks, once the update
+   * is over either way. */
+  private dropAcks(xfer: number): void {
+    for (const [key, pending] of this.pendingAcks) {
+      if (key.startsWith(`${xfer}:`)) {
+        clearTimeout(pending.timer);
+        this.pendingAcks.delete(key);
+      }
+    }
+  }
+
+  /** Sends the chunks of one transfer, keeping UPDATE_WINDOW unanswered. */
+  private async sendImage(
+    xfer: number,
+    image: Uint8Array,
+    onProgress?: (written: number, total: number) => void,
+  ): Promise<void> {
+    const chunkBytes = (this.limits?.max_frame ?? 16384) - 8;
+    const inFlight: Array<Promise<number>> = [];
+    let written = 0;
+    for (let offset = 0; offset < image.length; offset += chunkBytes) {
+      if (inFlight.length >= UPDATE_WINDOW) {
+        written += await inFlight.shift()!;
+        onProgress?.(written, image.length);
+      }
+      const data = image.subarray(offset, offset + chunkBytes);
+      const chunk = this.sendChunk(xfer, offset, data).then(() => data.length);
+      chunk.catch(() => {}); // Awaited in turn below; a later chunk may fail first
+      inFlight.push(chunk);
+    }
+    for (const chunk of inFlight) {
+      written += await chunk;
+      onProgress?.(written, image.length);
+    }
+  }
+
+  private sendChunk(xfer: number, offset: number, data: Uint8Array): Promise<void> {
+    const ws = this.requireSocket();
+    const key = `${xfer}:${offset}`;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingAcks.delete(key);
+        reject(new Error(`no answer for the chunk at offset ${offset}`));
+      }, UPDATE_ACK_TIMEOUT_MS);
+      this.pendingAcks.set(key, { resolve, reject, timer });
+      ws.send(encodeFrame({ type: "fwdata", tag: xfer, offset, data }));
+    });
+  }
+
+  /** The next message of type `t`, as a promise that can be called off. */
+  private nextMessage<T extends LinkMessage>(t: string): {
+    promise: Promise<T>;
+    cancel: () => void;
+  } {
+    let stop = (): void => {};
+    const promise = new Promise<T>((resolve) => {
+      stop = this.on("message", (message) => {
+        if (message.t === t) {
+          stop();
+          resolve(message as T);
+        }
+      });
+    });
+    return { promise, cancel: () => stop() };
+  }
+
   // -- plumbing -------------------------------------------------------------
 
   /** Send a request and wait for its ok/err. `id` is assigned here. */
@@ -917,6 +1073,11 @@ export class LinkClient {
       p.reject(err);
     }
     this.pendingCommands.clear();
+    for (const [, p] of this.pendingAcks) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pendingAcks.clear();
   }
 
   private startPing(): void {
@@ -965,4 +1126,21 @@ function toBytes(data: unknown): Uint8Array | null {
     return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
   }
   return null;
+}
+
+/** `promise`, or a rejection after `ms` naming `what`. */
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }

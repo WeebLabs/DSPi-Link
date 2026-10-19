@@ -1,0 +1,5 @@
+# Drives one WS2812 addressable LED through the RMT peripheral (bridge spec
+# 13), from the ESP-IDF component registry. Pinned exactly, so every build
+# of a release uses the same code.
+dependencies:
+  espressif/led_strip: "==3.1.0~1"

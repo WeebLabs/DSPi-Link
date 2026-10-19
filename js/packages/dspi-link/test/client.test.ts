@@ -9,7 +9,7 @@ import {
 import { LinkStatus } from "../src/frames.js";
 import { bytesToBase64 } from "../src/decoders.js";
 import type { DeviceInfo } from "../src/messages.js";
-import { FakeHub, settle } from "./fakeHub.js";
+import { FakeHub, settle, type FakeHubConfig } from "./fakeHub.js";
 import { fixtureBytes, fixtureJson } from "./fixtures.js";
 
 const DEVICE: DeviceInfo = {
@@ -388,6 +388,65 @@ describe("hub administration (spec 7.10 to 7.13)", () => {
       { t: "hub.restart" },
       { t: "hub.reset", level: "network" },
     ]);
+    client.disconnect();
+  });
+});
+
+describe("hub firmware update (spec 7.14)", () => {
+  /** A hub that answers hub.update with transfer 5. */
+  function updateHub(onFwData?: FakeHubConfig["onFwData"]) {
+    return new FakeHub({
+      auth: "none",
+      role: "admin",
+      onRequest: (msg) => (msg.t === "hub.update" ? { t: "ok", xfer: 5 } : null),
+      onFwData,
+    });
+  }
+
+  it("sends the image in order, a few chunks ahead, and returns the new version", async () => {
+    const hub = updateHub();
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+    const image = Uint8Array.from({ length: 150000 }, (_, i) => i & 0xff);
+    const progress: number[] = [];
+
+    const update = client.updateHub(image, {
+      version: "0.2.0",
+      onProgress: (written) => progress.push(written),
+    });
+    // The fake hub acknowledges each chunk at once; finish once all are in.
+    await settle(40);
+    hub.socket.deliverText({ t: "hub.update.done", ok: true, version: "0.2.0" });
+    expect(await update).toBe("0.2.0");
+
+    const request = hub.received.find((m) => m.t === "hub.update")!;
+    expect(request.size).toBe(150000);
+    expect(request.sha256).toMatch(/^[0-9a-f]{64}$/);
+    const chunks = hub.receivedFrames.filter((f) => f.type === "fwdata");
+    expect(chunks.map((c) => (c as { offset: number }).offset)).toEqual([0, 65528, 131056]);
+    expect(chunks.every((c) => c.tag === 5)).toBe(true);
+    expect(progress.at(-1)).toBe(150000);
+    client.disconnect();
+  });
+
+  it("keeps no more than two chunks unanswered", async () => {
+    const held: Array<{ tag: number; offset: number }> = [];
+    const hub = updateHub((frame) => {
+      held.push({ tag: frame.tag, offset: frame.offset });
+      return null; // Answer later, by hand
+    });
+    const client = newClient(hub);
+    await client.connect("ws://hub.local:11915/dspi/v1", { clientName: "Test" });
+    const update = client.updateHub(new Uint8Array(300000));
+    await settle(20);
+    expect(held).toHaveLength(2);
+
+    hub.socket.deliverFrame({ type: "fwdata_ack", tag: 5, offset: held[0].offset, status: 0 });
+    await settle(20);
+    expect(held).toHaveLength(3); // One answered, so one more went out
+
+    hub.socket.deliverText({ t: "hub.update.done", ok: false, msg: "the file was damaged" });
+    await expect(update).rejects.toThrow("the file was damaged");
     client.disconnect();
   });
 });

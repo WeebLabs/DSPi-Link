@@ -57,6 +57,17 @@ typedef struct {
     char saved_device_serial[17];
     char saved_device_name[64];
     unsigned advertise_count;
+
+    /* Firmware updates: what the hub asked for. Writes are only recorded;
+     * the test reports them done with hub_update_written(). */
+    uint32_t update_capacity; /* 0 turns updates off */
+    uint32_t update_size;     /* From update_begin; 0 when none is open */
+    uint8_t update_sha256[32];
+    uint32_t update_bytes_written;
+    uint32_t update_last_offset;
+    unsigned update_writes;
+    bool update_queue_full; /* Make update_write fail */
+    unsigned update_aborts;
 } fake_hub_io_t;
 
 /* Clears the record and returns the hub_io_t that writes to it. */

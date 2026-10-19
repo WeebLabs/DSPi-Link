@@ -6,13 +6,15 @@ that DSPi over the network. What it does and why is in
 [`spec/esp32_bridge_spec.md`](../../spec/esp32_bridge_spec.md); the build
 order is in [`PLAN.md`](PLAN.md).
 
-**Status:** phase 5 of 8. The bridge is a working Link hub that sets itself
+**Status:** phase 6 of 8. The bridge is a working Link hub that sets itself
 up: on first power-up it shows the setup network `DSPi Bridge XXXX`, a phone
 that joins it gets the setup page by itself, and from there the bridge joins
 the home network, advertises itself by DNS-SD, and serves DSPi Console and
 the web client. Access is open by default; an optional PIN protects both.
 Its settings page, inside the web client, changes the DSPi connection,
-Wi-Fi, PIN, name and hostname, and restarts or resets the bridge.
+Wi-Fi, PIN, name, hostname and status LED, installs new firmware, and
+restarts or resets the bridge. A new firmware that fails to start properly
+is replaced by the previous one by itself.
 
 Supported chips: ESP32, ESP32-S3, ESP32-C3 and ESP32-C6, with at least 4 MB
 of flash.
@@ -72,6 +74,24 @@ by itself.
 
 Everything else is on the settings page: open the bridge's address, connect,
 and choose **Bridge settings**.
+
+## BOOT button and LED
+
+Holding the board's BOOT button for 5 to 15 s and letting go forgets the
+Wi-Fi network; 15 to 30 s erases everything (a factory reset, which is also
+the way out of a forgotten PIN); longer cancels. Holding BOOT while
+plugging the board in starts the chip's download mode instead, which is how
+esptool flashes it.
+
+An optional status LED shows what the bridge is doing (bridge spec 13);
+choose its type and pin under **Bridge settings**. Without one, the serial
+log shows the same stages.
+
+## Update
+
+In **Bridge settings**, under Maintenance, choose **Update firmware** and
+pick the `dspi_bridge.bin` for your chip from `build/<chip>/`. The bridge
+restarts into it and keeps it once it has run properly for a minute.
 
 ## Test
 

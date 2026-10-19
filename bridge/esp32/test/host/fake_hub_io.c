@@ -121,12 +121,48 @@ static void advertise(void *context)
     fake->advertise_count++;
 }
 
+static uint32_t update_capacity(void *context)
+{
+    const fake_hub_io_t *fake = context;
+    return fake->update_capacity;
+}
+
+static bool update_begin(void *context, uint32_t size, const uint8_t sha256[32])
+{
+    fake_hub_io_t *fake = context;
+    fake->update_size = size;
+    memcpy(fake->update_sha256, sha256, sizeof(fake->update_sha256));
+    fake->update_bytes_written = 0;
+    return true;
+}
+
+static bool update_write(void *context, uint32_t offset, const uint8_t *data, size_t length)
+{
+    (void)data;
+    fake_hub_io_t *fake = context;
+    if (fake->update_queue_full) {
+        return false;
+    }
+    fake->update_last_offset = offset;
+    fake->update_bytes_written += (uint32_t)length;
+    fake->update_writes++;
+    return true;
+}
+
+static void update_abort(void *context)
+{
+    fake_hub_io_t *fake = context;
+    fake->update_size = 0;
+    fake->update_aborts++;
+}
+
 hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
 {
     memset(fake, 0, sizeof(*fake));
     fake->now_ms = 5000;
     fake->scan_slot = -1;
     fake->restart_level = -1;
+    fake->update_capacity = 1920 * 1024;
     return (hub_io_t){
         .context = fake,
         .send_text = send_text,
@@ -143,5 +179,9 @@ hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
         .load_device_name = load_device_name,
         .advertise = advertise,
         .describe_bridge = NULL,
+        .update_capacity = update_capacity,
+        .update_begin = update_begin,
+        .update_write = update_write,
+        .update_abort = update_abort,
     };
 }

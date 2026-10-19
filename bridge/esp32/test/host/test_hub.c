@@ -922,6 +922,162 @@ static void a_factory_reset_tells_everyone_then_restarts(void)
     CHECK(io_record.restart_level == HUB_RESTART_FACTORY);
 }
 
+/* ---------------------------------------------------------------------------
+ * Firmware update (Link spec 7.14, bridge spec 14.2)
+ * ------------------------------------------------------------------------- */
+
+#define TEST_SHA256 "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+/* Sends one FWDATA chunk of `length` bytes at `offset` (Link spec 8.5). */
+static void send_chunk(int slot, uint16_t transfer, uint32_t offset, size_t length)
+{
+    uint8_t frame[8 + 64] = {LINK_FRAME_FWDATA,       0,
+                             (uint8_t)transfer,       (uint8_t)(transfer >> 8),
+                             (uint8_t)offset,         (uint8_t)(offset >> 8),
+                             (uint8_t)(offset >> 16), (uint8_t)(offset >> 24)};
+    hub_session_binary(&hub, slot, frame, 8 + length);
+}
+
+/* The status of the last FWDATA ack sent to `slot` for `offset`, or -1. */
+static int last_ack_status(int slot, uint32_t offset)
+{
+    const fake_message_t *ack = last_frame(slot, LINK_FRAME_FWDATA_ACK);
+    if (ack == NULL || ack->length < 9) {
+        return -1;
+    }
+    const uint32_t acked = (uint32_t)ack->data[4] | (uint32_t)ack->data[5] << 8 |
+                           (uint32_t)ack->data[6] << 16 | (uint32_t)ack->data[7] << 24;
+    return acked == offset ? ack->data[8] : -1;
+}
+
+/* True when the hello sent to `slot` offers the capability `name`. */
+static bool hello_offers(int slot, const char *name)
+{
+    cJSON *hello = last_json(slot, "hello");
+    bool found = false;
+    const cJSON *cap;
+    cJSON_ArrayForEach(cap, cJSON_GetObjectItemCaseSensitive(hello, "caps"))
+    {
+        found = found || (cJSON_IsString(cap) && strcmp(cap->valuestring, name) == 0);
+    }
+    cJSON_Delete(hello);
+    return found;
+}
+
+/* Starts a 10-byte update from `slot` and returns its transfer id. */
+static uint16_t begin_update(int slot)
+{
+    send_json(slot, "{\"t\":\"hub.update\",\"id\":40,\"size\":10,\"sha256\":\"" TEST_SHA256 "\"}");
+    cJSON *ok = last_json(slot, "ok");
+    const int transfer = json_number(ok, "xfer");
+    cJSON_Delete(ok);
+    return (uint16_t)transfer;
+}
+
+static void an_update_is_written_chunk_by_chunk_then_restarts(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    CHECK(hello_offers(0, "hub_update"));
+
+    const uint16_t transfer = begin_update(0);
+    CHECK(transfer != 0);
+    CHECK(io_record.update_size == 10);
+    CHECK(io_record.update_sha256[1] == 0x11 && io_record.update_sha256[31] == 0xff);
+
+    forget_messages();
+    send_chunk(0, transfer, 0, 6);
+    CHECK(io_record.update_writes == 1);
+    CHECK(last_ack_status(0, 0) == -1); /* Acknowledged only once written */
+    hub_update_written(&hub, 0);
+    CHECK(last_ack_status(0, 0) == 0);
+
+    send_chunk(0, transfer, 6, 4);
+    hub_update_written(&hub, 6);
+    CHECK(last_ack_status(0, 6) == 0);
+    CHECK(io_record.update_bytes_written == 10);
+
+    hub_update_finished(&hub, true, "0.2.0");
+    cJSON *done = last_json(0, "hub.update.done");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(done, "ok")));
+    CHECK(strcmp(json_string(done, "version"), "0.2.0") == 0);
+    cJSON_Delete(done);
+    CHECK(io_record.close_code[0] == 4003 && io_record.close_code[1] == 4003);
+    CHECK(io_record.restart_level == HUB_RESTART_ONLY);
+}
+
+static void bad_updates_are_refused_and_keep_the_firmware(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+
+    send_json(0,
+              "{\"t\":\"hub.update\",\"id\":41,\"size\":99999999,\"sha256\":\"" TEST_SHA256 "\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "bad_request") == 0); /* Too large */
+    cJSON_Delete(err);
+    forget_messages();
+    send_json(0, "{\"t\":\"hub.update\",\"id\":42,\"size\":10,\"sha256\":\"+0112233\"}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "bad_request") == 0); /* Not a SHA-256 */
+    cJSON_Delete(err);
+
+    const uint16_t transfer = begin_update(0);
+    forget_messages();
+    send_json(1, "{\"t\":\"hub.update\",\"id\":43,\"size\":10,\"sha256\":\"" TEST_SHA256 "\"}");
+    err = last_json(1, "err");
+    CHECK(strcmp(json_string(err, "code"), "busy") == 0); /* One at a time */
+    cJSON_Delete(err);
+
+    send_chunk(1, transfer, 0, 4); /* Someone else's chunk is refused... */
+    CHECK(last_ack_status(1, 0) == 1);
+    CHECK(io_record.update_writes == 0);
+
+    send_chunk(0, transfer, 4, 4); /* ...and a gap ends the update */
+    CHECK(last_ack_status(0, 4) == 1);
+    cJSON *done = last_json(0, "hub.update.done");
+    CHECK(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(done, "ok")));
+    CHECK(strlen(json_string(done, "msg")) > 0);
+    cJSON_Delete(done);
+    CHECK(io_record.update_aborts == 1);
+    CHECK(io_record.restart_level == -1);
+
+    CHECK(begin_update(0) != transfer); /* A new update may start */
+    forget_messages();
+    hub_update_finished(&hub, false, "this file is not firmware for this chip");
+    done = last_json(0, "hub.update.done"); /* The writer's reason reaches the client */
+    CHECK(strcmp(json_string(done, "msg"), "this file is not firmware for this chip") == 0);
+    cJSON_Delete(done);
+    CHECK(io_record.restart_level == -1);
+}
+
+static void a_stalled_or_orphaned_update_is_abandoned(void)
+{
+    start();
+    open_session(0);
+    begin_update(0);
+    for (int i = 0; i < 7; i++) {
+        io_record.now_ms += 5000;
+        hub_session_activity(&hub, 0); /* The session stays alive; the update does not */
+        hub_tick(&hub);
+    }
+    CHECK(io_record.update_aborts == 1);
+    cJSON *done = last_json(0, "hub.update.done");
+    CHECK(done != NULL);
+    cJSON_Delete(done);
+
+    begin_update(0);
+    hub_session_closed(&hub, 0);
+    CHECK(io_record.update_aborts == 2);
+
+    start();
+    io_record.update_capacity = 0; /* A build that cannot update */
+    open_session(0);
+    CHECK(!hello_offers(0, "hub_update"));
+}
+
 void test_hub(void)
 {
     RUN(hello_describes_the_bridge);
@@ -963,4 +1119,7 @@ void test_hub(void)
     RUN(wifi_scans_answer_later);
     RUN(joining_another_network_closes_every_session);
     RUN(a_factory_reset_tells_everyone_then_restarts);
+    RUN(an_update_is_written_chunk_by_chunk_then_restarts);
+    RUN(bad_updates_are_refused_and_keep_the_firmware);
+    RUN(a_stalled_or_orphaned_update_is_abandoned);
 }

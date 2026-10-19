@@ -16,6 +16,7 @@ void test_hub(void);
 void test_net(void);
 void test_ws_header(void);
 void test_hub_auth(void);
+void test_button_led(void);
 
 int main(void)
 {
@@ -29,6 +30,7 @@ int main(void)
     test_net();
     test_ws_header();
     test_hub_auth();
+    test_button_led();
 
     const int failures = check_failure_count();
     if (failures == 0) {

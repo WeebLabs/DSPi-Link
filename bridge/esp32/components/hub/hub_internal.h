@@ -13,6 +13,7 @@
  *   hub_admin.c     administering the hub: settings, Wi-Fi, the PIN and
  *                   paired clients, restart and reset
  *   hub_config.c    the settings as hub.config JSON (hub_config.h)
+ *   hub_update.c    the hub's own firmware update (Link spec 7.14)
  */
 
 #ifndef HUB_INTERNAL_H
@@ -71,6 +72,10 @@ const char *hub_auth_mode(const hub_t *hub);
  * hub_admin.c
  * ------------------------------------------------------------------------- */
 
+/* True when the session may administer the hub; otherwise replies `denied`
+ * and returns false (Link spec 7.9). */
+bool hub_require_admin(hub_t *hub, int slot, int id);
+
 /* Makes `settings` current: saves and applies them through the I/O,
  * advertises, and tells every session with hub.config.changed. */
 void hub_apply_settings(hub_t *hub, const bridge_settings_t *settings);
@@ -124,6 +129,23 @@ void hub_snapshot_mark_stale(hub_t *hub);
 void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
 void hub_device_session_closed(hub_t *hub, int slot, uint16_t session_id);
 void hub_device_tick(hub_t *hub);
+
+/* ---------------------------------------------------------------------------
+ * hub_update.c
+ * ------------------------------------------------------------------------- */
+
+/* True when the I/O can take an update, so hello offers `hub_update`. */
+bool hub_update_available(const hub_t *hub);
+
+void hub_handle_update(hub_t *hub, int slot, int id, const cJSON *message);
+
+/* Handles one FWDATA frame (Link spec 8.5). */
+void hub_update_chunk(hub_t *hub, int slot, const uint8_t *data, size_t length);
+
+void hub_update_session_closed(hub_t *hub, int slot);
+
+/* Gives up on an update that has stopped making progress. */
+void hub_update_tick(hub_t *hub);
 
 /* ---------------------------------------------------------------------------
  * hub_polls.c

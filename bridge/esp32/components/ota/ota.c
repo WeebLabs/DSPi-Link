@@ -1,0 +1,350 @@
+/*
+ * ota.c - firmware updates and rollback (bridge spec 14.2). See ota.h.
+ *
+ * The ota task takes three kinds of item from one queue, in order: begin an
+ * update, write a chunk, abort. Each begin or abort bumps a generation
+ * number, and every chunk carries the generation it was queued under, so a
+ * chunk left over from an abandoned update is dropped rather than written
+ * into the next one.
+ */
+
+#include "ota.h"
+
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bridge_config.h"
+#include "esp_app_desc.h"
+#include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "psa/crypto.h"
+
+static const char *TAG = "ota";
+
+/* Writing to flash is slow; below the hub task, so the hub keeps answering
+ * while an image goes in. */
+#define OTA_TASK_PRIORITY 3
+#define OTA_TASK_STACK_BYTES 4096
+
+/* Chunks plus a begin and an abort. */
+#define OTA_ITEM_QUEUE_DEPTH (OTA_QUEUE_DEPTH + 2)
+
+typedef enum {
+    ITEM_BEGIN,
+    ITEM_CHUNK,
+    ITEM_ABORT,
+} item_kind_t;
+
+typedef struct {
+    item_kind_t kind;
+    uint32_t generation;
+    /* Begin */
+    uint32_t size;
+    uint8_t sha256[OTA_SHA256_BYTES];
+    /* Chunk; `data` is the ota task's to free */
+    uint32_t offset;
+    uint8_t *data;
+    size_t length;
+} ota_item_t;
+
+/* The update the ota task is writing. Touched only by the ota task. */
+typedef struct {
+    bool active;
+    uint32_t generation;
+    const esp_partition_t *partition;
+    esp_ota_handle_t handle;
+    psa_hash_operation_t hash;
+    uint32_t size;
+    uint32_t written;
+    uint8_t expected_sha256[OTA_SHA256_BYTES];
+} update_t;
+
+static struct {
+    ota_handlers_t handlers;
+    QueueHandle_t queue;
+    atomic_uint generation;     /* Bumped by every begin and abort */
+    atomic_uint chunks_waiting; /* Chunks in the queue, for ota_write's limit */
+    update_t update;
+    esp_timer_handle_t confirm_timer;
+    bool (*healthy)(void);
+} ota_state;
+
+/* ---------------------------------------------------------------------------
+ * The ota task
+ * ------------------------------------------------------------------------- */
+
+/* Ends the update in progress without touching the running image. */
+static void drop_update(void)
+{
+    update_t *update = &ota_state.update;
+    if (update->active) {
+        esp_ota_abort(update->handle);
+        psa_hash_abort(&update->hash);
+        update->active = false;
+    }
+}
+
+/* Ends the update in progress as a failure and says why. */
+static void fail(const char *why)
+{
+    ESP_LOGW(TAG, "Update failed: %s", why);
+    drop_update();
+    ota_state.handlers.finished(ota_state.handlers.context, false, why);
+}
+
+static void begin(const ota_item_t *item)
+{
+    drop_update();
+    update_t *update = &ota_state.update;
+    *update = (update_t){
+        .generation = item->generation,
+        .partition = esp_ota_get_next_update_partition(NULL),
+        .hash = PSA_HASH_OPERATION_INIT,
+        .size = item->size,
+    };
+    memcpy(update->expected_sha256, item->sha256, OTA_SHA256_BYTES);
+
+    /* Sequential writes erase each sector as the image reaches it, rather
+     * than the whole image up front, which would stall for seconds. */
+    const esp_err_t err =
+        update->partition == NULL
+            ? ESP_ERR_NOT_FOUND
+            : esp_ota_begin(update->partition, OTA_WITH_SEQUENTIAL_WRITES, &update->handle);
+    if (err != ESP_OK) {
+        /* A firmware still on trial (bridge spec 14.2) must keep the one
+         * it would go back to, so ESP-IDF refuses to overwrite it. */
+        ota_state.handlers.finished(
+            ota_state.handlers.context, false,
+            err == ESP_ERR_OTA_ROLLBACK_INVALID_STATE
+                ? "the bridge has only just been updated; try again in a minute"
+                : "the bridge could not prepare its flash for the update");
+        return;
+    }
+    if (psa_hash_setup(&update->hash, PSA_ALG_SHA_256) != PSA_SUCCESS) {
+        esp_ota_abort(update->handle);
+        ota_state.handlers.finished(ota_state.handlers.context, false,
+                                    "the bridge could not check the update");
+        return;
+    }
+    update->active = true;
+    ESP_LOGI(TAG, "Receiving a %lu-byte image into %s", (unsigned long)update->size,
+             update->partition->label);
+}
+
+/* Every byte is in flash: check the image and, if it is good, start it
+ * next time. */
+static void finish(void)
+{
+    update_t *update = &ota_state.update;
+
+    uint8_t actual[OTA_SHA256_BYTES];
+    size_t actual_length = 0;
+    const bool hashed =
+        psa_hash_finish(&update->hash, actual, sizeof(actual), &actual_length) == PSA_SUCCESS;
+    if (!hashed || memcmp(actual, update->expected_sha256, OTA_SHA256_BYTES) != 0) {
+        fail("the file was damaged on the way: its SHA-256 does not match");
+        return;
+    }
+
+    /* esp_ota_end() checks the image's headers and that it was built for
+     * this chip; the handle is closed whatever it finds. */
+    const esp_err_t end = esp_ota_end(update->handle);
+    update->active = false;
+    if (end != ESP_OK) {
+        fail(end == ESP_ERR_OTA_VALIDATE_FAILED ? "this file is not firmware for this chip"
+                                                : "the bridge could not finish writing the update");
+        return;
+    }
+
+    /* Any valid image for this chip would pass the checks above; make sure
+     * it is the bridge, so a wrong file cannot leave a board without it. */
+    esp_app_desc_t description;
+    if (esp_ota_get_partition_description(update->partition, &description) != ESP_OK ||
+        strcmp(description.project_name, esp_app_get_description()->project_name) != 0) {
+        fail("this file is firmware for this chip, but not DSPi bridge firmware");
+        return;
+    }
+
+    if (esp_ota_set_boot_partition(update->partition) != ESP_OK) {
+        fail("the bridge could not switch to the new firmware");
+        return;
+    }
+    ESP_LOGI(TAG, "Firmware %s is ready and starts after the restart", description.version);
+    ota_state.handlers.finished(ota_state.handlers.context, true, description.version);
+}
+
+static void write_chunk(const ota_item_t *item)
+{
+    update_t *update = &ota_state.update;
+    if (!update->active || item->generation != update->generation) {
+        return; /* Left over from an update that was abandoned */
+    }
+
+    if (item->offset != update->written || item->length > update->size - update->written) {
+        fail("the image arrived out of order");
+        return;
+    }
+    /* The first write checks the image's first byte, so a file that is not
+     * firmware at all is refused here. */
+    const esp_err_t err = esp_ota_write(update->handle, item->data, item->length);
+    if (err != ESP_OK) {
+        fail(err == ESP_ERR_OTA_VALIDATE_FAILED ? "this file is not firmware for this chip"
+                                                : "the bridge could not write the update to flash");
+        return;
+    }
+    if (psa_hash_update(&update->hash, item->data, item->length) != PSA_SUCCESS) {
+        fail("the bridge could not check the update");
+        return;
+    }
+    ota_state.handlers.written(ota_state.handlers.context, item->offset);
+
+    update->written += (uint32_t)item->length;
+    if (update->written == update->size) {
+        finish();
+    }
+}
+
+static void ota_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        ota_item_t item;
+        xQueueReceive(ota_state.queue, &item, portMAX_DELAY);
+        switch (item.kind) {
+        case ITEM_BEGIN:
+            begin(&item);
+            break;
+        case ITEM_CHUNK:
+            write_chunk(&item);
+            free(item.data);
+            atomic_fetch_sub(&ota_state.chunks_waiting, 1);
+            break;
+        case ITEM_ABORT:
+            if (ota_state.update.active) {
+                ESP_LOGI(TAG, "Update abandoned");
+            }
+            drop_update();
+            break;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Public functions
+ * ------------------------------------------------------------------------- */
+
+esp_err_t ota_start(const ota_handlers_t *handlers)
+{
+    ota_state.handlers = *handlers;
+    ota_state.queue = xQueueCreate(OTA_ITEM_QUEUE_DEPTH, sizeof(ota_item_t));
+    if (ota_state.queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(ota_task, "ota", OTA_TASK_STACK_BYTES, NULL, OTA_TASK_PRIORITY, NULL) !=
+        pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+uint32_t ota_capacity(void)
+{
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    return partition != NULL ? partition->size : 0;
+}
+
+bool ota_begin(uint32_t size, const uint8_t sha256[OTA_SHA256_BYTES])
+{
+    if (size == 0 || size > ota_capacity()) {
+        return false;
+    }
+    ota_item_t item = {
+        .kind = ITEM_BEGIN,
+        .generation = atomic_fetch_add(&ota_state.generation, 1) + 1,
+        .size = size,
+    };
+    memcpy(item.sha256, sha256, OTA_SHA256_BYTES);
+    return xQueueSend(ota_state.queue, &item, 0) == pdTRUE;
+}
+
+bool ota_write(uint32_t offset, const uint8_t *data, size_t length)
+{
+    if (atomic_load(&ota_state.chunks_waiting) >= OTA_QUEUE_DEPTH) {
+        return false;
+    }
+    ota_item_t item = {
+        .kind = ITEM_CHUNK,
+        .generation = atomic_load(&ota_state.generation),
+        .offset = offset,
+        .data = malloc(length),
+        .length = length,
+    };
+    if (item.data == NULL) {
+        return false;
+    }
+    memcpy(item.data, data, length);
+    atomic_fetch_add(&ota_state.chunks_waiting, 1);
+    if (xQueueSend(ota_state.queue, &item, 0) != pdTRUE) {
+        atomic_fetch_sub(&ota_state.chunks_waiting, 1);
+        free(item.data);
+        return false;
+    }
+    return true;
+}
+
+void ota_abort(void)
+{
+    ota_item_t item = {
+        .kind = ITEM_ABORT,
+        .generation = atomic_fetch_add(&ota_state.generation, 1) + 1,
+    };
+    /* If even this cannot be queued, the bumped generation already makes
+     * the task drop the chunks still waiting; the next begin ends the rest. */
+    xQueueSend(ota_state.queue, &item, pdMS_TO_TICKS(100));
+}
+
+/* ---------------------------------------------------------------------------
+ * Confirming a new image
+ * ------------------------------------------------------------------------- */
+
+static void confirm(void *argument)
+{
+    (void)argument;
+    if (ota_state.healthy()) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "This firmware ran %d s with every task up and is now confirmed",
+                 OTA_CONFIRM_AFTER_MS / 1000);
+    } else {
+        ESP_LOGE(TAG, "This firmware is not running properly; returning to the previous one");
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
+}
+
+void ota_confirm_after_healthy_start(bool (*healthy)(void))
+{
+    esp_ota_img_states_t state;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (esp_ota_get_state_partition(running, &state) != ESP_OK ||
+        state != ESP_OTA_IMG_PENDING_VERIFY) {
+        return; /* Confirmed already, or flashed by cable */
+    }
+
+    ESP_LOGI(TAG, "New firmware: it is confirmed if it runs properly for %d s",
+             OTA_CONFIRM_AFTER_MS / 1000);
+    ota_state.healthy = healthy;
+    const esp_timer_create_args_t timer = {.callback = confirm, .name = "ota_confirm"};
+    if (esp_timer_create(&timer, &ota_state.confirm_timer) != ESP_OK ||
+        esp_timer_start_once(ota_state.confirm_timer, (uint64_t)OTA_CONFIRM_AFTER_MS * 1000) !=
+            ESP_OK) {
+        /* Without the timer the image would never be confirmed and the next
+         * restart would roll back; confirm now rather than lose it. */
+        ESP_LOGW(TAG, "Could not start the confirmation timer; confirming now");
+        esp_ota_mark_app_valid_cancel_rollback();
+    }
+}

@@ -18,6 +18,7 @@
 #include "esp_err.h"
 #include "http_server.h"
 #include "hub_auth.h"
+#include "hub_io.h"
 #include "settings_model.h"
 
 /*
@@ -50,6 +51,14 @@ hub_auth_result_t hub_task_check_pin(uint32_t address, const char *pin);
  * forgotten (bridge spec 9.3). ESP_ERR_INVALID_ARG for a PIN that is not
  * six digits. */
 esp_err_t hub_task_set_pin(const char *pin);
+
+/* Tells every session the bridge is going, then restarts after erasing
+ * what `level` says, as hub.reset does. For the BOOT button. */
+esp_err_t hub_task_restart(hub_restart_level_t level);
+
+/* True when the hub task's loop ran in the last 2 s. Safe from any task;
+ * for the check that confirms a new firmware (bridge spec 14.2). */
+bool hub_task_is_alive(void);
 
 /* Copies the hub's current name. Safe from any task. */
 void hub_task_name(char *name, size_t size);

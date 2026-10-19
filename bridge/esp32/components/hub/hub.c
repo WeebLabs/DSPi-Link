@@ -143,6 +143,7 @@ void hub_init(hub_t *hub, const hub_io_t *io, const hub_config_t *config,
     hub->next_session_id = 1;
     hub->next_tag = 1;
     hub->device.state = HUB_DEVICE_ABSENT;
+    hub->update.next_transfer = 1;
 }
 
 bool hub_has_room(const hub_t *hub)
@@ -176,6 +177,7 @@ static void release_session(hub_t *hub, int slot)
     const uint16_t session_id = hub->sessions[slot].id;
     hub_polls_session_closed(hub, slot);
     hub_device_session_closed(hub, slot, session_id);
+    hub_update_session_closed(hub, slot);
 }
 
 void hub_close_session(hub_t *hub, int slot, uint16_t code)
@@ -287,6 +289,9 @@ static cJSON *new_caps_array(const hub_t *hub)
     cJSON_AddItemToArray(caps, cJSON_CreateString("wifi"));
     cJSON_AddItemToArray(caps, cJSON_CreateString("auth_config"));
     cJSON_AddItemToArray(caps, cJSON_CreateString("reset"));
+    if (hub_update_available(hub)) {
+        cJSON_AddItemToArray(caps, cJSON_CreateString("hub_update"));
+    }
     return caps;
 }
 
@@ -525,6 +530,7 @@ static const struct {
     {"hub.wifi.join", hub_handle_wifi_join},
     {"hub.restart", hub_handle_restart},
     {"hub.reset", hub_handle_reset},
+    {"hub.update", hub_handle_update},
     {"device.list", hub_handle_device_list},
     {"device.rename", hub_handle_device_rename},
     {"device.snapshot", hub_handle_device_snapshot},
@@ -601,13 +607,7 @@ void hub_session_binary(hub_t *hub, int slot, const uint8_t *data, size_t length
     if (type == LINK_FRAME_CMD_REQUEST) {
         hub_commands_handle_frame(hub, slot, data, length);
     } else if (type == LINK_FRAME_FWDATA) {
-        /* No transfer is open: hub_update arrives in phase 6. Refuse the chunk. */
-        link_fwdata_chunk_t chunk;
-        if (link_decode_fwdata(data, length, &chunk)) {
-            const size_t frame_length = link_encode_fwdata_ack(hub->frame, sizeof(hub->frame),
-                                                               chunk.transfer, chunk.offset, 1);
-            hub_send_binary(hub, slot, hub->frame, frame_length);
-        }
+        hub_update_chunk(hub, slot, data, length);
     } else if (type >= 0 && type < 0x80) {
         /* An unknown request type gets UNSUPPORTED with its tag (Link spec 8). */
         const size_t frame_length =
@@ -660,6 +660,7 @@ void hub_tick(hub_t *hub)
     tick_sessions(hub, hub_now(hub));
     hub_device_tick(hub);
     hub_polls_tick(hub);
+    hub_update_tick(hub);
 }
 
 /* ---------------------------------------------------------------------------

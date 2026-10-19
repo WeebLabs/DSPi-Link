@@ -175,6 +175,10 @@
  * is never held up by network work. */
 #define DSPI_UART_TASK_PRIORITY 10
 
+/* The uart task counts as alive if its loop has come round this recently.
+ * One pass can include a search of every baud rate, a few seconds at most. */
+#define DSPI_UART_ALIVE_WITHIN_MS 15000
+
 /* ---------------------------------------------------------------------------
  * Networking (bridge spec 9)
  * ------------------------------------------------------------------------- */
@@ -213,6 +217,29 @@
 #define BUTTON_FACTORY_RESET_HOLD_MS 15000
 #define BUTTON_CANCEL_HOLD_MS 30000
 
+/* How often the pin is read, and how many readings in a row must agree
+ * before a press or release counts: 60 ms, longer than contact bounce. */
+#define BUTTON_SAMPLE_MS 20
+#define BUTTON_DEBOUNCE_SAMPLES 3
+
+/* ---------------------------------------------------------------------------
+ * Status LED (bridge spec 13)
+ * ------------------------------------------------------------------------- */
+
+/* One full cycle of a fast blink (4 a second) and of a slow blink or pulse. */
+#define LED_FAST_BLINK_MS 250
+#define LED_SLOW_PERIOD_MS 2000
+
+/* How long the LED shows green once the bridge is online with its DSPi. */
+#define LED_READY_SHOW_MS 5000
+
+/* How often the LED is redrawn: 50 times a second keeps a pulse smooth. */
+#define LED_FRAME_MS 20
+
+/* An addressable LED at full brightness is glaring; colours are scaled to
+ * this out of 255. A plain LED is driven at full brightness. */
+#define LED_WS2812_BRIGHTNESS 48
+
 /* ---------------------------------------------------------------------------
  * Firmware updates (bridge spec 14)
  * ------------------------------------------------------------------------- */
@@ -220,5 +247,15 @@
 /* A new image confirms itself after running this long with every task up;
  * a crash before then rolls back (bridge spec 14.2). */
 #define OTA_CONFIRM_AFTER_MS 60000
+
+/* An update with no chunk written or received for this long is abandoned
+ * (bridge spec 14.2). Generous: a phone that locks its screen pauses the
+ * page for a while. */
+#define OTA_IDLE_TIMEOUT_MS 30000
+
+/* Chunks waiting to be written to flash. Each holds up to one 16 KB frame,
+ * so this bounds the memory an update takes; the client keeps no more than
+ * this many chunks unanswered (bridge spec 14.2). */
+#define OTA_QUEUE_DEPTH 2
 
 #endif /* BRIDGE_CONFIG_H */

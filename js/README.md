@@ -43,7 +43,7 @@ const snap = await client.snapshot(0);
 const volumeDb = readMasterVolumeDb(snap.bulk!);
 ```
 
-Four modules, each usable on its own:
+Five modules, each usable on its own:
 
 - `frames.ts` - the binary data plane (spec 8). `decodeFrame` / `encodeFrame`
   round-trip every frame type byte for byte. An unknown frame type decodes to
@@ -57,9 +57,13 @@ Four modules, each usable on its own:
   close-code mapping and backoff reconnection. Since 1.2 it also has the hub
   administration calls of spec 7.9 to 7.13 (`getHubConfig`, `setHubConfig`,
   `scanWifi`, `joinWifi`, `setAuth`, `listClients`, `revokeClient`,
-  `restartHub`, `resetHub`) and a `hubConfig` event for
+  `restartHub`, `resetHub`, `updateHub`) and a `hubConfig` event for
   `hub.config.changed`. A rejected `hub.config.set` rejects with a
-  `LinkProtocolError` whose `field` names the key.
+  `LinkProtocolError` whose `field` names the key. `updateHub` sends an
+  image as FWDATA chunks, two ahead of their acks, and resolves with the
+  new version.
+- `sha256.ts` - SHA-256 for firmware uploads. Browsers offer it only on
+  secure origins, and a hub's page is usually plain `http://`.
 - `decoders.ts` - the firmware payloads Link carries verbatim: the bulk header,
   master volume and global preamp accessors, the combined status frame, the
   platform reply and v2 notification packets. Every offset is documented with
@@ -91,8 +95,10 @@ Four screens: connect, device list, one device, and a bridge's settings.
   dropped. `RESYNC` and `BULK_INVALIDATED` re-read the snapshot.
 - **Bridge settings** (`settings.ts`). Shown to an `admin` session when the
   hub has `hub_config`: status, the DSPi connection with a wiring diagram,
-  Wi-Fi, the PIN and paired clients, name, hostname and LED, and restart,
-  forget Wi-Fi and factory reset. Everything goes through the admin
+  Wi-Fi, the PIN and paired clients, name, hostname and LED, and firmware
+  update, restart, forget Wi-Fi and factory reset. `firmware.ts` reads an
+  ESP32 image's chip, version and project, so a wrong file is refused
+  before it is sent. Everything goes through the admin
   messages; the layout is in `esp32_bridge_spec.md` section 10.3.
 
 `apps/web` also builds a second page, `setup.html`, which only a bridge

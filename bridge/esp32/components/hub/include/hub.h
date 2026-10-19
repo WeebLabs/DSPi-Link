@@ -9,8 +9,7 @@
  * only caller, so nothing here needs locking. The host tests call the same
  * functions directly.
  *
- * Portable: no ESP-IDF headers. Phase 3 implements `auth: none` only; the
- * PIN and the administration messages arrive in phase 5.
+ * Portable: no ESP-IDF headers.
  */
 
 #ifndef HUB_H
@@ -167,6 +166,24 @@ typedef struct {
     uint32_t sent_ms;
 } hub_origin_t;
 
+typedef enum {
+    HUB_UPDATE_IDLE,
+    HUB_UPDATE_RECEIVING, /* Chunks are arriving */
+    HUB_UPDATE_FINISHING, /* Every chunk has arrived; waiting for the check */
+} hub_update_phase_t;
+
+/* The firmware update in progress, if any (Link spec 7.14). */
+typedef struct {
+    hub_update_phase_t phase;
+    int slot;            /* Who is sending it */
+    uint16_t session_id; /* Detects a slot reused meanwhile */
+    uint16_t transfer;   /* The xfer id its FWDATA chunks carry */
+    uint16_t next_transfer;
+    uint32_t size;
+    uint32_t received;         /* Bytes handed to the I/O: the next chunk's offset */
+    uint32_t last_progress_ms; /* A chunk arriving or being written */
+} hub_update_t;
+
 typedef struct {
     bridge_settings_t settings; /* The hub id, name and everything hub.config shows */
     const board_table_t *board; /* For the choices hub.config offers */
@@ -202,6 +219,7 @@ typedef struct {
 
     hub_device_t device;
     hub_snapshot_t snapshot;
+    hub_update_t update;
 
     /* Scratch for encoding one outbound binary frame; the largest is a CMD
      * response carrying a whole bulk blob. */
@@ -272,6 +290,23 @@ hub_auth_result_t hub_check_pin(hub_t *hub, uint32_t address, const char *pin);
 /* Sets or clears the PIN from the setup page (bridge spec 9.3): `pin` NULL
  * turns it off. Every paired client is forgotten either way. */
 bool hub_set_pin(hub_t *hub, const char *pin);
+
+/* Tells every session the hub is going (close code 4003), then restarts
+ * through the I/O after erasing what `level` says. The BOOT button uses
+ * this; hub.restart and hub.reset do the same after replying. */
+void hub_restart(hub_t *hub, hub_restart_level_t level);
+
+/* ---------------------------------------------------------------------------
+ * Firmware update events, from the I/O (hub_io_t's update functions)
+ * ------------------------------------------------------------------------- */
+
+/* The chunk at `offset` is in flash. */
+void hub_update_written(hub_t *hub, uint32_t offset);
+
+/* The update is over: the whole image was checked (`ok`), or something
+ * went wrong on the way. `text` is the new firmware's version when `ok`,
+ * or a sentence saying what was wrong. */
+void hub_update_finished(hub_t *hub, bool ok, const char *text);
 
 /* ---------------------------------------------------------------------------
  * What the hub publishes
