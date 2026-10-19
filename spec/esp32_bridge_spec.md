@@ -639,6 +639,9 @@ that applies:
 4. `DENIED` if the session's role does not permit the command's class.
 5. `LOCKED` if another session holds the lock.
 6. `RATE_LIMITED` if the session already has `max_inflight` commands queued.
+7. `BUSY` (0x01) if a firmware update is in progress and the command is a
+   GET whose `wLength` exceeds 2048 bytes, half the UART's receive buffer
+   (section 14.2). The command has not run, so the client may retry.
 
 Then the command joins the uart task's queue and its response returns to the
 session with the client's `tag`. The hub never interprets payloads.
@@ -1154,10 +1157,25 @@ that the margin covers future growth. CI fails a build that exceeds it.
   previous image, except that a restart the user asks for (`hub.restart`,
   `hub.reset` or the BOOT button) first confirms an image that is running
   properly at that moment.
+- While an update is written, flash erases pause the uart task for about
+  45 ms at a time, and the UART's 4 KB receive buffer must hold whatever
+  arrives meanwhile. So from `hub.update` until the update ends, the hub
+  keeps large answers off the link: polls pause, `device.snapshot`
+  requests wait and are answered once the update ends (or the bridge
+  restarts into the new firmware), and large client GETs are answered
+  `BUSY` (section 8.3). Small commands and notifications go on as usual.
 - While a new image is still on trial, another update is refused ("try
   again in a minute"), because ESP-IDF keeps the image it would return to.
 - On the ESP32-S3, a 983 KB image took about 4 to 7 s to send and check,
   and the bridge was back 7 s later.
+- Updates are not signed, by design. Sending one takes an admin session,
+  which can already control the DSPi and move the bridge to another
+  network, and anyone with the board in hand can flash it over USB. A
+  signature would add a release key to guard forever, and would stop
+  people who build their own firmware from updating over the air. A PIN
+  (section 8.9) is the protection for a shared network. Hardware secure
+  boot and flash encryption are not used either: they burn eFuses that
+  cannot be undone, and would lock the board to one key.
 
 ---
 

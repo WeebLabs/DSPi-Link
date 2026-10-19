@@ -30,6 +30,18 @@ bool hub_update_available(const hub_t *hub)
     return hub->io.update_capacity != NULL && hub->io.update_capacity(hub->io.context) > 0;
 }
 
+bool hub_update_in_progress(const hub_t *hub)
+{
+    return hub->update.phase != HUB_UPDATE_IDLE;
+}
+
+/* Ends the update without a restart, and lets the reads it held back go. */
+static void end_update(hub_t *hub)
+{
+    hub->update.phase = HUB_UPDATE_IDLE;
+    hub_snapshot_resume(hub);
+}
+
 /* The session sending the update, if it is still connected. */
 static bool sender_is_connected(hub_t *hub)
 {
@@ -68,7 +80,7 @@ static void fail(hub_t *hub, const char *why)
 {
     hub->io.update_abort(hub->io.context);
     send_done(hub, false, why);
-    hub->update.phase = HUB_UPDATE_IDLE;
+    end_update(hub);
 }
 
 /* The value of one hex digit, or -1. */
@@ -211,10 +223,12 @@ void hub_update_finished(hub_t *hub, uint32_t generation, bool ok, const char *t
         return; /* From an update abandoned meanwhile */
     }
     send_done(hub, ok, text);
-    hub->update.phase = HUB_UPDATE_IDLE;
     if (ok) {
         /* The new image starts next; restart into it (Link spec 7.14). */
+        hub->update.phase = HUB_UPDATE_IDLE;
         hub_restart(hub, HUB_RESTART_ONLY);
+    } else {
+        end_update(hub);
     }
 }
 
@@ -233,7 +247,7 @@ void hub_update_session_closed(hub_t *hub, int slot)
     }
     /* Part of the image is missing, so nobody is left to finish it. */
     hub->io.update_abort(hub->io.context);
-    update->phase = HUB_UPDATE_IDLE;
+    end_update(hub);
 }
 
 void hub_update_tick(hub_t *hub)

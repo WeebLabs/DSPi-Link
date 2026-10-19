@@ -212,6 +212,10 @@ static uint8_t admission_status(const hub_t *hub, const hub_session_t *session,
     if (session->commands_in_flight >= LINK_MAX_INFLIGHT) {
         return LINK_STATUS_RATE_LIMITED;
     }
+    if (command->is_get && command->length > HUB_UPDATE_MAX_GET_BYTES &&
+        hub_update_in_progress(hub)) {
+        return DSPI_STATUS_BUSY; /* Not run; retry once the update is over */
+    }
     if (!command->is_get && command->request != REQ_SET_ALL_PARAMS &&
         command->length > DSPI_UART_MAX_SET_PAYLOAD_BYTES) {
         /* The firmware refuses this on its UART (Link spec 9.2); answer as

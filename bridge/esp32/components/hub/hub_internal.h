@@ -165,6 +165,10 @@ void hub_handle_lock_release(hub_t *hub, int slot, int id, const cJSON *message)
 /* A forwarded SET or a notification may have changed the settings blob. */
 void hub_snapshot_mark_stale(hub_t *hub);
 
+/* Starts the snapshot read that waited for an update to end, if one is
+ * wanted. */
+void hub_snapshot_resume(hub_t *hub);
+
 void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
 void hub_device_session_closed(hub_t *hub, int slot, uint16_t session_id);
 void hub_device_tick(hub_t *hub);
@@ -175,6 +179,10 @@ void hub_device_tick(hub_t *hub);
 
 /* True when the I/O can take an update, so hello offers `hub_update`. */
 bool hub_update_available(const hub_t *hub);
+
+/* True from hub.update until the update ends. Meanwhile the hub keeps
+ * large answers off the UART (HUB_UPDATE_MAX_GET_BYTES). */
+bool hub_update_in_progress(const hub_t *hub);
 
 void hub_handle_update(hub_t *hub, int slot, int id, const cJSON *message);
 

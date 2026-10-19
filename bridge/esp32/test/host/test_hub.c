@@ -1342,6 +1342,46 @@ static void a_refused_subscription_changes_nothing(void)
     CHECK(hub.poll_group_count == HUB_MAX_POLL_GROUPS);
 }
 
+static void an_update_holds_back_large_answers_until_it_ends(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    subscribe_polls(1, 0, 1, 0, false);
+    hub_tick(&hub);
+    CHECK(io_record.submission_count == 1); /* The poll runs... */
+    static const uint8_t status[41] = {1};
+    answer_last(0, status, sizeof(status));
+    const uint16_t transfer = begin_update(0);
+    forget_messages();
+    forget_submissions();
+
+    io_record.now_ms += 2000;
+    hub_tick(&hub);
+    CHECK(io_record.submission_count == 0); /* ...but waits during the update */
+    send_json(1, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    CHECK(io_record.submission_count == 0);                           /* So does the snapshot... */
+    CHECK(last_json(1, "ok") == NULL && last_json(1, "err") == NULL); /* ...unanswered */
+    send_cmd(1, 5, true, 0xA0, 6136, NULL);
+    CHECK(last_status(1) == DSPI_STATUS_BUSY); /* A large GET is not run */
+    CHECK(io_record.submission_count == 0);
+    send_cmd(1, 6, true, 0x7F, 7, NULL);
+    CHECK(io_record.submission_count == 1); /* A small one goes on */
+    answer_last(0, (const uint8_t[]){1, 2, 3, 4, 5, 6, 7}, 7);
+
+    forget_submissions();
+    send_chunk(0, transfer, 4, 2); /* A gap ends the update */
+    CHECK(io_record.update_aborts == 1);
+    CHECK(io_record.submission_count == 1 && last_request() == 0x50); /* The snapshot's read */
+    answer_last(0, status, sizeof(status));
+    cJSON *ok = last_json(1, "ok");
+    CHECK(ok != NULL);
+    cJSON_Delete(ok);
+    hub_tick(&hub);
+    CHECK(io_record.submission_count == 2); /* Polls run again */
+}
+
 static void repeated_keys_need_one_group(void)
 {
     start();
@@ -1837,6 +1877,7 @@ void test_hub(void)
     RUN(an_update_is_written_chunk_by_chunk_then_restarts);
     RUN(bad_updates_are_refused_and_keep_the_firmware);
     RUN(a_stalled_or_orphaned_update_is_abandoned);
+    RUN(an_update_holds_back_large_answers_until_it_ends);
     RUN(a_complete_update_survives_its_sender_leaving);
     RUN(reports_from_an_abandoned_update_are_ignored);
     RUN(a_lost_answer_times_out_and_a_late_one_is_ignored);

@@ -504,6 +504,13 @@
  * again; Link spec 8.4 asks only for "a reduced rate". */
 #define HUB_POLL_FAILED_PERIOD_MS 1000
 
+/* While a firmware update is written, flash erases pause the uart task for
+ * up to about 45 ms each, and the UART's receive buffer must hold whatever
+ * arrives meanwhile. So a client GET that could bring back more than half
+ * of it is answered BUSY until the update ends, and polls and snapshot
+ * reads wait (bridge spec 14.2). */
+#define HUB_UPDATE_MAX_GET_BYTES (DSPI_UART_DRIVER_RX_BUFFER_BYTES / 2)
+
 /* hub.stats' avg_rtt_ms is a moving average in which each new round trip
  * counts 1/HUB_RTT_AVERAGE_WEIGHT: smooth, yet it follows a change within a
  * few dozen commands. */

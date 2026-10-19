@@ -398,8 +398,10 @@ void hub_polls_clear(hub_t *hub)
 
 void hub_polls_tick(hub_t *hub)
 {
-    /* Client commands first, one poll at a time (bridge spec 7.7). */
-    if (!hub_device_online(hub) || hub->client_commands_pending > 0 || hub->poll_pending) {
+    /* Client commands first, one poll at a time (bridge spec 7.7), and
+     * none while an update is written (HUB_UPDATE_MAX_GET_BYTES). */
+    if (!hub_device_online(hub) || hub->client_commands_pending > 0 || hub->poll_pending ||
+        hub_update_in_progress(hub)) {
         return;
     }
 

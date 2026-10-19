@@ -343,6 +343,9 @@ static void start_snapshot_read(hub_t *hub)
     if (snapshot->read_tag != 0 || !hub_device_online(hub)) {
         return;
     }
+    if (hub_update_in_progress(hub)) {
+        return; /* The blob is too large to read now; hub_snapshot_resume() */
+    }
     if (blob_trusted(hub)) {
         snapshot->read_tag = submit_status_read(hub);
     } else {
@@ -355,6 +358,13 @@ static void start_snapshot_read(hub_t *hub)
     if (snapshot->read_tag == 0) {
         snapshot->stale = true;
         fail_snapshot_waiters(hub, "busy", "the bridge's queue to the DSPi is full");
+    }
+}
+
+void hub_snapshot_resume(hub_t *hub)
+{
+    if (hub->snapshot.waiter_count > 0 || !hub->snapshot.valid) {
+        start_snapshot_read(hub);
     }
 }
 

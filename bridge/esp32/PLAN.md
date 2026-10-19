@@ -367,8 +367,13 @@ the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
 - Release note: the ESP32 no longer offers GPIO 34 to 39 for the UART. A
   bridge with one of them saved as its RX pin returns both UART pins to the
   defaults after the update.
-- Open from the audit: whether to sign firmware updates (it needs a
-  release key held in CI).
+- Closed from the audit: updates are not signed, by decision (bridge spec
+  14.2). Sending one already takes an admin session, which controls the
+  DSPi and the bridge anyway, and a signing key would have to be guarded
+  forever and would stop self-built firmware updating over the air.
+- During an update the hub now keeps large answers off the UART, so a
+  flash erase cannot overflow its receive buffer: polls pause, snapshots
+  wait, and GETs over 2 KB are answered BUSY.
 - Left: the same bench run on the ESP32, ESP32-C3 and ESP32-C6, the
   setup journey on an Android phone, DSPi Console against the PIN, and
   marking the specs implemented once every chip passes.
