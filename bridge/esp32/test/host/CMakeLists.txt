@@ -31,6 +31,9 @@ endif()
 add_library(cjson STATIC ${cjson_SOURCE_DIR}/cJSON.c)
 target_include_directories(cjson PUBLIC ${cjson_SOURCE_DIR})
 target_compile_options(cjson PRIVATE -w)
+# The nesting limit the firmware uses (CONFIG_CJSON_NESTING_LIMIT in
+# sdkconfig.defaults), so the tests see the same parser.
+target_compile_definitions(cjson PUBLIC CJSON_NESTING_LIMIT=8)
 
 set(COMPONENTS ${CMAKE_CURRENT_LIST_DIR}/../../components)
 
@@ -50,6 +53,7 @@ add_executable(host_tests
     test_hub.c
     test_net.c
     test_ws_header.c
+    test_origin.c
     test_hub_auth.c
     test_button_led.c
     fake_crypto.c
@@ -71,6 +75,7 @@ add_executable(host_tests
     ${COMPONENTS}/net/net_machine.c
     ${COMPONENTS}/net/captive_dns.c
     ${COMPONENTS}/http_server/ws_header.c
+    ${COMPONENTS}/http_server/origin.c
     ${COMPONENTS}/hub_auth/hub_auth.c
     ${COMPONENTS}/settings/settings_model.c
     ${COMPONENTS}/button/button_machine.c

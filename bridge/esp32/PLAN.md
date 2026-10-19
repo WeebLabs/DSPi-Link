@@ -303,6 +303,28 @@ the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
   145 host tests and 150 JS tests pass. All four chips build without
   warnings, QEMU passes on three, and `link_smoke.mjs` and
   `link_conformance.mjs --offline` pass on the ESP32-S3.
+- A security and robustness audit of every subsystem followed (six
+  parallel reviews). Its critical and high findings are fixed and were
+  checked on the ESP32-S3, each against the attack that had worked:
+  - one deeply nested JSON message crashed the bridge before pairing; JSON
+    may now nest 8 levels;
+  - any web page in a browser on the network could administer the bridge;
+    WebSocket upgrades from a foreign `Origin` are now refused;
+  - idle connections could hold every socket on the Link port, and one
+    client trickling a request could freeze every session; the Link port
+    now drops the least recently used socket, uses TCP keep-alive, and
+    gives each request 8 s;
+  - an abandoned update could still be switched to, and a later wrong file
+    left as the boot image; abandoned updates now write and switch nothing,
+    and a new update waits while a finished one awaits its restart;
+  - a stranger guessing PINs could lock paired clients out; the hub-wide
+    lock now guards PIN guesses only.
+
+  `tools/build.sh` now regenerates a chip's sdkconfig when the defaults
+  change: the earlier bench runs had used a stale configuration (16
+  sockets). The bench was rerun on a clean build and passes.
+- Open from the audit: whether to sign firmware updates (it needs a
+  release key held in CI), and its medium and low findings.
 - Left: the same bench run on the ESP32, ESP32-C3 and ESP32-C6, the
   setup journey on an Android phone, DSPi Console against the PIN, and
   marking the specs implemented once every chip passes.

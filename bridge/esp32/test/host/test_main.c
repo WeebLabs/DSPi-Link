@@ -16,6 +16,7 @@ void test_link_base64(void);
 void test_hub(void);
 void test_net(void);
 void test_ws_header(void);
+void test_origin(void);
 void test_hub_auth(void);
 void test_button_led(void);
 
@@ -31,6 +32,7 @@ int main(void)
     test_hub();
     test_net();
     test_ws_header();
+    test_origin();
     test_hub_auth();
     test_button_led();
 

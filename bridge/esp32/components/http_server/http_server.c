@@ -31,14 +31,21 @@
 #include "freertos/FreeRTOS.h"
 #include "lwip/sockets.h"
 #include "net.h"
+#include "origin.h"
 #include "web_assets.h"
 #include "ws_header.h"
 
 static const char *TAG = "http_server";
 
 #define LINK_SUBPROTOCOL "dspi-link-1"
-/* Room for the sub-protocols a client offers; a Link client offers one. */
-#define SUBPROTOCOL_HEADER_BYTES 96
+/* Room for the sub-protocols a client offers. The same size as the buffer
+ * ESP-IDF reads the header into when it echoes the protocol back
+ * (httpd_ws.c), so a list too long for ESP-IDF is refused here too, rather
+ * than passing this check and then failing in the browser. */
+#define SUBPROTOCOL_HEADER_BYTES 50
+/* Room for an Origin header: the longest .local hostname, a scheme and a
+ * port fit easily; anything longer is not the bridge's own origin. */
+#define ORIGIN_HEADER_BYTES 128
 #define CLOSE_NORMAL 1000
 #define CLOSE_PROTOCOL_ERROR 4000
 
@@ -594,6 +601,44 @@ static bool requests_link_subprotocol(httpd_req_t *request)
     return false;
 }
 
+static uint32_t ipv4_of(const struct sockaddr_storage *address);
+static void stop_request_clock(int fd);
+
+/* True when the upgrade comes from a native app, which sends no Origin, or
+ * from a page the bridge itself served (origin.h). Any other web page is
+ * refused, so a site open in a browser on the home network cannot drive
+ * the bridge through that browser (Link spec 4). */
+static bool origin_allowed(httpd_req_t *request)
+{
+    char origin[ORIGIN_HEADER_BYTES];
+    const esp_err_t err = httpd_req_get_hdr_value_str(request, "Origin", origin, sizeof(origin));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false; /* Too long to be the bridge's own origin */
+    }
+
+    struct sockaddr_storage local;
+    socklen_t length = sizeof(local);
+    char local_address[INET_ADDRSTRLEN] = "";
+    if (getsockname(httpd_req_to_sockfd(request), (struct sockaddr *)&local, &length) == 0) {
+        const uint32_t ipv4 = ipv4_of(&local);
+        if (ipv4 != 0) {
+            const struct in_addr address = {.s_addr = ipv4};
+            inet_ntoa_r(address, local_address, sizeof(local_address));
+        }
+    }
+    net_status_t network;
+    net_get_status(&network);
+
+    if (origin_is_own(origin, local_address, network.hostname)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "Refused a Link session from the web page at %s", origin);
+    return false;
+}
+
 /* Answers a handshake the bridge will not complete. The server closes the
  * socket once this returns ESP_FAIL. */
 static esp_err_t refuse_handshake(httpd_req_t *request, const char *status, const char *text)
@@ -605,13 +650,18 @@ static esp_err_t refuse_handshake(httpd_req_t *request, const char *status, cons
     return ESP_FAIL;
 }
 
-/* Before the handshake: a client that does not speak Link gets 400, and a
- * full bridge answers 503 (Link spec 4, bridge spec 8.2). */
+/* Before the handshake: a client that does not speak Link gets 400, a web
+ * page the bridge did not serve gets 403, and a full bridge answers 503
+ * (Link spec 4, bridge spec 8.2). */
 static esp_err_t before_handshake(httpd_req_t *request)
 {
     if (!requests_link_subprotocol(request)) {
         return refuse_handshake(request, "400 Bad Request",
                                 "Link needs the " LINK_SUBPROTOCOL " sub-protocol.");
+    }
+    if (!origin_allowed(request)) {
+        return refuse_handshake(request, "403 Forbidden",
+                                "This bridge accepts Link sessions only from its own pages.");
     }
     if (has_free_slot()) {
         return ESP_OK;
@@ -669,6 +719,7 @@ static esp_err_t after_handshake(httpd_req_t *request)
         ESP_LOGW(TAG, "Session %d keeps Nagle's delay (errno %d)", slot, errno);
     }
     handlers->session_opened(handlers->context, slot, http_server_peer_address(fd));
+    stop_request_clock(fd); /* The handshake request is done */
     return ESP_OK;
 }
 
@@ -759,6 +810,120 @@ static esp_err_t on_link_socket(httpd_req_t *request)
     answer_control_frame(slot, &frame);
     free(data);
     return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * A time budget for each request
+ *
+ * Each port is served by one task, which reads a request or a WebSocket
+ * frame through to its end before it turns to anyone else. A client that
+ * sent, or read, a byte every few seconds could therefore hold every other
+ * connection up for hours. So each request gets HTTP_REQUEST_BUDGET_MS from
+ * its first byte: the server's reads and writes on a socket go through the
+ * two functions below, which fail once the budget is spent, and the server
+ * then drops that connection alone. The clock stops when a handler returns,
+ * so an idle keep-alive connection or WebSocket costs nothing until its
+ * next request. The send pump writes with its own non-blocking send() and
+ * is not affected.
+ * ------------------------------------------------------------------------- */
+
+/* When the request now being read or answered on each socket began, in
+ * esp_timer microseconds, or 0 between requests. Indexed by fd minus
+ * LWIP_SOCKET_OFFSET. Each entry is touched only by the task of the server
+ * that owns the socket. */
+static int64_t request_started_us[CONFIG_LWIP_MAX_SOCKETS];
+
+static int64_t *request_clock(int fd)
+{
+    const int index = fd - LWIP_SOCKET_OFFSET;
+    return index >= 0 && index < CONFIG_LWIP_MAX_SOCKETS ? &request_started_us[index] : NULL;
+}
+
+/* Starts the socket's clock if it is stopped; false once the budget is
+ * spent. */
+static bool within_request_budget(int fd)
+{
+    int64_t *started = request_clock(fd);
+    if (started == NULL) {
+        return true;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (*started == 0) {
+        *started = now;
+        return true;
+    }
+    return now - *started <= (int64_t)HTTP_REQUEST_BUDGET_MS * 1000;
+}
+
+/* The request on this socket is finished: stop its clock. */
+static void stop_request_clock(int fd)
+{
+    int64_t *started = request_clock(fd);
+    if (started != NULL) {
+        *started = 0;
+    }
+}
+
+/* A failed recv() or send() as ESP-IDF's server expects it: a timeout it
+ * may retry, or a failure that closes the socket. */
+static int socket_error(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ? HTTPD_SOCK_ERR_TIMEOUT
+                                                                     : HTTPD_SOCK_ERR_FAIL;
+}
+
+static int budgeted_recv(httpd_handle_t server, int fd, char *buffer, size_t length, int flags)
+{
+    (void)server;
+    if (buffer == NULL) {
+        return HTTPD_SOCK_ERR_INVALID;
+    }
+    if (!within_request_budget(fd)) {
+        ESP_LOGD(TAG, "Socket %d: a request ran past its time budget; dropping it", fd);
+        return HTTPD_SOCK_ERR_FAIL;
+    }
+    const int received = recv(fd, buffer, length, flags);
+    return received < 0 ? socket_error() : received;
+}
+
+static int budgeted_send(httpd_handle_t server, int fd, const char *buffer, size_t length,
+                         int flags)
+{
+    (void)server;
+    if (buffer == NULL) {
+        return HTTPD_SOCK_ERR_INVALID;
+    }
+    if (!within_request_budget(fd)) {
+        ESP_LOGD(TAG, "Socket %d: a reply ran past its time budget; dropping it", fd);
+        return HTTPD_SOCK_ERR_FAIL;
+    }
+    const int sent = send(fd, buffer, length, flags);
+    return sent < 0 ? socket_error() : sent;
+}
+
+/* Every new socket on either server reads and writes within the budget. */
+static esp_err_t on_socket_opened(httpd_handle_t server, int fd)
+{
+    stop_request_clock(fd); /* A reused fd starts clean */
+    esp_err_t err = httpd_sess_set_recv_override(server, fd, budgeted_recv);
+    if (err == ESP_OK) {
+        err = httpd_sess_set_send_override(server, fd, budgeted_send);
+    }
+    return err; /* On failure the server drops the socket */
+}
+
+/* Every route's handler runs through this, which stops the clock when the
+ * handler returns, whatever path it took. `user_ctx` is the real handler. */
+typedef struct {
+    esp_err_t (*handle)(httpd_req_t *request);
+} route_t;
+
+static esp_err_t run_route(httpd_req_t *request)
+{
+    const route_t *route = request->user_ctx;
+    const esp_err_t result = route->handle(request);
+    stop_request_clock(httpd_req_to_sockfd(request));
+    return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -870,7 +1035,20 @@ static esp_err_t start_link_server(void)
     config.max_open_sockets = server_state.config.max_sessions + HTTP_LINK_EXTRA_SOCKETS;
     config.stack_size = HTTP_SERVER_STACK_BYTES;
     config.close_fn = on_socket_closed;
+    config.open_fn = on_socket_opened;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.recv_wait_timeout = HTTP_SOCKET_WAIT_S;
+    config.send_wait_timeout = HTTP_SOCKET_WAIT_S;
+    /* Connections that send nothing would otherwise hold every socket for
+     * good: with all of them taken, a new connection replaces the one used
+     * least recently, and TCP keep-alive notices peers that vanished
+     * without closing (a phone that left the network). A WebSocket that is
+     * dropped this way closes like any other; its client reconnects. */
+    config.lru_purge_enable = true;
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = HTTP_KEEP_ALIVE_IDLE_S;
+    config.keep_alive_interval = HTTP_KEEP_ALIVE_INTERVAL_S;
+    config.keep_alive_count = HTTP_KEEP_ALIVE_COUNT;
 
     esp_err_t err = httpd_start(&server_state.link_server, &config);
     if (err != ESP_OK) {
@@ -878,18 +1056,24 @@ static esp_err_t start_link_server(void)
     }
 
     /* Registered most specific first: the wildcard catches the rest. */
+    static route_t link_route = {on_link_socket};
+    static route_t info_route = {on_info};
+    static route_t page_route = {on_web_page};
     const httpd_uri_t link_socket = {
         .uri = "/dspi/v1",
         .method = HTTP_GET,
-        .handler = on_link_socket,
+        .handler = run_route,
+        .user_ctx = &link_route,
         .is_websocket = true,
         .handle_ws_control_frames = true, /* Pongs prove a client alive (Link spec 4) */
         .supported_subprotocol = LINK_SUBPROTOCOL,
         .ws_pre_handshake_cb = before_handshake,
         .ws_post_handshake_cb = after_handshake,
     };
-    const httpd_uri_t info = {.uri = "/dspi/v1/info", .method = HTTP_GET, .handler = on_info};
-    const httpd_uri_t pages = {.uri = "/*", .method = HTTP_GET, .handler = on_web_page};
+    const httpd_uri_t info = {
+        .uri = "/dspi/v1/info", .method = HTTP_GET, .handler = run_route, .user_ctx = &info_route};
+    const httpd_uri_t pages = {
+        .uri = "/*", .method = HTTP_GET, .handler = run_route, .user_ctx = &page_route};
 
     err = httpd_register_uri_handler(server_state.link_server, &link_socket);
     if (err == ESP_OK) {
@@ -912,13 +1096,19 @@ static esp_err_t start_redirect_server(void)
     config.lru_purge_enable = true;
     config.stack_size = HTTP_SERVER_STACK_BYTES;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.open_fn = on_socket_opened;
+    config.recv_wait_timeout = HTTP_SOCKET_WAIT_S;
+    config.send_wait_timeout = HTTP_SOCKET_WAIT_S;
 
     esp_err_t err = httpd_start(&server_state.redirect_server, &config);
     if (err != ESP_OK) {
         return err;
     }
-    const httpd_uri_t get = {.uri = "/*", .method = HTTP_GET, .handler = on_port_80};
-    const httpd_uri_t post = {.uri = "/*", .method = HTTP_POST, .handler = on_port_80};
+    static route_t port_80_route = {on_port_80};
+    const httpd_uri_t get = {
+        .uri = "/*", .method = HTTP_GET, .handler = run_route, .user_ctx = &port_80_route};
+    const httpd_uri_t post = {
+        .uri = "/*", .method = HTTP_POST, .handler = run_route, .user_ctx = &port_80_route};
     err = httpd_register_uri_handler(server_state.redirect_server, &get);
     return err == ESP_OK ? httpd_register_uri_handler(server_state.redirect_server, &post) : err;
 }

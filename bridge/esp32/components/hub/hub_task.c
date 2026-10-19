@@ -100,6 +100,7 @@ typedef struct {
     cJSON *body;               /* EVENT_REPLY_LATER, handed to the hub */
     hub_call_t *call;          /* EVENT_CALL */
     uint32_t offset;           /* EVENT_UPDATE_WRITTEN */
+    uint32_t generation;       /* EVENT_UPDATE_WRITTEN, EVENT_UPDATE_DONE */
     bool ok;                   /* EVENT_UPDATE_DONE */
     hub_restart_level_t level; /* EVENT_RESTART */
 } hub_event_t;
@@ -299,18 +300,21 @@ static char *copy_info_json(void *context)
  * Producers: the ota task's handlers (on its task)
  * ------------------------------------------------------------------------- */
 
-static void on_update_written(void *context, uint32_t offset)
+static void on_update_written(void *context, uint32_t generation, uint32_t offset)
 {
     (void)context;
-    post_lifecycle(&(hub_event_t){.type = EVENT_UPDATE_WRITTEN, .offset = offset});
+    post_lifecycle(
+        &(hub_event_t){.type = EVENT_UPDATE_WRITTEN, .generation = generation, .offset = offset});
 }
 
-static void on_update_finished(void *context, bool ok, const char *text)
+static void on_update_finished(void *context, uint32_t generation, bool ok, const char *text)
 {
     (void)context;
     /* NULL when memory ran out; the loop then says so instead. */
-    post_lifecycle(
-        &(hub_event_t){.type = EVENT_UPDATE_DONE, .ok = ok, .data = (uint8_t *)strdup(text)});
+    post_lifecycle(&(hub_event_t){.type = EVENT_UPDATE_DONE,
+                                  .generation = generation,
+                                  .ok = ok,
+                                  .data = (uint8_t *)strdup(text)});
 }
 
 /* ---------------------------------------------------------------------------
@@ -766,7 +770,8 @@ static uint32_t io_update_capacity(void *context)
     return ota_capacity();
 }
 
-static bool io_update_begin(void *context, uint32_t size, const uint8_t sha256[HUB_IO_SHA256_BYTES])
+static uint32_t io_update_begin(void *context, uint32_t size,
+                                const uint8_t sha256[HUB_IO_SHA256_BYTES])
 {
     (void)context;
     return ota_begin(size, sha256);
@@ -840,10 +845,10 @@ static void handle_event(hub_event_t *event)
         xSemaphoreGive(event->call->done);
         break;
     case EVENT_UPDATE_WRITTEN:
-        hub_update_written(hub, event->offset);
+        hub_update_written(hub, event->generation, event->offset);
         break;
     case EVENT_UPDATE_DONE:
-        hub_update_finished(hub, event->ok,
+        hub_update_finished(hub, event->generation, event->ok,
                             event->data != NULL ? (const char *)event->data : "out of memory");
         break;
     case EVENT_RESTART:

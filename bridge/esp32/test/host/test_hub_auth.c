@@ -122,11 +122,15 @@ static void many_addresses_together_lock_out_everyone(void)
     start();
     hub_auth_set_pin(&auth, "482913");
     char token[HUB_AUTH_TOKEN_CHARS + 1];
+    char paired[HUB_AUTH_TOKEN_CHARS + 1];
     uint16_t cid;
+    CHECK(hub_auth_pair(&auth, HOME, "482913", "x", paired, &cid) == HUB_AUTH_OK);
     for (uint32_t i = 0; i < AUTH_MAX_FAILURES_ALL_ADDRESSES; i++) {
         hub_auth_pair(&auth, 0x01000000u + i, "000000", "x", token, &cid);
     }
     CHECK(hub_auth_pair(&auth, HOME, "482913", "x", token, &cid) == HUB_AUTH_RATE_LIMITED);
+    /* The lock is on guessing the PIN; a client already paired gets in. */
+    CHECK(hub_auth_token(&auth, HOME, paired, &cid) == HUB_AUTH_OK);
     clock_ms += AUTH_LOCKOUT_MS;
     CHECK(hub_auth_pair(&auth, HOME, "482913", "x", token, &cid) == HUB_AUTH_OK);
 }

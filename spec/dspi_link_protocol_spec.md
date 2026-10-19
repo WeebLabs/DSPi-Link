@@ -119,6 +119,12 @@ A client must accept a bare host or `host:port` typed by the user and derive
   is advertised). Sub-protocol name `dspi-link-1` must be requested by the
   client and echoed by the hub. Hubs may refuse connections that do not
   request it.
+- A browser sends an `Origin` header with every WebSocket upgrade; native
+  apps send none. A hub refuses an upgrade whose `Origin` names any site
+  but the hub itself (its own address or name), so a web page open in a
+  browser on the hub's network cannot drive the hub through that browser.
+  A hub compares the origin with names it knows are its own, not with the
+  request's `Host`, which a hostile page controls through DNS rebinding.
 - **Text frames carry JSON control messages** (section 7).
 - **Binary frames carry data-plane frames** (section 8).
 - WebSocket ping/pong is the keepalive. The hub pings every 10 s and closes a
@@ -249,7 +255,10 @@ A fixed PIN is long-lived, so it follows different rules:
 - It is never invalidated by failures, since that would lock out its owner.
   The per-address limit above still applies, and in addition the hub refuses
   every `auth.pair` for 60 s after 20 failures from all addresses together
-  within a minute, which slows guessing spread across many addresses.
+  within a minute, which slows guessing spread across many addresses. That
+  hub-wide limit does not apply to `auth.token`: a token cannot be guessed,
+  and refusing tokens too would let anyone guessing PINs lock every paired
+  client out.
 - The hub stores only a salted, deliberately slow hash of it (for example
   PBKDF2-HMAC-SHA256), never the PIN itself.
 - Changing the PIN, or switching the auth mode, revokes every token. Live

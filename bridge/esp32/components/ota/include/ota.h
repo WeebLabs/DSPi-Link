@@ -26,13 +26,16 @@
 
 #define OTA_SHA256_BYTES 32
 
+/* Each report names the update it belongs to by the generation ota_begin()
+ * returned, so a report from an abandoned update is never taken for the
+ * next one's. */
 typedef struct {
     void *context;
     /* The chunk at `offset` is in flash. */
-    void (*written)(void *context, uint32_t offset);
+    void (*written)(void *context, uint32_t generation, uint32_t offset);
     /* The update is over. `text` is the new image's version when `ok`,
      * otherwise a sentence saying what went wrong. */
-    void (*finished)(void *context, bool ok, const char *text);
+    void (*finished)(void *context, uint32_t generation, bool ok, const char *text);
 } ota_handlers_t;
 
 /* Starts the ota task. Call once. */
@@ -42,14 +45,17 @@ esp_err_t ota_start(const ota_handlers_t *handlers);
 uint32_t ota_capacity(void);
 
 /* Starts receiving an image of `size` bytes whose SHA-256 is `sha256`,
- * abandoning any update in progress. False if `size` does not fit. */
-bool ota_begin(uint32_t size, const uint8_t sha256[OTA_SHA256_BYTES]);
+ * abandoning any update in progress. Returns the update's generation, never
+ * 0, or 0 if `size` does not fit. */
+uint32_t ota_begin(uint32_t size, const uint8_t sha256[OTA_SHA256_BYTES]);
 
 /* Queues the chunk at `offset`, copying it. False when OTA_QUEUE_DEPTH
  * chunks are already waiting or memory ran out. */
 bool ota_write(uint32_t offset, const uint8_t *data, size_t length);
 
-/* Abandons the update in progress, if any. The running image is untouched. */
+/* Abandons the update in progress, if any. Chunks still queued are
+ * dropped, and an image being checked is not switched to. The running
+ * image is untouched. */
 void ota_abort(void);
 
 /*

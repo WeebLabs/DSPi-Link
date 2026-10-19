@@ -29,6 +29,11 @@ CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT=y
 # use lwIP directly, not sockets.
 CONFIG_LWIP_MAX_SOCKETS=28
 
+# TCP connections in use at most: the Link server's 11 and port 80's 7, 18.
+# lwIP drops a new connection's SYN, silently, once this many are in use,
+# so it must cover both servers with room for connections still closing.
+CONFIG_LWIP_MAX_ACTIVE_TCP=24
+
 # Each HTTP server's control queue, which carries the send pump and every
 # socket close, holds this many waiting jobs. The default 6 overflowed when
 # several clients left at once.
@@ -38,6 +43,14 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
 # include saving the network to flash and starting SNTP; the default 2304
 # bytes is too tight for that.
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+
+# How deeply nested a JSON message may be. Every message is parsed by
+# recursion, about 64 bytes of stack per level, on a task with a few KB of
+# stack, before anyone has authenticated; cJSON's default of 1000 let one
+# 2 KB message overflow the stack and crash the bridge. The deepest message
+# Link or the setup API uses is 3 levels (hub.config.set's config.uart).
+# test/host/CMakeLists.txt builds cJSON with the same limit.
+CONFIG_CJSON_NESTING_LIMIT=8
 
 # A 1 ms scheduler tick, so the UART link's 2 ms idle gap and 5 ms listen
 # slice are real (bridge spec 7.2). The default 10 ms tick would round them

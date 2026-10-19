@@ -103,17 +103,22 @@ typedef struct {
     /* Firmware updates (Link spec 7.14, bridge spec 14.2). The I/O writes
      * the image beside the running firmware, away from the hub task, and
      * reports back through hub_update_written() for each chunk in flash and
-     * hub_update_finished() once, at the end or on a failure.
+     * hub_update_finished() once, at the end or on a failure. Each report
+     * carries the generation update_begin returned, so a report from an
+     * abandoned update is never taken for the next one's.
      *
      *   update_capacity  the largest image it can take; 0 for no updates
-     *   update_begin     prepares for `size` bytes whose SHA-256 is `sha256`
+     *   update_begin     prepares for `size` bytes whose SHA-256 is `sha256`;
+     *                    returns the update's generation, or 0 if it cannot
      *   update_write     queues the chunk at `offset`, copying it. False when
      *                    its queue is full. Once the last byte is written it
      *                    checks the whole image and, if it is good, makes it
      *                    the one that starts next.
-     *   update_abort     drops the update in progress, if any */
+     *   update_abort     drops the update in progress, if any: nothing more
+     *                    of it is written or switched to */
     uint32_t (*update_capacity)(void *context);
-    bool (*update_begin)(void *context, uint32_t size, const uint8_t sha256[HUB_IO_SHA256_BYTES]);
+    uint32_t (*update_begin)(void *context, uint32_t size,
+                             const uint8_t sha256[HUB_IO_SHA256_BYTES]);
     bool (*update_write)(void *context, uint32_t offset, const uint8_t *data, size_t length);
     void (*update_abort)(void *context);
 } hub_io_t;

@@ -139,13 +139,14 @@ static uint32_t update_capacity(void *context)
     return fake->update_capacity;
 }
 
-static bool update_begin(void *context, uint32_t size, const uint8_t sha256[HUB_IO_SHA256_BYTES])
+static uint32_t update_begin(void *context, uint32_t size,
+                             const uint8_t sha256[HUB_IO_SHA256_BYTES])
 {
     fake_hub_io_t *fake = context;
     fake->update_size = size;
     memcpy(fake->update_sha256, sha256, sizeof(fake->update_sha256));
     fake->update_bytes_written = 0;
-    return true;
+    return ++fake->update_generation;
 }
 
 static bool update_write(void *context, uint32_t offset, const uint8_t *data, size_t length)

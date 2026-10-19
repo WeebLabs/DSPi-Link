@@ -252,6 +252,26 @@ static void the_first_message_must_be_hello(void)
     CHECK(io_record.close_code[0] == 4000);
 }
 
+/* JSON is parsed by recursion on a small stack before anyone has
+ * authenticated, so deep nesting is refused rather than parsed. */
+static void deeply_nested_json_is_refused(void)
+{
+    start();
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
+    char deep[2 * 999 + 1];
+    memset(deep, '[', 999);
+    memset(deep + 999, ']', 999);
+    deep[2 * 999] = '\0';
+    hub_session_text(&hub, 0, deep, strlen(deep));
+    CHECK(io_record.close_code[0] == 4000);
+
+    /* The deepest message Link uses still parses. */
+    start();
+    open_session(0);
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":2,\"config\":{\"uart\":{\"baud\":921600}}}");
+    CHECK(io_record.apply_count == 1);
+}
+
 static void pairing_without_auth_reports_the_session(void)
 {
     start();
@@ -990,15 +1010,15 @@ static void an_update_is_written_chunk_by_chunk_then_restarts(void)
     send_chunk(0, transfer, 0, 6);
     CHECK(io_record.update_writes == 1);
     CHECK(last_ack_status(0, 0) == -1); /* Acknowledged only once written */
-    hub_update_written(&hub, 0);
+    hub_update_written(&hub, io_record.update_generation, 0);
     CHECK(last_ack_status(0, 0) == 0);
 
     send_chunk(0, transfer, 6, 4);
-    hub_update_written(&hub, 6);
+    hub_update_written(&hub, io_record.update_generation, 6);
     CHECK(last_ack_status(0, 6) == 0);
     CHECK(io_record.update_bytes_written == 10);
 
-    hub_update_finished(&hub, true, "0.2.0");
+    hub_update_finished(&hub, io_record.update_generation, true, "0.2.0");
     cJSON *done = last_json(0, "hub.update.done");
     CHECK(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(done, "ok")));
     CHECK(strcmp(json_string(done, "version"), "0.2.0") == 0);
@@ -1046,11 +1066,47 @@ static void bad_updates_are_refused_and_keep_the_firmware(void)
 
     CHECK(begin_update(0) != transfer); /* A new update may start */
     forget_messages();
-    hub_update_finished(&hub, false, "this file is not firmware for this chip");
+    hub_update_finished(&hub, io_record.update_generation, false,
+                        "this file is not firmware for this chip");
     done = last_json(0, "hub.update.done"); /* The writer's reason reaches the client */
     CHECK(strcmp(json_string(done, "msg"), "this file is not firmware for this chip") == 0);
     cJSON_Delete(done);
     CHECK(io_record.restart_level == -1);
+}
+
+static void a_complete_update_survives_its_sender_leaving(void)
+{
+    start();
+    open_session(0);
+    const uint16_t transfer = begin_update(0);
+    send_chunk(0, transfer, 0, 6);
+    send_chunk(0, transfer, 6, 4); /* Every byte is in: only the check is left */
+    hub_session_closed(&hub, 0);
+    CHECK(io_record.update_aborts == 0);
+    hub_update_finished(&hub, io_record.update_generation, true, "0.2.0");
+    CHECK(io_record.restart_level == HUB_RESTART_ONLY);
+}
+
+static void reports_from_an_abandoned_update_are_ignored(void)
+{
+    start();
+    open_session(0);
+    const uint16_t first = begin_update(0);
+    const uint32_t first_generation = io_record.update_generation;
+    send_chunk(0, first, 0, 4);
+    send_chunk(0, first, 8, 2); /* A gap ends the first update */
+    CHECK(io_record.update_aborts == 1);
+
+    const uint16_t second = begin_update(0);
+    forget_messages();
+    hub_update_written(&hub, first_generation, 0); /* The first's late report */
+    CHECK(last_ack_status(0, 0) == -1);
+    hub_update_finished(&hub, first_generation, false, "late failure");
+    CHECK(last_json(0, "hub.update.done") == NULL);
+
+    send_chunk(0, second, 0, 6); /* The second carries on */
+    hub_update_written(&hub, io_record.update_generation, 0);
+    CHECK(last_ack_status(0, 0) == 0);
 }
 
 static void a_stalled_or_orphaned_update_is_abandoned(void)
@@ -1321,6 +1377,7 @@ void test_hub(void)
 {
     RUN(hello_describes_the_bridge);
     RUN(the_first_message_must_be_hello);
+    RUN(deeply_nested_json_is_refused);
     RUN(pairing_without_auth_reports_the_session);
     RUN(unknown_requests_get_unknown_type);
     RUN(a_full_bridge_has_no_room);
@@ -1361,6 +1418,8 @@ void test_hub(void)
     RUN(an_update_is_written_chunk_by_chunk_then_restarts);
     RUN(bad_updates_are_refused_and_keep_the_firmware);
     RUN(a_stalled_or_orphaned_update_is_abandoned);
+    RUN(a_complete_update_survives_its_sender_leaving);
+    RUN(reports_from_an_abandoned_update_are_ignored);
     RUN(a_lost_answer_times_out_and_a_late_one_is_ignored);
     RUN(an_unknown_answer_finishes_only_older_requests);
     RUN(a_refused_subscription_changes_nothing);

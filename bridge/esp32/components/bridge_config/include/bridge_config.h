@@ -307,6 +307,25 @@
  * again after this long, so a lost request cannot keep a session open. */
 #define HTTP_CLOSE_RETRY_MS 1000
 
+/* The longest one HTTP request or WebSocket frame may take to arrive, or a
+ * reply to leave, from its first byte. Each port has one task, so a client
+ * that trickled a request a byte at a time would hold every other
+ * connection up; past this budget it is dropped. The largest legitimate
+ * transfers, the 23 KB control page or a 16 KB frame, take well under a
+ * second even on a weak Wi-Fi link. */
+#define HTTP_REQUEST_BUDGET_MS 8000
+
+/* How long one read or write on a server socket may wait, in seconds. The
+ * request budget above bounds the total. */
+#define HTTP_SOCKET_WAIT_S 3
+
+/* TCP keep-alive on the Link port: a connection idle this long is probed,
+ * every interval, and dropped after this many probes go unanswered, so a
+ * phone that left the network without closing frees its socket. */
+#define HTTP_KEEP_ALIVE_IDLE_S 30
+#define HTTP_KEEP_ALIVE_INTERVAL_S 5
+#define HTTP_KEEP_ALIVE_COUNT 3
+
 /* Largest JSON body the setup API reads: an apply request with the longest
  * network name, password and bridge name, and two PINs, fits in half. */
 #define SETUP_API_MAX_BODY_BYTES 512

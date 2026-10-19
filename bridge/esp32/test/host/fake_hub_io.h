@@ -63,8 +63,9 @@ typedef struct {
 
     /* Firmware updates: what the hub asked for. Writes are only recorded;
      * the test reports them done with hub_update_written(). */
-    uint32_t update_capacity; /* 0 turns updates off */
-    uint32_t update_size;     /* From update_begin; 0 when none is open */
+    uint32_t update_capacity;   /* 0 turns updates off */
+    uint32_t update_size;       /* From update_begin; 0 when none is open */
+    uint32_t update_generation; /* The last generation update_begin returned */
     uint8_t update_sha256[HUB_IO_SHA256_BYTES];
     uint32_t update_bytes_written;
     uint32_t update_last_offset;

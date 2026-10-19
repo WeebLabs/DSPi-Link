@@ -3,9 +3,10 @@
  *
  * The ota task takes three kinds of item from one queue, in order: begin an
  * update, write a chunk, abort. Each begin or abort bumps a generation
- * number, and every chunk carries the generation it was queued under, so a
- * chunk left over from an abandoned update is dropped rather than written
- * into the next one.
+ * number. Work goes ahead only while its update's generation is still the
+ * current one, so once an update is abandoned nothing more of it is
+ * written, it is never switched to, and its reports carry a generation the
+ * hub no longer accepts.
  */
 
 #include "ota.h"
@@ -90,12 +91,20 @@ static void drop_update(void)
     }
 }
 
+/* True while `generation` is the update the hub still wants: no abort or
+ * newer begin has been asked for since. */
+static bool still_wanted(uint32_t generation)
+{
+    return generation == atomic_load(&ota_state.generation);
+}
+
 /* Ends the update in progress as a failure and says why. */
 static void fail(const char *why)
 {
     ESP_LOGW(TAG, "Update failed: %s", why);
+    const uint32_t generation = ota_state.update.generation;
     drop_update();
-    ota_state.handlers.finished(ota_state.handlers.context, false, why);
+    ota_state.handlers.finished(ota_state.handlers.context, generation, false, why);
 }
 
 static void begin(const ota_item_t *item)
@@ -109,6 +118,20 @@ static void begin(const ota_item_t *item)
         .size = item->size,
     };
     memcpy(update->expected_sha256, item->sha256, OTA_SHA256_BYTES);
+    if (!still_wanted(item->generation)) {
+        return; /* Abandoned before it began */
+    }
+
+    /* A finished update may already be waiting to start (its sender left,
+     * or the restart has not happened yet). Writing over the partition the
+     * bootloader will start next could leave a wrong image there, so wait
+     * for that restart. */
+    if (esp_ota_get_boot_partition() != esp_ota_get_running_partition()) {
+        ota_state.handlers.finished(
+            ota_state.handlers.context, item->generation, false,
+            "a new firmware is installed and starts at the next restart; restart the bridge first");
+        return;
+    }
 
     /* Sequential writes erase each sector as the image reaches it, rather
      * than the whole image up front, which would stall for seconds. */
@@ -120,7 +143,7 @@ static void begin(const ota_item_t *item)
         /* A firmware still on trial (bridge spec 14.2) must keep the one
          * it would go back to, so ESP-IDF refuses to overwrite it. */
         ota_state.handlers.finished(
-            ota_state.handlers.context, false,
+            ota_state.handlers.context, item->generation, false,
             err == ESP_ERR_OTA_ROLLBACK_INVALID_STATE
                 ? "the bridge has only just been updated; try again in a minute"
                 : "the bridge could not prepare its flash for the update");
@@ -130,7 +153,7 @@ static void begin(const ota_item_t *item)
         if (esp_ota_abort(update->handle) != ESP_OK) {
             ESP_LOGW(TAG, "Could not release the update partition");
         }
-        ota_state.handlers.finished(ota_state.handlers.context, false,
+        ota_state.handlers.finished(ota_state.handlers.context, item->generation, false,
                                     "the bridge could not check the update");
         return;
     }
@@ -173,18 +196,26 @@ static void finish(void)
         return;
     }
 
+    /* The check took a moment; if the update was abandoned meanwhile, the
+     * running firmware stays the one that starts. */
+    if (!still_wanted(update->generation)) {
+        ESP_LOGI(TAG, "Update abandoned during its final check; keeping this firmware");
+        return;
+    }
     if (esp_ota_set_boot_partition(update->partition) != ESP_OK) {
         fail("the bridge could not switch to the new firmware");
         return;
     }
     ESP_LOGI(TAG, "Firmware %s is ready and starts after the restart", description.version);
-    ota_state.handlers.finished(ota_state.handlers.context, true, description.version);
+    ota_state.handlers.finished(ota_state.handlers.context, update->generation, true,
+                                description.version);
 }
 
 static void write_chunk(const ota_item_t *item)
 {
     update_t *update = &ota_state.update;
-    if (!update->active || item->generation != update->generation) {
+    if (!update->active || item->generation != update->generation ||
+        !still_wanted(item->generation)) {
         return; /* Left over from an update that was abandoned */
     }
 
@@ -204,7 +235,7 @@ static void write_chunk(const ota_item_t *item)
         fail("the bridge could not check the update");
         return;
     }
-    ota_state.handlers.written(ota_state.handlers.context, item->offset);
+    ota_state.handlers.written(ota_state.handlers.context, update->generation, item->offset);
 
     update->written += (uint32_t)item->length;
     if (update->written == update->size) {
@@ -228,9 +259,11 @@ static void ota_task(void *argument)
             begin(&item);
             break;
         case ITEM_CHUNK:
+            /* Off the queue now, so its place is free before its ack goes
+             * out; the client may send the next chunk the moment it hears. */
+            atomic_fetch_sub(&ota_state.chunks_waiting, 1);
             write_chunk(&item);
             free(item.data);
-            atomic_fetch_sub(&ota_state.chunks_waiting, 1);
             break;
         case ITEM_ABORT:
             if (ota_state.update.active) {
@@ -266,18 +299,18 @@ uint32_t ota_capacity(void)
     return partition != NULL ? partition->size : 0;
 }
 
-bool ota_begin(uint32_t size, const uint8_t sha256[OTA_SHA256_BYTES])
+uint32_t ota_begin(uint32_t size, const uint8_t sha256[OTA_SHA256_BYTES])
 {
     if (size == 0 || size > ota_capacity()) {
-        return false;
+        return 0;
     }
-    ota_item_t item = {
-        .kind = ITEM_BEGIN,
-        .generation = atomic_fetch_add(&ota_state.generation, 1) + 1,
-        .size = size,
-    };
+    uint32_t generation = atomic_fetch_add(&ota_state.generation, 1) + 1;
+    if (generation == 0) {
+        generation = atomic_fetch_add(&ota_state.generation, 1) + 1; /* 0 means failure */
+    }
+    ota_item_t item = {.kind = ITEM_BEGIN, .generation = generation, .size = size};
     memcpy(item.sha256, sha256, OTA_SHA256_BYTES);
-    return xQueueSend(ota_state.queue, &item, 0) == pdTRUE;
+    return xQueueSend(ota_state.queue, &item, 0) == pdTRUE ? generation : 0;
 }
 
 bool ota_write(uint32_t offset, const uint8_t *data, size_t length)
@@ -311,8 +344,9 @@ void ota_abort(void)
         .kind = ITEM_ABORT,
         .generation = atomic_fetch_add(&ota_state.generation, 1) + 1,
     };
-    /* If even this cannot be queued, the bumped generation already makes
-     * the task drop the chunks still waiting; the next begin ends the rest. */
+    /* The bumped generation alone already stops the update: its chunks are
+     * no longer written and its image is never switched to. The item only
+     * releases the partition sooner. */
     if (xQueueSend(ota_state.queue, &item, pdMS_TO_TICKS(OTA_ABORT_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "The ota queue is full; the abandoned update's chunks are dropped");
     }

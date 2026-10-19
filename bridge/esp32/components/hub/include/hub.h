@@ -180,6 +180,8 @@ typedef struct {
     uint32_t size;
     uint32_t received;         /* Bytes handed to the I/O: the next chunk's offset */
     uint32_t last_progress_ms; /* A chunk arriving or being written */
+    uint32_t generation;       /* The I/O's id for this update (hub_io_t) */
+    bool sender_left;          /* The sender closed after the last chunk */
 } hub_update_t;
 
 typedef struct {
@@ -328,13 +330,15 @@ void hub_restart(hub_t *hub, hub_restart_level_t level);
  * Firmware update events, from the I/O (hub_io_t's update functions)
  * ------------------------------------------------------------------------- */
 
-/* The chunk at `offset` is in flash. */
-void hub_update_written(hub_t *hub, uint32_t offset);
+/* The chunk at `offset` is in flash. `generation` is the one update_begin
+ * returned; a report for any other update is ignored. Hub task only. */
+void hub_update_written(hub_t *hub, uint32_t generation, uint32_t offset);
 
 /* The update is over: the whole image was checked (`ok`), or something
  * went wrong on the way. `text` is the new firmware's version when `ok`,
- * or a sentence saying what was wrong. */
-void hub_update_finished(hub_t *hub, bool ok, const char *text);
+ * or a sentence saying what was wrong. A report for any update but the
+ * current one is ignored. Hub task only. */
+void hub_update_finished(hub_t *hub, uint32_t generation, bool ok, const char *text);
 
 /* ---------------------------------------------------------------------------
  * What the hub publishes

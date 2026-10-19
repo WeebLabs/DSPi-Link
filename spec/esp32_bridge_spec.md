@@ -543,7 +543,18 @@ notifications.
   close (section 6.2), so a client that reconnects at once may briefly get
   503; Link's reconnect backoff covers this.
 - An upgrade that does not ask for the `dspi-link-1` sub-protocol is
-  refused with HTTP 400 (Link spec 4).
+  refused with HTTP 400 (Link spec 4). One whose `Origin` names any site
+  but the bridge, by the address the connection arrived on or by
+  `<hostname>.local`, is refused with HTTP 403.
+- Each port is served by one task, so each HTTP request or WebSocket frame
+  has 8 s from its first byte to arrive, and each reply 8 s to leave; a
+  client that trickles one past that is dropped, alone. When every socket
+  on the Link port is taken, a new connection replaces the one used least
+  recently, and TCP keep-alive drops peers that vanished without closing,
+  so idle connections cannot hold the port.
+- JSON messages, on the Link port and from the setup page, may nest at
+  most 8 levels; anything deeper is refused unparsed, because the parser's
+  recursion would otherwise overflow the stack of the task parsing it.
 - Keepalive and close codes follow Link spec 4 and 5.
 - Each session has an outbound queue of 32 frames. One job on the HTTP
   server's task sends what waits: each session's frames encoded into one
@@ -1027,6 +1038,14 @@ that the margin covers future growth. CI fails a build that exceeds it.
 - On success it switches the boot partition and restarts. Every refusal
   ends with `hub.update.done` carrying a plain sentence, and the bridge
   keeps running its current firmware.
+- An update abandoned part way (its sender left, it stalled, it was
+  refused) writes nothing more and is never switched to, even if its
+  final check was under way. One whose every byte has arrived is finished
+  even if its sender leaves during the check: a good image then starts,
+  and the client sees the new version in `hello` when it reconnects.
+- While a finished update waits for its restart, a new one is refused
+  ("restart the bridge first"), so the image the bootloader will start is
+  never overwritten.
 - With rollback enabled in the bootloader, the new image starts in a
   pending state. It confirms itself only after it has run for 60 s with the
   hub task and the uart task both still going round their loops (Wi-Fi

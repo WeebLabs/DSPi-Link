@@ -35,6 +35,17 @@ done
 for target in "${targets[@]}"; do
     echo "=== Building for ${target} with ESP-IDF ${IDF_VERSION}"
 
+    # ESP-IDF fills a chip's sdkconfig from sdkconfig.defaults only for keys
+    # it does not have yet, so a changed default would be ignored by an
+    # existing build. Start that chip's sdkconfig again whenever a defaults
+    # file is newer than it.
+    sdkconfig="${BRIDGE_DIR}/build/${target}/sdkconfig"
+    if [[ -f "${sdkconfig}" ]] &&
+        [[ -n "$(find "${BRIDGE_DIR}" -maxdepth 1 -name 'sdkconfig.defaults*' -newer "${sdkconfig}")" ]]; then
+        echo "=== ${target}: sdkconfig.defaults changed; regenerating the configuration"
+        rm "${sdkconfig}"
+    fi
+
     # The whole repository is mounted because later components read
     # policy/, fixtures/ and js/ from it. Running as the caller's user keeps
     # build files owned by them; HOME points somewhere that user can write.

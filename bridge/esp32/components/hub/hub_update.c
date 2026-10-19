@@ -133,7 +133,8 @@ void hub_handle_update(hub_t *hub, int slot, int id, const cJSON *message)
         hub_reply_error(hub, slot, id, "bad_request", "sha256 must be 64 hex digits");
         return;
     }
-    if (!hub->io.update_begin(hub->io.context, (uint32_t)size, digest)) {
+    const uint32_t generation = hub->io.update_begin(hub->io.context, (uint32_t)size, digest);
+    if (generation == 0) {
         hub_reply_error(hub, slot, id, "internal", "the bridge could not prepare for an update");
         return;
     }
@@ -148,6 +149,8 @@ void hub_handle_update(hub_t *hub, int slot, int id, const cJSON *message)
     update->size = (uint32_t)size;
     update->received = 0;
     update->last_progress_ms = hub_now(hub);
+    update->generation = generation;
+    update->sender_left = false;
 
     cJSON *body = cJSON_CreateObject();
     cJSON_AddNumberToObject(body, "xfer", update->transfer);
@@ -190,11 +193,11 @@ void hub_update_chunk(hub_t *hub, int slot, const uint8_t *data, size_t length)
     }
 }
 
-void hub_update_written(hub_t *hub, uint32_t offset)
+void hub_update_written(hub_t *hub, uint32_t generation, uint32_t offset)
 {
     hub_update_t *update = &hub->update;
-    if (update->phase == HUB_UPDATE_IDLE) {
-        return; /* Abandoned meanwhile */
+    if (update->phase == HUB_UPDATE_IDLE || generation != update->generation) {
+        return; /* From an update abandoned meanwhile */
     }
     update->last_progress_ms = hub_now(hub);
     if (sender_is_connected(hub)) {
@@ -202,10 +205,10 @@ void hub_update_written(hub_t *hub, uint32_t offset)
     }
 }
 
-void hub_update_finished(hub_t *hub, bool ok, const char *text)
+void hub_update_finished(hub_t *hub, uint32_t generation, bool ok, const char *text)
 {
-    if (hub->update.phase == HUB_UPDATE_IDLE) {
-        return;
+    if (hub->update.phase == HUB_UPDATE_IDLE || generation != hub->update.generation) {
+        return; /* From an update abandoned meanwhile */
     }
     send_done(hub, ok, text);
     hub->update.phase = HUB_UPDATE_IDLE;
@@ -217,11 +220,20 @@ void hub_update_finished(hub_t *hub, bool ok, const char *text)
 
 void hub_update_session_closed(hub_t *hub, int slot)
 {
-    if (hub->update.phase != HUB_UPDATE_IDLE && slot == hub->update.slot) {
-        /* Nobody is left to finish it or to hear how it went. */
-        hub->io.update_abort(hub->io.context);
-        hub->update.phase = HUB_UPDATE_IDLE;
+    hub_update_t *update = &hub->update;
+    if (update->phase == HUB_UPDATE_IDLE || slot != update->slot || update->sender_left) {
+        return;
     }
+    if (update->phase == HUB_UPDATE_FINISHING) {
+        /* Every byte is here; only the check is left. Let it finish: a good
+         * image then starts as Link spec 7.14 says, and the client confirms
+         * the outcome from hello when it reconnects. */
+        update->sender_left = true;
+        return;
+    }
+    /* Part of the image is missing, so nobody is left to finish it. */
+    hub->io.update_abort(hub->io.context);
+    update->phase = HUB_UPDATE_IDLE;
 }
 
 void hub_update_tick(hub_t *hub)

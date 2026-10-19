@@ -95,8 +95,12 @@ static hub_auth_address_t *address_record(hub_auth_t *auth, uint32_t address)
     return choice;
 }
 
-/* True while `address`, or everyone, is locked out. Expired locks lift. */
-static bool locked_out(hub_auth_t *auth, uint32_t address)
+/* True while `address` is locked out, or, when `include_global`, while
+ * everyone is. Expired locks lift. The global lock guards the PIN alone: a
+ * paired client's token is 32 random bytes nobody can guess, so refusing
+ * tokens too would only let a stranger guessing PINs lock every paired app
+ * out (Link spec 6.2). */
+static bool locked_out(hub_auth_t *auth, uint32_t address, bool include_global)
 {
     const uint32_t now = now_ms(auth);
     if (auth->global_locked && reached(now, auth->global_locked_until_ms)) {
@@ -114,7 +118,7 @@ static bool locked_out(hub_auth_t *auth, uint32_t address)
             }
         }
     }
-    return auth->global_locked;
+    return include_global && auth->global_locked;
 }
 
 /* Counts one failure from `address`, locking out at the limits. */
@@ -202,7 +206,7 @@ hub_auth_result_t hub_auth_set_pin(hub_auth_t *auth, const char *pin)
 
 hub_auth_result_t hub_auth_check_pin(hub_auth_t *auth, uint32_t address, const char *pin)
 {
-    if (locked_out(auth, address)) {
+    if (locked_out(auth, address, true)) {
         return HUB_AUTH_RATE_LIMITED;
     }
     uint8_t hash[HUB_AUTH_HASH_BYTES];
@@ -285,7 +289,7 @@ hub_auth_result_t hub_auth_pair(hub_auth_t *auth, uint32_t address, const char *
 hub_auth_result_t hub_auth_token(hub_auth_t *auth, uint32_t address, const char *token,
                                  uint16_t *cid)
 {
-    if (locked_out(auth, address)) {
+    if (locked_out(auth, address, false)) {
         return HUB_AUTH_RATE_LIMITED;
     }
     if (token != NULL && strlen(token) == HUB_AUTH_TOKEN_CHARS) {
