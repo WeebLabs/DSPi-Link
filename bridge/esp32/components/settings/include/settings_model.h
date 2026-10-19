@@ -5,8 +5,10 @@
  * rules of bridge spec 8.11. The struct here is what settings.h loads and
  * saves; the functions decide defaults and validity.
  *
- * Portable: no ESP-IDF headers, so the rules are covered by host tests and
- * the same checks serve hub.config.set in a later phase.
+ * Portable: no ESP-IDF headers, so the rules are covered by host tests.
+ * settings.c applies them when loading and saving, and the hub applies the
+ * same checks to hub.config.set. Nothing here keeps state, so any task may
+ * call these functions.
  */
 
 #ifndef SETTINGS_MODEL_H
@@ -79,12 +81,16 @@ const char *settings_model_find_problem(const bridge_settings_t *settings,
                                         const board_table_t *board);
 
 /*
- * Replaces each invalid value with its default from `defaults`, which must
- * itself be valid. Returns how many keys were replaced; 0 means nothing was
- * wrong.
+ * Replaces each invalid value with its default from `defaults`.
+ *
+ * repaired: receives how many keys were replaced; 0 means nothing was wrong.
+ *
+ * Returns true when `settings` are valid afterwards. False means `defaults`
+ * are themselves invalid on this board, a bug in the board table; the
+ * settings are then still invalid and must not be saved.
  */
-size_t settings_model_repair(bridge_settings_t *settings, const bridge_settings_t *defaults,
-                             const board_table_t *board);
+bool settings_model_repair(bridge_settings_t *settings, const bridge_settings_t *defaults,
+                           const board_table_t *board, size_t *repaired);
 
 /* True for 1 to 63 bytes of valid UTF-8 with no control characters. */
 bool settings_name_is_valid(const char *name);

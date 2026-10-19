@@ -1,3 +1,5 @@
+/* The portable SHA-256 against the FIPS 180-4 examples and Node's own. */
+
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/sha256.js";

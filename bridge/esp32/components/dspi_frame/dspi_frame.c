@@ -1,6 +1,8 @@
 /*
  * dspi_frame.c - builds DSPi UART requests and parses responses and
- * notifications. See dspi_frame.h; implements bridge spec 7.1.
+ * notifications. Implements bridge spec 7.1; see dspi_frame.h for the frame
+ * layout. The uart task's link engine (dspi_link.c) is its only user on the
+ * bridge; the host tests drive it directly.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -79,6 +81,50 @@ static void add_to_crc(dspi_parser_t *parser, uint8_t byte)
     parser->crc = dspi_crc16_update(parser->crc, &byte, 1);
 }
 
+/* Handles the bytes before the payload: type, status and length. */
+static dspi_parse_result_t feed_header(dspi_parser_t *parser, uint8_t byte)
+{
+    switch (parser->stage) {
+    case DSPI_PARSER_WAIT_TYPE:
+        if (!is_device_frame_type(byte)) {
+            /* Noise. A second 0xA5 may be the real start of a frame. */
+            parser->stage =
+                (byte == DSPI_FRAME_SYNC) ? DSPI_PARSER_WAIT_TYPE : DSPI_PARSER_WAIT_SYNC;
+            return DSPI_PARSE_NOTHING;
+        }
+        parser->type = byte;
+        parser->stage = DSPI_PARSER_WAIT_STATUS;
+        break;
+    case DSPI_PARSER_WAIT_STATUS:
+        parser->status = byte;
+        parser->stage = DSPI_PARSER_WAIT_LENGTH_LOW;
+        break;
+    case DSPI_PARSER_WAIT_LENGTH_LOW:
+        parser->length = byte;
+        parser->stage = DSPI_PARSER_WAIT_LENGTH_HIGH;
+        break;
+    default: /* DSPI_PARSER_WAIT_LENGTH_HIGH */
+        parser->length |= (uint16_t)(byte << 8);
+        if (parser->length > parser->capacity) {
+            return DSPI_PARSE_TOO_LONG;
+        }
+        parser->received = 0;
+        parser->stage = parser->length > 0 ? DSPI_PARSER_WAIT_PAYLOAD : DSPI_PARSER_WAIT_CRC_LOW;
+        break;
+    }
+    add_to_crc(parser, byte);
+    return DSPI_PARSE_NOTHING;
+}
+
+/* Describes the frame in the parser, finished or discarded. */
+static void describe_frame(const dspi_parser_t *parser, dspi_frame_t *frame)
+{
+    frame->type = parser->type;
+    frame->status = parser->status;
+    frame->length = parser->length;
+    frame->payload = parser->buffer;
+}
+
 dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame)
 {
     switch (parser->stage) {
@@ -90,38 +136,15 @@ dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_f
         return DSPI_PARSE_NOTHING;
 
     case DSPI_PARSER_WAIT_TYPE:
-        if (!is_device_frame_type(byte)) {
-            /* Noise. A second 0xA5 may be the real start of a frame. */
-            parser->stage =
-                (byte == DSPI_FRAME_SYNC) ? DSPI_PARSER_WAIT_TYPE : DSPI_PARSER_WAIT_SYNC;
-            return DSPI_PARSE_NOTHING;
-        }
-        parser->type = byte;
-        add_to_crc(parser, byte);
-        parser->stage = DSPI_PARSER_WAIT_STATUS;
-        return DSPI_PARSE_NOTHING;
-
     case DSPI_PARSER_WAIT_STATUS:
-        parser->status = byte;
-        add_to_crc(parser, byte);
-        parser->stage = DSPI_PARSER_WAIT_LENGTH_LOW;
-        return DSPI_PARSE_NOTHING;
-
     case DSPI_PARSER_WAIT_LENGTH_LOW:
-        parser->length = byte;
-        add_to_crc(parser, byte);
-        parser->stage = DSPI_PARSER_WAIT_LENGTH_HIGH;
-        return DSPI_PARSE_NOTHING;
-
     case DSPI_PARSER_WAIT_LENGTH_HIGH:
-        parser->length |= (uint16_t)(byte << 8);
-        add_to_crc(parser, byte);
-        if (parser->length > parser->capacity) {
+        if (feed_header(parser, byte) == DSPI_PARSE_TOO_LONG) {
+            describe_frame(parser, frame);
+            frame->payload = NULL;
             dspi_parser_reset(parser);
             return DSPI_PARSE_TOO_LONG;
         }
-        parser->received = 0;
-        parser->stage = parser->length > 0 ? DSPI_PARSER_WAIT_PAYLOAD : DSPI_PARSER_WAIT_CRC_LOW;
         return DSPI_PARSE_NOTHING;
 
     case DSPI_PARSER_WAIT_PAYLOAD:
@@ -139,15 +162,12 @@ dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_f
 
     case DSPI_PARSER_WAIT_CRC_HIGH: {
         const uint16_t received_crc = (uint16_t)(parser->crc_low | (byte << 8));
-        const bool crc_matches = received_crc == parser->crc;
         parser->stage = DSPI_PARSER_WAIT_SYNC;
-        if (!crc_matches) {
+        describe_frame(parser, frame);
+        if (received_crc != parser->crc) {
+            frame->payload = NULL;
             return DSPI_PARSE_BAD_CRC;
         }
-        frame->type = parser->type;
-        frame->status = parser->status;
-        frame->length = parser->length;
-        frame->payload = parser->buffer;
         return DSPI_PARSE_FRAME;
     }
     }

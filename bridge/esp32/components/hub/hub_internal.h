@@ -1,17 +1,19 @@
 /*
  * hub_internal.h - functions the hub's source files share. Not part of the
- * public API (hub.h).
+ * public API (hub.h); like it, everything here runs on the hub task only.
  *
- * The hub is split by subject so each file can be read on its own:
+ * The hub (bridge spec 8, implementing Link spec 5 to 8) is split by
+ * subject so each file can be read on its own:
  *
- *   hub.c           sessions, the message dispatch table, hello, keepalive
- *   hub_commands.c  CMD frames, the queue of requests to the uart task,
- *                   origin attribution
+ *   hub.c           sessions, the message dispatch table, hello, keepalive,
+ *                   replies and the info document
+ *   hub_commands.c  CMD frames, the queue of requests to the uart task and
+ *                   its lost answers, origin attribution
  *   hub_device.c    the device record and its events, notifications,
  *                   snapshots, locks, names
  *   hub_polls.c     poll subscriptions and their schedule
- *   hub_admin.c     administering the hub: settings, Wi-Fi, the PIN and
- *                   paired clients, restart and reset
+ *   hub_admin.c     administering the hub: statistics, its name, settings,
+ *                   Wi-Fi, the PIN and paired clients, restart and reset
  *   hub_config.c    the settings as hub.config JSON (hub_config.h)
  *   hub_update.c    the hub's own firmware update (Link spec 7.14)
  */
@@ -28,6 +30,7 @@
 #define CLOSE_AUTH_TIMEOUT 4001
 #define CLOSE_TOKEN_REVOKED 4002
 #define CLOSE_SHUTTING_DOWN 4003
+#define CLOSE_INTERNAL_ERROR 1011 /* The hub ran out of memory for the session */
 
 /* ---------------------------------------------------------------------------
  * hub.c
@@ -52,8 +55,19 @@ bool hub_send_binary(hub_t *hub, int slot, const uint8_t *data, size_t length);
  * be NULL for an empty reply. */
 void hub_reply_ok(hub_t *hub, int slot, int id, cJSON *body);
 
-/* Replies {"t":"err","id":id,"code":code,"msg":msg}. */
+/* Replies {"t":"err","id":id,"code":code,"msg":msg}. `msg` may be NULL. */
 void hub_reply_error(hub_t *hub, int slot, int id, const char *code, const char *msg);
+
+/* The same, with the offending setting's dotted path as "field" (Link spec
+ * 7.10). */
+void hub_reply_error_field(hub_t *hub, int slot, int id, const char *code, const char *msg,
+                           const char *field);
+
+/* Adds `item` to `object` as `name`, or to `array`. On failure (`item`
+ * NULL, or no memory) `item` is deleted, so a half-built message never
+ * leaks. Returns whether it was added. */
+bool hub_json_add(cJSON *object, const char *name, cJSON *item);
+bool hub_json_append(cJSON *array, cJSON *item);
 
 /* Reads an integer member. False if absent or not a number. */
 bool hub_json_int(const cJSON *object, const char *name, int *value);
@@ -76,9 +90,17 @@ const char *hub_auth_mode(const hub_t *hub);
  * and returns false (Link spec 7.9). */
 bool hub_require_admin(hub_t *hub, int slot, int id);
 
-/* Makes `settings` current: saves and applies them through the I/O,
- * advertises, and tells every session with hub.config.changed. */
-void hub_apply_settings(hub_t *hub, const bridge_settings_t *settings);
+/* Makes `settings` current: saves and applies them through the I/O and
+ * advertises. False, keeping the old settings, if the I/O could not. The
+ * caller then announces them with hub_broadcast_config(), after any reply
+ * that should lead it. */
+bool hub_apply_settings(hub_t *hub, const bridge_settings_t *settings);
+
+/* Tells every session the current settings with hub.config.changed. */
+void hub_broadcast_config(hub_t *hub);
+
+void hub_handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message);
+void hub_handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message);
 
 void hub_handle_auth_list(hub_t *hub, int slot, int id, const cJSON *message);
 void hub_handle_auth_revoke(hub_t *hub, int slot, int id, const cJSON *message);
@@ -106,6 +128,10 @@ bool hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *requ
 /* The session that most likely caused a notification from `source`, or 0
  * (Link spec 8.3). */
 uint16_t hub_take_origin(hub_t *hub, uint8_t source);
+
+/* Finishes the oldest request as a timeout if its answer is overdue by
+ * HUB_REPLY_LOST_AFTER_MS, so a lost answer cannot hold the queue. */
+void hub_commands_tick(hub_t *hub);
 
 /* ---------------------------------------------------------------------------
  * hub_device.c

@@ -66,19 +66,27 @@ static uint32_t now_ms(void *context)
     return fake->now_ms;
 }
 
-static void apply_settings(void *context, const bridge_settings_t *settings)
+static bool apply_settings(void *context, const bridge_settings_t *settings)
 {
     fake_hub_io_t *fake = context;
+    if (fake->refuse_apply) {
+        return false;
+    }
     fake->applied = *settings;
     fake->apply_count++;
+    return true;
 }
 
-static void start_wifi_scan(void *context, int slot, uint16_t session_id, int request_id)
+static hub_io_result_t start_wifi_scan(void *context, int slot, uint16_t session_id, int request_id)
 {
     fake_hub_io_t *fake = context;
+    if (fake->scan_result != HUB_IO_OK) {
+        return fake->scan_result;
+    }
     fake->scan_slot = slot;
     fake->scan_session = session_id;
     fake->scan_request = request_id;
+    return HUB_IO_OK;
 }
 
 static bool wifi_join(void *context, const char *ssid, const char *password)
@@ -98,11 +106,15 @@ static void restart(void *context, hub_restart_level_t level)
     fake->restart_level = (int)level;
 }
 
-static void save_device_name(void *context, const char *serial, const char *name)
+static bool save_device_name(void *context, const char *serial, const char *name)
 {
     fake_hub_io_t *fake = context;
+    if (fake->refuse_save_name) {
+        return false;
+    }
     snprintf(fake->saved_device_serial, sizeof(fake->saved_device_serial), "%s", serial);
     snprintf(fake->saved_device_name, sizeof(fake->saved_device_name), "%s", name);
+    return true;
 }
 
 static bool load_device_name(void *context, const char *serial, char *name, size_t size)
@@ -127,7 +139,7 @@ static uint32_t update_capacity(void *context)
     return fake->update_capacity;
 }
 
-static bool update_begin(void *context, uint32_t size, const uint8_t sha256[32])
+static bool update_begin(void *context, uint32_t size, const uint8_t sha256[HUB_IO_SHA256_BYTES])
 {
     fake_hub_io_t *fake = context;
     fake->update_size = size;

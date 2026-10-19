@@ -12,6 +12,7 @@ void test_dspi_frame(void);
 void test_dspi_link(void);
 void test_link_policy(void);
 void test_link_frames(void);
+void test_link_base64(void);
 void test_hub(void);
 void test_net(void);
 void test_ws_header(void);
@@ -26,6 +27,7 @@ int main(void)
     test_dspi_link();
     test_link_policy();
     test_link_frames();
+    test_link_base64();
     test_hub();
     test_net();
     test_ws_header();

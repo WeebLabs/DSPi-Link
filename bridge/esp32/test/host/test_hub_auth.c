@@ -60,10 +60,10 @@ static void the_pin_is_off_until_set(void)
 {
     start();
     CHECK(!hub_auth_pin_enabled(&auth));
-    CHECK(!hub_auth_set_pin(&auth, "12345"));  /* Too short */
-    CHECK(!hub_auth_set_pin(&auth, "12345a")); /* Not digits */
+    CHECK(hub_auth_set_pin(&auth, "12345") == HUB_AUTH_INVALID_PIN);  /* Too short */
+    CHECK(hub_auth_set_pin(&auth, "12345a") == HUB_AUTH_INVALID_PIN); /* Not digits */
     CHECK(!hub_auth_pin_enabled(&auth));
-    CHECK(hub_auth_set_pin(&auth, "482913"));
+    CHECK(hub_auth_set_pin(&auth, "482913") == HUB_AUTH_OK);
     CHECK(hub_auth_pin_enabled(&auth));
     CHECK(memcmp(auth.store.pin_hash, "482913", 6) != 0); /* Only a hash is kept */
     CHECK(saves == 1);
@@ -197,6 +197,69 @@ static void last_seen_is_saved_at_most_hourly(void)
     CHECK(saves == before + 1);
 }
 
+static void a_failed_hash_sets_no_pin(void)
+{
+    start();
+    fake_pbkdf2_fails = true;
+    CHECK(hub_auth_set_pin(&auth, "482913") == HUB_AUTH_UNAVAILABLE);
+    CHECK(!hub_auth_pin_enabled(&auth));
+    CHECK(saves == 0);
+
+    /* A PIN already set stays as it was, and so do its clients. */
+    fake_pbkdf2_fails = false;
+    CHECK(hub_auth_set_pin(&auth, "482913") == HUB_AUTH_OK);
+    char token[HUB_AUTH_TOKEN_CHARS + 1];
+    uint16_t cid;
+    CHECK(hub_auth_pair(&auth, HOME, "482913", "x", token, &cid) == HUB_AUTH_OK);
+    fake_random_fails = true;
+    CHECK(hub_auth_set_pin(&auth, "135790") == HUB_AUTH_UNAVAILABLE);
+    fake_random_fails = false;
+    CHECK(hub_auth_token(&auth, HOME, token, &cid) == HUB_AUTH_OK);
+    CHECK(hub_auth_check_pin(&auth, HOME, "482913") == HUB_AUTH_OK);
+}
+
+static void a_failed_hash_accepts_nothing_and_counts_nothing(void)
+{
+    start();
+    hub_auth_set_pin(&auth, "482913");
+    char token[HUB_AUTH_TOKEN_CHARS + 1];
+    uint16_t cid;
+    CHECK(hub_auth_pair(&auth, HOME, "482913", "x", token, &cid) == HUB_AUTH_OK);
+
+    fake_pbkdf2_fails = true;
+    for (int i = 0; i < AUTH_MAX_FAILURES_PER_ADDRESS; i++) {
+        CHECK(hub_auth_check_pin(&auth, HOME, "482913") == HUB_AUTH_UNAVAILABLE);
+        CHECK(hub_auth_pair(&auth, HOME, "000000", "x", token, &cid) == HUB_AUTH_UNAVAILABLE);
+    }
+    fake_sha256_fails = true;
+    CHECK(hub_auth_token(&auth, HOME, token, &cid) == HUB_AUTH_UNAVAILABLE);
+
+    /* None of that was the client's fault, so nothing locked it out. */
+    fake_crypto_reset();
+    CHECK(hub_auth_check_pin(&auth, HOME, "482913") == HUB_AUTH_OK);
+}
+
+static void a_failed_random_source_issues_no_token(void)
+{
+    start();
+    hub_auth_set_pin(&auth, "482913");
+    const unsigned before = saves;
+    char token[HUB_AUTH_TOKEN_CHARS + 1];
+    uint16_t cid = 0;
+    fake_random_fails = true;
+    CHECK(hub_auth_issue(&auth, "x", token, &cid) == HUB_AUTH_UNAVAILABLE);
+    CHECK(hub_auth_pair(&auth, HOME, "482913", "x", token, &cid) == HUB_AUTH_UNAVAILABLE);
+    fake_random_fails = false;
+    fake_sha256_fails = true;
+    CHECK(hub_auth_issue(&auth, "x", token, &cid) == HUB_AUTH_UNAVAILABLE);
+    CHECK(cid == 0 && saves == before);
+    size_t count = 0;
+    const hub_auth_client_t *clients = hub_auth_clients(&auth, &count);
+    for (size_t i = 0; i < count; i++) {
+        CHECK(!clients[i].used);
+    }
+}
+
 void test_hub_auth(void)
 {
     RUN(the_pin_is_off_until_set);
@@ -208,4 +271,7 @@ void test_hub_auth(void)
     RUN(clients_can_be_revoked);
     RUN(a_full_list_replaces_the_stalest_client);
     RUN(last_seen_is_saved_at_most_hourly);
+    RUN(a_failed_hash_sets_no_pin);
+    RUN(a_failed_hash_accepts_nothing_and_counts_nothing);
+    RUN(a_failed_random_source_issues_no_token);
 }

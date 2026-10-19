@@ -1,10 +1,12 @@
+/*
+ * Structural checks on policy/commands.json (Link spec 9.3). Every hub embeds
+ * this file, so a malformed row is an authorization bug in every implementation.
+ */
+
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FIXTURES } from "./fixtures.js";
-
-// Structural checks on policy/commands.json (spec 9.3). Every hub embeds this
-// file, so a malformed row is an authorization bug in every implementation.
 
 type Dir = "set" | "get";
 type Cls = "read" | "control" | "config";

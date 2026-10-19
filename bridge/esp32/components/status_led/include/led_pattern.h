@@ -1,6 +1,8 @@
 /*
  * led_pattern.h - what the status LED shows, and when (bridge spec 13).
  *
+ * With the LED_* timings of bridge_config.h:
+ *
  *   slow blue pulse           the setup network is up (setup or fallback)
  *   fast blue blink           joining the home network
  *   solid green for 5 s       online with the DSPi found, then off
@@ -48,10 +50,11 @@ typedef struct {
     uint32_t ready_since_ms;
 } led_pattern_t;
 
+/* Starts a pattern with the bridge not yet ready. */
 void led_pattern_init(led_pattern_t *pattern);
 
-/* The colour to show at `now_ms`. Call it often (every 20 ms) so blinks and
- * pulses look smooth. */
+/* The colour to show at `now_ms`. Call it often (every LED_FRAME_MS) so
+ * blinks and pulses look smooth. */
 led_colour_t led_pattern_colour(led_pattern_t *pattern, const led_inputs_t *inputs,
                                 uint32_t now_ms);
 

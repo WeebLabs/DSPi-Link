@@ -8,7 +8,8 @@
  * RESYNC).
  *
  * Portable: no ESP-IDF headers. Encoders write into a caller's buffer and
- * return the frame length, or 0 if the buffer is too small.
+ * return the frame length, or 0 if the buffer is too small. Nothing here
+ * keeps state, so any task may call these; on the bridge it is the hub task.
  */
 
 #ifndef LINK_FRAMES_H
@@ -32,6 +33,9 @@
 #define LINK_CMD_RESPONSE_HEADER_BYTES 8
 #define LINK_NOTIFY_HEADER_BYTES 8
 #define LINK_POLL_HEADER_BYTES 8
+#define LINK_FWDATA_HEADER_BYTES 8 /* Everything before a chunk's data */
+#define LINK_FWDATA_ACK_BYTES 9
+#define LINK_RESYNC_BYTES 6
 
 /* Link-level CMD statuses (Link spec 8.1). 0x00 to 0x07 are the DSPi's own,
  * passed through unchanged (see dspi_frame.h). */
@@ -79,20 +83,35 @@ typedef struct {
     size_t length;
 } link_fwdata_chunk_t;
 
+/* Decodes a FWDATA chunk. False if the frame is of another type or too
+ * short for its offset; a chunk with no data is valid. */
 bool link_decode_fwdata(const uint8_t *frame, size_t length, link_fwdata_chunk_t *out);
 
+/* Encodes a CMD response (Link spec 8.2): `status` and, for an OK GET,
+ * `length` bytes of `payload` (which may be NULL when `length` is 0).
+ * Returns the frame length, or 0 if `capacity` is too small. */
 size_t link_encode_cmd_response(uint8_t *out, size_t capacity, uint16_t tag, uint8_t status,
                                 const uint8_t *payload, uint16_t length);
 
+/* Encodes a NOTIFY (Link spec 8.3) carrying `packet` verbatim, with the
+ * session's `sequence` as its tag and `origin` the session id the hub
+ * credits, or 0. Returns the frame length, or 0 if `capacity` is too small. */
 size_t link_encode_notify(uint8_t *out, size_t capacity, uint16_t sequence, uint8_t handle,
                           uint16_t origin, const uint8_t *packet, size_t length);
 
+/* Encodes a POLL (Link spec 8.4): the answer to the GET subscribed in
+ * `slot`. Returns the frame length, or 0 if `capacity` is too small. */
 size_t link_encode_poll(uint8_t *out, size_t capacity, uint16_t sequence, uint8_t handle,
                         uint8_t slot, const uint8_t *payload, uint16_t length);
 
+/* Encodes a FWDATA ack (Link spec 8.5) for the chunk at `offset`; status 0
+ * means accepted. Returns LINK_FWDATA_ACK_BYTES, or 0 if `capacity` is too
+ * small. */
 size_t link_encode_fwdata_ack(uint8_t *out, size_t capacity, uint16_t transfer, uint32_t offset,
                               uint8_t status);
 
+/* Encodes a RESYNC (Link spec 8.6) with one of the LINK_RESYNC_* reasons.
+ * Returns LINK_RESYNC_BYTES, or 0 if `capacity` is too small. */
 size_t link_encode_resync(uint8_t *out, size_t capacity, uint8_t handle, uint8_t reason);
 
 #endif /* LINK_FRAMES_H */

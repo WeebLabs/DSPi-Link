@@ -31,12 +31,15 @@ case "${chip}" in
         ;;
 esac
 
-# Inside the container: merge the build into one 4 MB flash image, or pad the
-# full image given to 4 MB, then boot it twice. sed keeps the bridge's own lines and any crash, and quits at the
-# last line of the startup summary, which ends that boot. The original ESP32
-# is slow under emulation, hence the generous timeout.
+# Inside the container: merge the build into one 4 MB flash image, or pad
+# the full image given to 4 MB, then boot it twice. sed keeps the bridge's
+# own lines and any crash, and quits at the last line of the startup
+# summary, which ends that boot; QEMU then exits non-zero, which is expected,
+# so only a failure to make the flash image fails the container. The
+# original ESP32 is slow under emulation, hence the generous timeout.
 boot_twice=$(cat <<SCRIPT
-set -uo pipefail
+set -euo pipefail
+command -v ${qemu} > /dev/null || { echo "${qemu} is not in this image" >&2; exit 1; }
 if [ -n "${image}" ]; then
     python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin 0x0 "${image}" > /dev/null
 else
@@ -46,17 +49,25 @@ for boot in 1 2; do
     echo "BOOT \${boot}"
     timeout 45 ${qemu} -nographic -machine ${chip} \
         -drive file=/tmp/flash.bin,if=mtd,format=raw 2>&1 |
-        sed -n -E '/I \([0-9]+\) (settings|bridge):|Guru Meditation|abort\(\)|assert failed/p; /bridge: DSPi UART/q'
+        sed -n -E '/I \([0-9]+\) (settings|bridge):|Guru Meditation|abort\(\)|assert failed/p; /bridge: DSPi UART/q' ||
+        true
 done
 SCRIPT
 )
 
+# Docker's and esptool's own errors stay in the log, so a broken image or a
+# missing tool says so rather than looking like a failed boot.
+docker_status=0
 log=$(docker run --rm \
     --volume "${REPO_DIR}:/repo" \
     --workdir /repo/bridge/esp32 \
     "espressif/idf:${IDF_VERSION}" \
-    bash -c "${boot_twice}" 2>/dev/null) || true # QEMU exits non-zero when sed ends a boot
+    bash -c "${boot_twice}" 2>&1) || docker_status=$?
 echo "${log}"
+if (( docker_status != 0 )); then
+    echo "FAILED (${chip}): the container could not make the flash image or run QEMU (exit ${docker_status})" >&2
+    exit 1
+fi
 
 first_boot=$(sed -n '/^BOOT 1/,/^BOOT 2/p' <<< "${log}")
 second_boot=$(sed -n '/^BOOT 2/,$p' <<< "${log}")

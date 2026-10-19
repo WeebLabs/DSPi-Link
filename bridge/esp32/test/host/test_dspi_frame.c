@@ -152,6 +152,11 @@ static void rejects_a_bad_crc_then_recovers(void)
     dspi_frame_t frame;
 
     CHECK(feed_all(&parser, wire, length, &frame, NULL) == DSPI_PARSE_BAD_CRC);
+    /* What the damaged frame claimed, so the link can tell an answer from a
+     * notification. */
+    CHECK(frame.type == DSPI_FRAME_TYPE_GET_RESPONSE);
+    CHECK(frame.length == sizeof(data));
+    CHECK(frame.payload == NULL);
     CHECK(feed_all(&parser, wire + length, second, &frame, NULL) == DSPI_PARSE_FRAME);
 }
 
@@ -168,6 +173,8 @@ static void rejects_a_frame_longer_than_the_buffer(void)
     /* The length bytes (offsets 3 and 4) already tell the parser it is too long. */
     CHECK(feed_all(&parser, wire, 5, &frame, NULL) == DSPI_PARSE_TOO_LONG);
     CHECK(!dspi_parser_in_frame(&parser));
+    CHECK(frame.type == DSPI_FRAME_TYPE_GET_RESPONSE);
+    CHECK(frame.length == sizeof(data));
 }
 
 static void reset_drops_a_partial_frame(void)

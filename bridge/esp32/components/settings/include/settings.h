@@ -2,8 +2,8 @@
  * settings.h - loads and saves the bridge's settings in flash (NVS).
  *
  * Implements bridge spec 11: the `bridge`, `wifi`, `auth` and `devices`
- * namespaces. This is the only module
- * that touches NVS. Call settings_init() once at boot before anything else
+ * namespaces. This is the only module that touches NVS. Call
+ * settings_init() once at boot before anything else
  * uses flash storage. The load and save functions may be called from any
  * task, because NVS serialises access itself; in practice the hub task is
  * their only caller after boot.
@@ -26,24 +26,29 @@ esp_err_t settings_init(void);
  * Loads the bridge's settings into `out`.
  *
  * On first boot this creates the factory settings, including a new hub id,
- * and saves them. A saved value that is invalid on this board is replaced
- * by its default and the repaired settings are saved, with a warning.
+ * and saves them. A saved value that is missing, or invalid on this board,
+ * is replaced by its default and the settings are saved again, with a
+ * warning. Returns ESP_ERR_INVALID_STATE, saving nothing, if even the
+ * defaults are invalid (a board table bug), or an NVS error.
  */
 esp_err_t settings_load(bridge_settings_t *out);
 
-/* Saves `settings`, which must pass settings_model_find_problem(). */
+/* Saves `settings`, which must pass settings_model_find_problem(); returns
+ * ESP_ERR_INVALID_ARG, saving nothing, if they do not. */
 esp_err_t settings_save(const bridge_settings_t *settings);
 
 /*
  * Device names, saved by serial in the `devices` namespace (bridge spec
  * 8.7 and 11). Up to LINK_MAX_DEVICE_NAMES are kept; saving a new one when
- * full replaces the name used least recently.
+ * full replaces the name saved least recently.
  */
 
 /* Copies the saved name for `serial` into `name`. ESP_ERR_NOT_FOUND if
  * there is none. */
 esp_err_t settings_load_device_name(const char *serial, char *name, size_t size);
 
+/* Saves `name` for `serial`, replacing any earlier name for it. Returns
+ * ESP_ERR_INVALID_ARG if the name breaks settings_name_is_valid(). */
 esp_err_t settings_save_device_name(const char *serial, const char *name);
 
 /*
@@ -59,6 +64,9 @@ esp_err_t settings_save_device_name(const char *serial, const char *name);
 esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
                              char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1]);
 
+/* Saves the home network. Returns ESP_ERR_INVALID_ARG for an empty or
+ * over-long SSID or an over-long password; an empty password is an open
+ * network. */
 esp_err_t settings_save_wifi(const char *ssid, const char *password);
 
 /* Erases the saved network: "Forget Wi-Fi" (bridge spec 12.1). */
@@ -71,6 +79,8 @@ esp_err_t settings_forget_wifi(void);
  * a firmware changes its layout; the bridge then starts with no PIN.
  */
 esp_err_t settings_load_auth(void *blob, size_t size);
+
+/* Saves `size` bytes of `blob`, replacing what was saved. */
 esp_err_t settings_save_auth(const void *blob, size_t size);
 
 /* Erases everything the bridge has saved: "Factory reset" (bridge spec

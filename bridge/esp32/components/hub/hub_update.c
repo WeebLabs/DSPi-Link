@@ -13,6 +13,8 @@
  * A chunk is acknowledged only once it is in flash, so the client, which
  * keeps few chunks unanswered, never sends faster than the flash takes
  * them. The flash work itself happens in the I/O, off the hub task.
+ *
+ * Portable: no ESP-IDF headers.
  */
 
 #include <string.h>
@@ -22,8 +24,6 @@
 /* FWDATA ack statuses (Link spec 8.5). */
 #define FWDATA_ACCEPTED 0
 #define FWDATA_REJECTED 1
-
-#define SHA256_BYTES 32
 
 bool hub_update_available(const hub_t *hub)
 {
@@ -42,7 +42,9 @@ static void send_ack(hub_t *hub, int slot, uint16_t transfer, uint32_t offset, u
 {
     const size_t length =
         link_encode_fwdata_ack(hub->frame, sizeof(hub->frame), transfer, offset, status);
-    hub_send_binary(hub, slot, hub->frame, length);
+    /* A lost ack stalls the sender, and the update is then abandoned after
+     * OTA_IDLE_TIMEOUT_MS with hub.update.done saying so. */
+    (void)hub_send_binary(hub, slot, hub->frame, length);
 }
 
 /* hub.update.done to the sender: {"ok": true, "version"} or {"ok": false,
@@ -56,7 +58,9 @@ static void send_done(hub_t *hub, bool ok, const char *text)
     cJSON_AddStringToObject(done, "t", "hub.update.done");
     cJSON_AddBoolToObject(done, "ok", ok);
     cJSON_AddStringToObject(done, ok ? "version" : "msg", text);
-    hub_send_json(hub, hub->update.slot, done);
+    /* Lost to a full queue, the outcome still shows: a good image restarts
+     * the bridge, and a bad one leaves the old version in hello. */
+    (void)hub_send_json(hub, hub->update.slot, done);
 }
 
 /* Abandons the update, says why, and keeps the current firmware. */
@@ -82,13 +86,13 @@ static int hex_digit(char c)
     return -1;
 }
 
-/* Reads exactly 64 hex digits into 32 bytes. */
-static bool parse_sha256(const char *hex, uint8_t digest[SHA256_BYTES])
+/* Reads exactly 2 x HUB_IO_SHA256_BYTES hex digits into a digest. */
+static bool parse_sha256(const char *hex, uint8_t digest[HUB_IO_SHA256_BYTES])
 {
-    if (hex == NULL || strlen(hex) != SHA256_BYTES * 2) {
+    if (hex == NULL || strlen(hex) != HUB_IO_SHA256_BYTES * 2) {
         return false;
     }
-    for (size_t i = 0; i < SHA256_BYTES; i++) {
+    for (size_t i = 0; i < HUB_IO_SHA256_BYTES; i++) {
         const int high = hex_digit(hex[i * 2]);
         const int low = hex_digit(hex[i * 2 + 1]);
         if (high < 0 || low < 0) {
@@ -123,7 +127,7 @@ void hub_handle_update(hub_t *hub, int slot, int id, const cJSON *message)
         hub_reply_error(hub, slot, id, "bad_request", "the image is too large for this bridge");
         return;
     }
-    uint8_t digest[SHA256_BYTES];
+    uint8_t digest[HUB_IO_SHA256_BYTES];
     const cJSON *sha256 = cJSON_GetObjectItemCaseSensitive(message, "sha256");
     if (!parse_sha256(cJSON_IsString(sha256) ? sha256->valuestring : NULL, digest)) {
         hub_reply_error(hub, slot, id, "bad_request", "sha256 must be 64 hex digits");

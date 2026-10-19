@@ -43,12 +43,15 @@ typedef struct {
     board_pin_list_t led_pins;     /* Outputs, including on-board LED pins */
 } board_table_t;
 
+/* One table per chip. They are constant data fixed at build time, not
+ * state, and are public so the host tests can check all four in one run;
+ * firmware code reaches its own through board_table(). */
 extern const board_table_t BOARD_TABLE_ESP32;
 extern const board_table_t BOARD_TABLE_ESP32S3;
 extern const board_table_t BOARD_TABLE_ESP32C3;
 extern const board_table_t BOARD_TABLE_ESP32C6;
 
-/* True when pin appears in list. */
+/* True when `pin` appears in `list`. Any task may call it. */
 bool board_pin_list_contains(board_pin_list_t list, uint8_t pin);
 
 #endif /* BOARD_TABLE_H */

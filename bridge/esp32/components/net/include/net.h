@@ -8,8 +8,8 @@
  * runs the setup network's DNS answers (captive_dns.h) and keeps the home
  * network's credentials in settings.
  *
- * Every function may be called from any task. Changes are carried out on
- * ESP-IDF's event task, one at a time.
+ * Each function says which task may call it. Wi-Fi changes are carried
+ * out on ESP-IDF's event task, one at a time.
  */
 
 #ifndef NET_H
@@ -50,43 +50,62 @@ typedef struct {
     bool secure;
 } net_network_t;
 
+/* Why net_check_credentials() refuses a network's name and password. */
+typedef enum {
+    NET_CREDENTIALS_OK,
+    NET_CREDENTIALS_BAD_SSID,     /* Empty, or longer than 32 bytes */
+    NET_CREDENTIALS_BAD_PASSWORD, /* Not empty, 8 to 63 characters, or 64 hex digits */
+} net_credentials_check_t;
+
 /* Starts Wi-Fi with `hostname`: joins the saved home network, or shows the
- * setup network if none is saved (bridge spec 9.1). */
+ * setup network if none is saved (bridge spec 9.1). Called once, by
+ * app_main, after settings. Returns the first step's error, if any. */
 esp_err_t net_start(const char *hostname);
 
 /* Advertises, or updates, the bridge's one _dspi._tcp service on the Link
- * port with this instance name and TXT record. */
+ * port with this instance name and TXT record (at most NET_MAX_TXT_ENTRIES
+ * entries). Hub task only. Returns ESP_ERR_INVALID_ARG for too many
+ * entries, or mDNS's error. */
 esp_err_t net_advertise(const char *instance_name, const net_txt_entry_t *txt, size_t count);
 
+/* Copies the network's state as last published. Any task. */
 void net_get_status(net_status_t *status);
 
 /* Takes a new mDNS hostname at once; DHCP reports it from the next lease
- * (bridge spec 8.11). */
+ * (bridge spec 8.11). Hub task. Returns the network stack's or mDNS's
+ * error. */
 esp_err_t net_set_hostname(const char *hostname);
 
 /*
  * Lists nearby 2.4 GHz networks, strongest first and each name once, into
- * `networks` (room for `capacity`). Takes a few seconds. Returns how many
- * were written.
+ * `networks` (room for `capacity`). Returns how many were written: 0 if the
+ * scan failed. Blocks its caller for a few seconds, so call it from a task
+ * that may wait (the HTTP server's or the hub's), never the event task.
  */
 size_t net_scan(net_network_t *networks, size_t capacity);
+
+/* Checks a network name and password before anything is changed. Any task. */
+net_credentials_check_t net_check_credentials(const char *ssid, const char *password);
 
 /*
  * Tries a new home network. The credentials are saved only once the bridge
  * has an address on it; until then the previous network, if any, is kept to
- * fall back to (Link spec 7.11, bridge spec 9.3). ESP_ERR_INVALID_ARG for an
- * empty or over-long name, or a password that WPA2 cannot use.
+ * fall back to (Link spec 7.11, bridge spec 9.3). Any task. Returns
+ * ESP_ERR_INVALID_ARG for credentials net_check_credentials() refuses, or
+ * an error if the request could not be queued within NET_REQUEST_TIMEOUT_MS.
  */
 esp_err_t net_join(const char *ssid, const char *password);
 
-/* The setup page has finished: switch the setup network off shortly. */
-void net_finish_setup(void);
+/* The setup page has finished: switch the setup network off shortly. Any
+ * task. Returns an error if the request could not be queued. */
+esp_err_t net_finish_setup(void);
 
 /* True when the socket `fd` was accepted on the setup network rather than
- * the home network. The setup API answers only there (bridge spec 9.3). */
+ * the home network. The setup API answers only there (bridge spec 9.3).
+ * Any task, while the socket is open. */
 bool net_socket_is_on_setup_network(int fd);
 
-/* The setup network's address, "192.168.4.1". */
+/* The setup network's address, "192.168.4.1". Any task. */
 const char *net_setup_address(void);
 
 #endif /* NET_H */

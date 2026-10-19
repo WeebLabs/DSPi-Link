@@ -214,20 +214,90 @@ static void requests_keep_the_idle_gap(void)
     CHECK(fake.smallest_gap_ms >= DSPI_UART_IDLE_GAP_MS);
 }
 
+static const dspi_request_t SET_MUTE = {.is_get = false, .request = 0xD4, .length = 0};
+
 static void repeated_timeouts_restart_the_uart(void)
 {
     start(BAUD, BAUD);
-    const dspi_request_t set_mute = {.is_get = false, .request = 0xD4, .length = 0};
-    for (int i = 0; i < DSPI_UART_TIMEOUTS_BEFORE_REINSTALL; i++) {
+    for (int i = 0; i < DSPI_UART_UNANSWERED_BEFORE_REINSTALL; i++) {
         fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
-        dspi_link_transact(&link, &set_mute, false);
+        CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
     }
     CHECK(fake.restarts == 1);
-    CHECK(dspi_link_failures_in_a_row(&link) == DSPI_UART_TIMEOUTS_BEFORE_REINSTALL);
+    CHECK(dspi_link_failures_in_a_row(&link) == DSPI_UART_UNANSWERED_BEFORE_REINSTALL);
 
     /* One good answer clears the count. */
     CHECK(dspi_link_transact(&link, &GET_PLATFORM, true).kind == DSPI_REPLY_ANSWERED);
     CHECK(dspi_link_failures_in_a_row(&link) == 0);
+}
+
+/* A receiver stuck on noise sees damaged frames rather than silence; that
+ * must still lead to the restart that clears it (bridge spec 7.4). */
+static void noise_counts_towards_the_restart(void)
+{
+    start(BAUD, BAUD);
+    /* Noise, then something shaped like a SET response with a wrong CRC. */
+    const uint8_t noise[] = {0x13, 0xFF, 0xA5, 0x81, 0x07, 0x00, 0x00, 0x12, 0x34, 0x5A};
+    for (int i = 0; i < DSPI_UART_UNANSWERED_BEFORE_REINSTALL; i++) {
+        fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+        fake_dspi_send_raw(&fake, noise, sizeof(noise), 60); /* After any quarantine */
+        CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_CORRUPT);
+    }
+    CHECK(fake.restarts == 1);
+    CHECK(dspi_link_counters(&link)->restarts == 1);
+    CHECK(dspi_link_counters(&link)->crc_errors == DSPI_UART_UNANSWERED_BEFORE_REINSTALL);
+    CHECK(dspi_link_counters(&link)->timeouts == 0);
+}
+
+/* A damaged notification before silence is not the answer: the client is
+ * told TIMEOUT, not CRC_ERROR. */
+static void a_damaged_notification_is_not_taken_for_the_answer(void)
+{
+    start(BAUD, BAUD);
+    const uint8_t damaged[] = {0xA5, 0x40, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00};
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+    fake_dspi_send_raw(&fake, damaged, sizeof(damaged), 5);
+    CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
+    CHECK(dspi_link_counters(&link)->crc_errors == 1);
+    CHECK(dspi_link_counters(&link)->timeouts == 1);
+    CHECK(notified_count == 0);
+}
+
+/* A restart that fails is tried again on the next unanswered attempt
+ * instead of waiting for another full run of failures. */
+static void a_failed_restart_is_tried_again(void)
+{
+    start(BAUD, BAUD);
+    fake.restart_fails = true;
+    for (int i = 0; i < DSPI_UART_UNANSWERED_BEFORE_REINSTALL + 1; i++) {
+        fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+        CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
+    }
+    CHECK(fake.restarts == 2);
+
+    fake.restart_fails = false;
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+    CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
+    CHECK(fake.restarts == 3);
+    /* Succeeded: the count starts again from zero. */
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+    CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
+    CHECK(fake.restarts == 3);
+}
+
+static void the_heartbeat_reads_the_interface_status(void)
+{
+    start(BAUD, BAUD);
+    CHECK(dspi_link_heartbeat(&link));
+    CHECK(fake.record_count == 1);
+    CHECK(fake.records[0].is_get && fake.records[0].request == 0xF9);
+    CHECK(fake.records[0].length == 8);
+
+    /* Silence twice: a heartbeat is a safe read, so it gets its retry. */
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+    CHECK(!dspi_link_heartbeat(&link));
+    CHECK(fake.record_count == 3);
 }
 
 static void the_baud_rate_is_found(void)
@@ -290,6 +360,10 @@ void test_dspi_link(void)
     RUN(a_late_answer_after_quarantine_is_recognised);
     RUN(requests_keep_the_idle_gap);
     RUN(repeated_timeouts_restart_the_uart);
+    RUN(noise_counts_towards_the_restart);
+    RUN(a_damaged_notification_is_not_taken_for_the_answer);
+    RUN(a_failed_restart_is_tried_again);
+    RUN(the_heartbeat_reads_the_interface_status);
     RUN(the_baud_rate_is_found);
     RUN(a_missing_device_leaves_the_first_rate);
     RUN(the_identity_is_read);

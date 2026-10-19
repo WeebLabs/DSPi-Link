@@ -19,7 +19,6 @@
 #define REQ_GET_UART_CONFIG 0xF6
 #define REQ_GET_CTRL_IFACE_STATUS 0xF9
 
-#define SERIAL_BYTES 16
 #define PLATFORM_MIN_BYTES 4 /* Old firmware returns 4; current returns 7 */
 #define IFACE_STATUS_BYTES 8
 #define UART_CONFIG_BYTES 8
@@ -100,7 +99,8 @@ typedef enum {
     WAIT_TIMED_OUT,
 } wait_result_t;
 
-/* What an answer to the request being waited on must look like. */
+/* What an answer to the request being waited on must look like. A type of
+ * 0 matches nothing: used while only listening for notifications. */
 typedef struct {
     uint8_t type;        /* A response type, or 0 when no answer is expected */
     uint16_t max_length; /* Longest payload it can carry; 0 for no limit */
@@ -122,7 +122,8 @@ static bool matches(const dspi_frame_t *frame, expected_answer_t expected)
  * passes, relaying every notification on the way. Any other answer is a
  * late one to an earlier request and is dropped.
  *
- * saw_corrupt: set when a frame failed its CRC; it may have been the answer.
+ * saw_corrupt: set when a damaged frame of the expected type arrived, which
+ *              may have been the answer. A damaged notification is not.
  */
 static wait_result_t receive_until(dspi_link_t *link, expected_answer_t expected, uint32_t deadline,
                                    dspi_frame_t *answer, bool *saw_corrupt)
@@ -152,7 +153,9 @@ static wait_result_t receive_until(dspi_link_t *link, expected_answer_t expected
             /* Keep waiting: a damaged notification can come before the
              * real answer. If no answer follows, the caller reports it. */
             link->counters.crc_errors++;
-            *saw_corrupt = true;
+            if (expected.type != 0 && frame.type == expected.type) {
+                *saw_corrupt = true;
+            }
             break;
         case DSPI_PARSE_NOTHING:
             break;
@@ -165,7 +168,8 @@ void dspi_link_listen(dspi_link_t *link, uint32_t duration_ms)
     const expected_answer_t nothing = {.type = 0};
     dspi_frame_t unused;
     bool corrupt = false;
-    receive_until(link, nothing, now_ms(link) + duration_ms, &unused, &corrupt);
+    /* Always times out: nothing matches `nothing`. */
+    (void)receive_until(link, nothing, now_ms(link) + duration_ms, &unused, &corrupt);
 }
 
 /* After a timeout, a late answer could be mistaken for the next request's.
@@ -247,22 +251,27 @@ static bool send_request(dspi_link_t *link, const dspi_request_t *request)
            link->port.write(link->port.context, crc, sizeof(crc));
 }
 
-/* Records a request that got no valid answer: quarantine before the next
- * one, and restart the UART after too many timeouts in a row. */
+/* Records an attempt that got no valid answer: quarantine before the next
+ * one, and restart the UART after too many in a row. A corrupt answer counts
+ * towards the restart as a timeout does, because a receiver stuck on noise
+ * produces exactly those (bridge spec 7.4). */
 static void note_no_answer(dspi_link_t *link, bool timed_out)
 {
     link->quarantined = true;
     dspi_parser_reset(&link->parser);
-    if (!timed_out) {
+    if (timed_out) {
+        link->counters.timeouts++;
+    }
+    if (++link->unanswered_in_a_row < DSPI_UART_UNANSWERED_BEFORE_REINSTALL) {
         return;
     }
-    link->counters.timeouts++;
-    if (++link->timeouts_in_a_row >= DSPI_UART_TIMEOUTS_BEFORE_REINSTALL) {
-        link->timeouts_in_a_row = 0;
-        link->counters.restarts++;
-        link->port.restart(link->port.context);
-        discard_received(link);
+    link->counters.restarts++;
+    discard_received(link);
+    if (link->port.restart(link->port.context)) {
+        link->unanswered_in_a_row = 0;
     }
+    /* On failure the count stays at the limit, so the next attempt that
+     * gets no answer tries the restart again. */
 }
 
 /* One attempt at a request, without retries. */
@@ -296,7 +305,7 @@ static dspi_reply_t attempt(dspi_link_t *link, const dspi_request_t *request)
     }
 
     link->last_reply_ms = now_ms(link);
-    link->timeouts_in_a_row = 0;
+    link->unanswered_in_a_row = 0;
     reply.kind = DSPI_REPLY_ANSWERED;
     reply.status = answer.status;
     if (request->is_get && answer.status == DSPI_STATUS_OK) {
@@ -364,6 +373,16 @@ const dspi_link_counters_t *dspi_link_counters(const dspi_link_t *link)
  * Finding the device
  * ------------------------------------------------------------------------- */
 
+/* The heartbeat and the baud probe: the interface status, the cheapest read
+ * there is. */
+static const dspi_request_t IFACE_STATUS_REQUEST = {
+    .is_get = true, .request = REQ_GET_CTRL_IFACE_STATUS, .length = IFACE_STATUS_BYTES};
+
+bool dspi_link_heartbeat(dspi_link_t *link)
+{
+    return dspi_link_transact(link, &IFACE_STATUS_REQUEST, true).kind == DSPI_REPLY_ANSWERED;
+}
+
 /* Asks for the interface status at `baud`. Any answer at all, even an error
  * status, proves a DSPi is listening at that rate. */
 static bool answers_at(dspi_link_t *link, uint32_t baud)
@@ -371,9 +390,7 @@ static bool answers_at(dspi_link_t *link, uint32_t baud)
     if (!dspi_link_set_baud(link, baud)) {
         return false;
     }
-    const dspi_request_t probe = {
-        .is_get = true, .request = REQ_GET_CTRL_IFACE_STATUS, .length = IFACE_STATUS_BYTES};
-    return dspi_link_transact(link, &probe, false).kind == DSPI_REPLY_ANSWERED;
+    return dspi_link_transact(link, &IFACE_STATUS_REQUEST, false).kind == DSPI_REPLY_ANSWERED;
 }
 
 bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
@@ -387,7 +404,9 @@ bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t 
             return true;
         }
     }
-    dspi_link_set_baud(link, first_baud);
+    /* If the port refuses, the link stays at the last rate tried, and
+     * dspi_link_baud() still reports it truthfully. */
+    (void)dspi_link_set_baud(link, first_baud);
     return false;
 }
 
@@ -411,7 +430,7 @@ bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)
     memset(identity, 0, sizeof(*identity));
 
     /* The serial is raw bytes padded with NULs; stop at the first NUL. */
-    uint8_t serial[SERIAL_BYTES];
+    uint8_t serial[DSPI_SERIAL_MAX_CHARS];
     const int serial_length = read_get(link, REQ_GET_SERIAL, serial, sizeof(serial));
     if (serial_length <= 0) {
         return false;

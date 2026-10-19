@@ -11,7 +11,6 @@
 #include "ota.h"
 
 #include <stdatomic.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,11 +25,6 @@
 #include "psa/crypto.h"
 
 static const char *TAG = "ota";
-
-/* Writing to flash is slow; below the hub task, so the hub keeps answering
- * while an image goes in. */
-#define OTA_TASK_PRIORITY 3
-#define OTA_TASK_STACK_BYTES 4096
 
 /* Chunks plus a begin and an abort. */
 #define OTA_ITEM_QUEUE_DEPTH (OTA_QUEUE_DEPTH + 2)
@@ -83,10 +77,16 @@ static struct {
 static void drop_update(void)
 {
     update_t *update = &ota_state.update;
-    if (update->active) {
-        esp_ota_abort(update->handle);
-        psa_hash_abort(&update->hash);
-        update->active = false;
+    if (!update->active) {
+        return;
+    }
+    update->active = false;
+    const esp_err_t err = esp_ota_abort(update->handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Abandoning the partial image: %s", esp_err_to_name(err));
+    }
+    if (psa_hash_abort(&update->hash) != PSA_SUCCESS) {
+        ESP_LOGW(TAG, "Could not release the image's hash");
     }
 }
 
@@ -127,7 +127,9 @@ static void begin(const ota_item_t *item)
         return;
     }
     if (psa_hash_setup(&update->hash, PSA_ALG_SHA_256) != PSA_SUCCESS) {
-        esp_ota_abort(update->handle);
+        if (esp_ota_abort(update->handle) != ESP_OK) {
+            ESP_LOGW(TAG, "Could not release the update partition");
+        }
         ota_state.handlers.finished(ota_state.handlers.context, false,
                                     "the bridge could not check the update");
         return;
@@ -214,8 +216,13 @@ static void ota_task(void *argument)
 {
     (void)argument;
     for (;;) {
+        /* The task's only job is this queue, so it may wait for ever: there
+         * is nothing else for it to notice while no update is running. A
+         * stalled update is abandoned by the hub (OTA_IDLE_TIMEOUT_MS). */
         ota_item_t item;
-        xQueueReceive(ota_state.queue, &item, portMAX_DELAY);
+        if (xQueueReceive(ota_state.queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
         switch (item.kind) {
         case ITEM_BEGIN:
             begin(&item);
@@ -306,7 +313,9 @@ void ota_abort(void)
     };
     /* If even this cannot be queued, the bumped generation already makes
      * the task drop the chunks still waiting; the next begin ends the rest. */
-    xQueueSend(ota_state.queue, &item, pdMS_TO_TICKS(100));
+    if (xQueueSend(ota_state.queue, &item, pdMS_TO_TICKS(OTA_ABORT_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "The ota queue is full; the abandoned update's chunks are dropped");
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -317,13 +326,20 @@ static void confirm(void *argument)
 {
     (void)argument;
     if (ota_state.healthy()) {
-        esp_ota_mark_app_valid_cancel_rollback();
+        const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not confirm this firmware (%s); the next restart rolls back",
+                     esp_err_to_name(err));
+            return;
+        }
         ESP_LOGI(TAG, "This firmware ran %d s with every task up and is now confirmed",
                  OTA_CONFIRM_AFTER_MS / 1000);
-    } else {
-        ESP_LOGE(TAG, "This firmware is not running properly; returning to the previous one");
-        esp_ota_mark_app_invalid_rollback_and_reboot();
+        return;
     }
+    ESP_LOGE(TAG, "This firmware is not running properly; returning to the previous one");
+    /* Returns only if it could not restart. */
+    const esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    ESP_LOGE(TAG, "Could not return to the previous firmware: %s", esp_err_to_name(err));
 }
 
 void ota_confirm_after_healthy_start(bool (*healthy)(void))
@@ -345,6 +361,9 @@ void ota_confirm_after_healthy_start(bool (*healthy)(void))
         /* Without the timer the image would never be confirmed and the next
          * restart would roll back; confirm now rather than lose it. */
         ESP_LOGW(TAG, "Could not start the confirmation timer; confirming now");
-        esp_ota_mark_app_valid_cancel_rollback();
+        const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Could not confirm this firmware: %s", esp_err_to_name(err));
+        }
     }
 }

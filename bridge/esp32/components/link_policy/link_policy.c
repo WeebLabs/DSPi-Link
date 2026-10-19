@@ -1,11 +1,14 @@
 /*
- * link_policy.c - looks commands up in the generated table. See
- * link_policy.h.
+ * link_policy.c - looks commands up in the generated table. Implements the
+ * authorization of Link spec 6.3 and 9.3: the hub asks it before sending
+ * any CMD to the DSPi. See link_policy.h.
  *
  * Portable: no ESP-IDF headers.
  */
 
 #include "link_policy.h"
+
+#include "link_policy_table.h"
 
 link_class_t link_policy_class(uint8_t request, bool is_get)
 {
@@ -35,5 +38,5 @@ const char *link_policy_role_name(link_role_t role)
     case LINK_ROLE_VIEWER:
         return "viewer";
     }
-    return "viewer";
+    return "unknown";
 }

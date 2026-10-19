@@ -16,6 +16,7 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "http_server.h"
 #include "hub_task.h"
 #include "net.h"
@@ -78,12 +79,25 @@ static void on_button_stage(void *context, button_stage_t stage)
     status_led_show_button(stage);
 }
 
-/* A long press of BOOT does what hub.reset does (bridge spec 12.1). */
+/* A long press of BOOT does what hub.reset does (bridge spec 12.1). The
+ * hub task normally does it, telling every session first; if it cannot
+ * take the request (stopped, or its queue full), the button must still
+ * work, so this erases and restarts by itself. */
 static void on_button_action(void *context, button_action_t action)
 {
     (void)context;
-    hub_task_restart(action == BUTTON_ACTION_FACTORY_RESET ? HUB_RESTART_FACTORY
-                                                           : HUB_RESTART_NETWORK);
+    const bool factory = action == BUTTON_ACTION_FACTORY_RESET;
+    const esp_err_t asked = hub_task_restart(factory ? HUB_RESTART_FACTORY : HUB_RESTART_NETWORK);
+    if (asked == ESP_OK) {
+        return;
+    }
+    ESP_LOGW(TAG, "The hub task could not take the reset (%s); doing it here",
+             esp_err_to_name(asked));
+    const esp_err_t erased = factory ? settings_erase_all() : settings_forget_wifi();
+    if (erased != ESP_OK) {
+        ESP_LOGE(TAG, "Could not erase before restarting: %s", esp_err_to_name(erased));
+    }
+    esp_restart();
 }
 
 /* A new firmware is kept if, after a minute, the hub task and the uart task

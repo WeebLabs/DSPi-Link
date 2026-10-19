@@ -14,9 +14,8 @@
 #include "hub_internal.h"
 
 /* After this many failures in a row a poll reports poll.error and slows to
- * POLL_FAILED_PERIOD_MS until the device recovers (Link spec 8.4). */
+ * HUB_POLL_FAILED_PERIOD_MS until the device recovers (Link spec 8.4). */
 #define POLL_FAILURES_BEFORE_ERROR 3
-#define POLL_FAILED_PERIOD_MS 1000
 
 /* ---------------------------------------------------------------------------
  * Groups
@@ -38,16 +37,48 @@ static hub_poll_group_t *find_group(hub_t *hub, const hub_poll_key_t *key)
     return NULL;
 }
 
+/* Gives a new group the schedule and failure count of the group with the
+ * same key before a rebuild, if there was one. */
+static void inherit_schedule(hub_poll_group_t *group, const hub_poll_group_t *previous,
+                             size_t previous_count)
+{
+    for (size_t old = 0; old < previous_count; old++) {
+        if (same_key(&previous[old].key, &group->key)) {
+            group->next_due_ms = previous[old].next_due_ms;
+            group->failures_in_a_row = previous[old].failures_in_a_row;
+            return;
+        }
+    }
+}
+
+/* Adds one subscriber's poll to the groups: it joins its group, which runs
+ * at the fastest rate any subscriber was granted, or starts a new one. */
+static void join_group(hub_t *hub, const hub_poll_slot_t *poll, const hub_poll_group_t *previous,
+                       size_t previous_count)
+{
+    const uint32_t period_ms = 1000u / poll->hz;
+    hub_poll_group_t *group = find_group(hub, &poll->key);
+    if (group != NULL) {
+        group->period_ms = period_ms < group->period_ms ? period_ms : group->period_ms;
+        return;
+    }
+    if (hub->poll_group_count == HUB_MAX_POLL_GROUPS) {
+        return; /* subscribe refuses before this can happen */
+    }
+    group = &hub->poll_groups[hub->poll_group_count++];
+    *group =
+        (hub_poll_group_t){.key = poll->key, .period_ms = period_ms, .next_due_ms = hub_now(hub)};
+    inherit_schedule(group, previous, previous_count);
+}
+
 /* Rebuilds the groups from every session's slots, keeping each surviving
- * group's schedule. A group runs at the fastest rate any subscriber was
- * granted. */
+ * group's schedule. */
 static void rebuild_groups(hub_t *hub)
 {
     hub_poll_group_t previous[HUB_MAX_POLL_GROUPS];
     const size_t previous_count = hub->poll_group_count;
     memcpy(previous, hub->poll_groups, sizeof(previous));
     hub->poll_group_count = 0;
-    const uint32_t now = hub_now(hub);
 
     for (size_t s = 0; s < hub->config.max_sessions; s++) {
         const hub_session_t *session = &hub->sessions[s];
@@ -55,61 +86,47 @@ static void rebuild_groups(hub_t *hub)
             continue;
         }
         for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-            const hub_poll_slot_t *poll = &session->polls[p];
-            if (!poll->active) {
-                continue;
-            }
-            const uint32_t period_ms = 1000u / poll->hz;
-            hub_poll_group_t *group = find_group(hub, &poll->key);
-            if (group != NULL) {
-                group->period_ms = period_ms < group->period_ms ? period_ms : group->period_ms;
-                continue;
-            }
-            if (hub->poll_group_count == HUB_MAX_POLL_GROUPS) {
-                continue; /* subscribe refuses before this can happen */
-            }
-            group = &hub->poll_groups[hub->poll_group_count++];
-            *group =
-                (hub_poll_group_t){.key = poll->key, .period_ms = period_ms, .next_due_ms = now};
-            for (size_t old = 0; old < previous_count; old++) {
-                if (same_key(&previous[old].key, &poll->key)) {
-                    group->next_due_ms = previous[old].next_due_ms;
-                    group->failures_in_a_row = previous[old].failures_in_a_row;
-                }
+            if (session->polls[p].active) {
+                join_group(hub, &session->polls[p], previous, previous_count);
             }
         }
     }
 }
 
-/* Distinct polls the other sessions already use, plus `extra` new ones. */
-static size_t groups_needed(const hub_t *hub, int slot, const hub_poll_key_t *extra, size_t count)
+/* Adds `key` to the `count` distinct keys in `keys` unless it is already
+ * there. `keys` has room for every key a caller can add. */
+static void add_distinct(hub_poll_key_t *keys, size_t *count, const hub_poll_key_t *key)
 {
-    hub_poll_key_t keys[HUB_MAX_POLL_GROUPS + HUB_POLL_SLOTS];
-    size_t distinct = 0;
+    for (size_t k = 0; k < *count; k++) {
+        if (same_key(&keys[k], key)) {
+            return;
+        }
+    }
+    keys[(*count)++] = *key;
+}
+
+/* The groups needed if session `slot` polls `keys` (`count` of them, which
+ * may repeat) and every other session keeps what it polls. */
+static size_t groups_needed(const hub_t *hub, int slot, const hub_poll_key_t *keys, size_t count)
+{
+    /* Other sessions use at most HUB_MAX_POLL_GROUPS distinct keys, and
+     * one session at most HUB_POLL_SLOTS. */
+    hub_poll_key_t distinct[HUB_MAX_POLL_GROUPS + HUB_POLL_SLOTS];
+    size_t distinct_count = 0;
     for (size_t s = 0; s < hub->config.max_sessions; s++) {
+        if ((int)s == slot || hub->sessions[s].state != HUB_SESSION_OPEN) {
+            continue;
+        }
         for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-            const hub_poll_slot_t *poll = &hub->sessions[s].polls[p];
-            if ((int)s == slot || !poll->active || hub->sessions[s].state != HUB_SESSION_OPEN) {
-                continue;
-            }
-            bool seen = false;
-            for (size_t k = 0; k < distinct; k++) {
-                seen = seen || same_key(&keys[k], &poll->key);
-            }
-            if (!seen && distinct < HUB_MAX_POLL_GROUPS) {
-                keys[distinct++] = poll->key;
+            if (hub->sessions[s].polls[p].active) {
+                add_distinct(distinct, &distinct_count, &hub->sessions[s].polls[p].key);
             }
         }
     }
-    size_t total = distinct;
     for (size_t i = 0; i < count; i++) {
-        bool seen = false;
-        for (size_t k = 0; k < distinct; k++) {
-            seen = seen || same_key(&keys[k], &extra[i]);
-        }
-        total += seen ? 0 : 1;
+        add_distinct(distinct, &distinct_count, &keys[i]);
     }
-    return total;
+    return distinct_count;
 }
 
 /* ---------------------------------------------------------------------------
@@ -157,57 +174,67 @@ static const char *parse_poll(const cJSON *item, poll_request_t *out)
     return NULL;
 }
 
-void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *message)
+/* Reads and checks every entry of `polls` into `requests`, before anything
+ * changes. Returns their number, or 0 after replying with the reason. */
+static int read_requests(hub_t *hub, int slot, int id, const cJSON *polls,
+                         poll_request_t requests[HUB_POLL_SLOTS])
 {
-    hub_session_t *session = &hub->sessions[slot];
-    int handle = -1;
-    hub_json_int(message, "handle", &handle);
-    if (handle != HUB_DEVICE_HANDLE || !hub_device_online(hub)) {
-        hub_reply_error(hub, slot, id, "no_device", NULL);
-        return;
-    }
-    const cJSON *polls = cJSON_GetObjectItemCaseSensitive(message, "polls");
     const int count = cJSON_GetArraySize(polls);
     if (!cJSON_IsArray(polls) || count < 1 || count > HUB_POLL_SLOTS) {
         hub_reply_error(hub, slot, id, "bad_request", "polls must list 1 to 16 polls");
-        return;
+        return 0;
     }
-
-    /* Check everything before changing anything. */
-    poll_request_t requests[HUB_POLL_SLOTS];
     for (int i = 0; i < count; i++) {
         const char *problem = parse_poll(cJSON_GetArrayItem(polls, i), &requests[i]);
         if (problem != NULL) {
             hub_reply_error(hub, slot, id, "bad_request", problem);
-            return;
+            return 0;
         }
         if (link_policy_class(requests[i].key.request, true) != LINK_CLASS_READ) {
             hub_reply_error(hub, slot, id, "denied", "only commands classed read may be polled");
-            return;
+            return 0;
         }
     }
+    return count;
+}
 
-    /* The new slots replace any old ones with the same numbers. */
+/* True when one of the `count` requests takes slot number `p`. */
+static bool slot_is_requested(size_t p, const poll_request_t *requests, int count)
+{
     for (int i = 0; i < count; i++) {
-        session->polls[requests[i].slot].active = false;
+        if ((size_t)requests[i].slot == p) {
+            return true;
+        }
     }
-    hub_poll_key_t all_keys[HUB_MAX_POLL_GROUPS + HUB_POLL_SLOTS];
+    return false;
+}
+
+/* The keys `session` polls once `requests` replace any of its slots with
+ * the same numbers: those it keeps, then the new ones. Returns how many. */
+static size_t keys_after(const hub_session_t *session, const poll_request_t *requests, int count,
+                         hub_poll_key_t keys[2 * HUB_POLL_SLOTS])
+{
     size_t key_count = 0;
     for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-        if (session->polls[p].active) {
-            all_keys[key_count++] = session->polls[p].key;
+        if (session->polls[p].active && !slot_is_requested(p, requests, count)) {
+            keys[key_count++] = session->polls[p].key;
         }
     }
     for (int i = 0; i < count; i++) {
-        all_keys[key_count++] = requests[i].key;
+        keys[key_count++] = requests[i].key;
     }
-    if (groups_needed(hub, slot, all_keys, key_count) > HUB_MAX_POLL_GROUPS) {
-        hub_reply_error(hub, slot, id, "busy", "the bridge is already running its most polls");
-        return;
-    }
+    return key_count;
+}
 
-    /* Grant rates within the session's budget (bridge spec 7.7). Every poll
-     * gets at least 1 Hz. */
+/* Takes the requests into the session's slots, granting rates within its
+ * budget (bridge spec 7.7): every poll gets at least 1 Hz. Each grant is
+ * added to `granted`. */
+static void grant_requests(hub_t *hub, hub_session_t *session, const poll_request_t *requests,
+                           int count, cJSON *granted)
+{
+    for (int i = 0; i < count; i++) {
+        session->polls[requests[i].slot].active = false; /* Replaced */
+    }
     uint32_t used = 0;
     for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
         if (session->polls[p].active) {
@@ -215,8 +242,6 @@ void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *messag
         }
     }
     const uint32_t budget = hub_poll_budget(hub);
-    cJSON *body = cJSON_CreateObject();
-    cJSON *granted = cJSON_AddArrayToObject(body, "granted");
 
     for (int i = 0; i < count; i++) {
         const uint32_t cost = poll_cost_bytes(&requests[i].key);
@@ -237,9 +262,34 @@ void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *messag
         cJSON *grant = cJSON_CreateObject();
         cJSON_AddNumberToObject(grant, "slot", requests[i].slot);
         cJSON_AddNumberToObject(grant, "hz", hz);
-        cJSON_AddItemToArray(granted, grant);
+        hub_json_append(granted, grant);
+    }
+}
+
+void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *message)
+{
+    hub_session_t *session = &hub->sessions[slot];
+    int handle = -1;
+    (void)hub_json_int(message, "handle", &handle); /* Absent: -1, no such device */
+    if (handle != HUB_DEVICE_HANDLE || !hub_device_online(hub)) {
+        hub_reply_error(hub, slot, id, "no_device", NULL);
+        return;
+    }
+    poll_request_t requests[HUB_POLL_SLOTS];
+    const int count =
+        read_requests(hub, slot, id, cJSON_GetObjectItemCaseSensitive(message, "polls"), requests);
+    if (count == 0) {
+        return;
+    }
+    hub_poll_key_t keys[2 * HUB_POLL_SLOTS];
+    const size_t key_count = keys_after(session, requests, count, keys);
+    if (groups_needed(hub, slot, keys, key_count) > HUB_MAX_POLL_GROUPS) {
+        hub_reply_error(hub, slot, id, "busy", "the bridge is already running its most polls");
+        return; /* Nothing has changed */
     }
 
+    cJSON *body = cJSON_CreateObject();
+    grant_requests(hub, session, requests, count, cJSON_AddArrayToObject(body, "granted"));
     rebuild_groups(hub);
     hub_reply_ok(hub, slot, id, body);
 }
@@ -302,7 +352,7 @@ void hub_polls_tick(hub_t *hub)
     }
 
     const uint32_t period = due->failures_in_a_row >= POLL_FAILURES_BEFORE_ERROR
-                                ? POLL_FAILED_PERIOD_MS
+                                ? HUB_POLL_FAILED_PERIOD_MS
                                 : due->period_ms;
     /* Fallen more than a period behind: skip ahead rather than burst. */
     due->next_due_ms = (int32_t)(now - due->next_due_ms) > (int32_t)period
@@ -316,10 +366,9 @@ void hub_polls_tick(hub_t *hub)
         .index = due->key.index,
         .length = due->key.length,
     };
-    /* No retry: the next tick is the retry, and it is never stale. */
-    if (hub_submit_own(hub, HUB_WORK_POLL, &request, false, &due->key)) {
-        hub->poll_pending = true;
-    }
+    /* No retry: the next tick is the retry, and it is never stale. A full
+     * queue is the same: the poll simply runs at its next due time. */
+    hub->poll_pending = hub_submit_own(hub, HUB_WORK_POLL, &request, false, &due->key);
 }
 
 /* Sends poll.error to every session subscribed to `key` (Link spec 8.4). */
@@ -340,7 +389,9 @@ static void report_poll_error(hub_t *hub, const hub_poll_key_t *key, const dspi_
             cJSON_AddNumberToObject(event, "handle", HUB_DEVICE_HANDLE);
             cJSON_AddNumberToObject(event, "slot", (double)p);
             cJSON_AddStringToObject(event, "code", code);
-            hub_send_json(hub, (int)s, event);
+            /* Lost to a full queue, it is missed: the poll's silence says
+             * the same. */
+            (void)hub_send_json(hub, (int)s, event);
         }
     }
 }
@@ -353,8 +404,10 @@ void hub_polls_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_
     }
 
     if (reply->kind != DSPI_REPLY_ANSWERED || reply->status != DSPI_STATUS_OK) {
-        /* Nothing is sent for a failed tick; the third in a row is reported. */
-        if (++group->failures_in_a_row == POLL_FAILURES_BEFORE_ERROR) {
+        /* Nothing is sent for a failed tick; the third in a row is reported
+         * once. The count stops there, so it never wraps round. */
+        if (group->failures_in_a_row < POLL_FAILURES_BEFORE_ERROR &&
+            ++group->failures_in_a_row == POLL_FAILURES_BEFORE_ERROR) {
             report_poll_error(hub, &group->key, reply);
         }
         return;
@@ -384,7 +437,8 @@ void hub_polls_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_
             const size_t length =
                 link_encode_poll(hub->frame, sizeof(hub->frame), session->poll_sequence++,
                                  HUB_DEVICE_HANDLE, (uint8_t)p, reply->payload, reply->length);
-            hub_send_binary(hub, (int)s, hub->frame, length);
+            /* A dropped POLL frame shows as a gap in the poll sequence. */
+            (void)hub_send_binary(hub, (int)s, hub->frame, length);
         }
     }
 }

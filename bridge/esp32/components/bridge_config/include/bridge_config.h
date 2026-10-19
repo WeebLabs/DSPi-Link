@@ -71,7 +71,9 @@
  * (Link spec 7.4). */
 #define LINK_OFFLINE_HANDLE_RETAIN_MS 60000
 
-/* Device names remembered by serial (bridge spec 8.7). */
+/* Device names remembered by serial (bridge spec 8.7). A bridge rarely
+ * meets more than a few DSPis; 8 keeps the saved list to one 648-byte NVS
+ * blob and its two working copies small enough for the hub task's stack. */
 #define LINK_MAX_DEVICE_NAMES 8
 
 /* ---------------------------------------------------------------------------
@@ -99,6 +101,15 @@
 #define AUTH_MAX_FAILURES_PER_ADDRESS 5
 #define AUTH_MAX_FAILURES_ALL_ADDRESSES 20
 #define AUTH_LOCKOUT_MS 60000
+
+/* Room for a paired client's name with its NUL; Console's names fit, and
+ * longer ones are cut rather than refused. */
+#define AUTH_CLIENT_NAME_BYTES 64
+
+/* Addresses whose failures are counted at once. A home network has few
+ * clients; one rotating through more addresses meets the all-addresses
+ * limit instead. */
+#define AUTH_TRACKED_ADDRESSES 8
 
 /* ---------------------------------------------------------------------------
  * DSPi UART link (bridge spec 7; firmware control_interfaces_spec.md)
@@ -137,8 +148,10 @@
  * a wrong baud rate) cannot hold the link forever. */
 #define DSPI_UART_QUARANTINE_MAX_MS 500
 
-/* Timeouts in a row before the UART driver is reinstalled (bridge spec 7.4). */
-#define DSPI_UART_TIMEOUTS_BEFORE_REINSTALL 3
+/* Attempts in a row with no valid answer (timeouts or corrupt answers)
+ * before the UART driver is reinstalled. A receiver stuck on noise produces
+ * corrupt frames, so they count too (bridge spec 7.4). */
+#define DSPI_UART_UNANSWERED_BEFORE_REINSTALL 3
 
 /* Failed requests in a row before the device is reported lost. One timeout
  * never is (Link spec 8.2, bridge spec 7.6). */
@@ -161,8 +174,25 @@
 #define DSPI_UART_DRIVER_RX_BUFFER_BYTES 4096
 
 /* Requests waiting for the uart task: room for every session's in-flight
- * commands (8 sessions x LINK_MAX_INFLIGHT) plus the hub's own polls. */
-#define DSPI_UART_QUEUE_DEPTH 40
+ * commands plus 8 for the hub's own polls and reads. */
+#define DSPI_UART_QUEUE_DEPTH (LINK_MAX_SESSIONS_WITH_PSRAM * LINK_MAX_INFLIGHT + 8)
+
+/* Bytes fetched from the UART driver in one read: enough to take a short
+ * frame in one call without making the link state large. */
+#define DSPI_UART_READ_CHUNK_BYTES 64
+
+/* After a write returns, at most the 128-byte hardware FIFO is left to
+ * send: 11 ms at 115200 baud. Anything longer means the UART is stuck. */
+#define DSPI_UART_TX_DONE_TIMEOUT_MS 50
+
+/* While idle, how long the uart task reads notifications after each listen
+ * slice. Short, so a request queued meanwhile starts within a millisecond. */
+#define DSPI_UART_IDLE_LISTEN_MS 1
+
+/* How long dspi_uart_reconfigure() waits for room in a full queue. The
+ * queue drains in a few hundred milliseconds even when every slot holds a
+ * request; a caller that still finds no room gets ESP_ERR_TIMEOUT. */
+#define DSPI_UART_RECONFIGURE_WAIT_MS 1000
 
 /* ---------------------------------------------------------------------------
  * Tasks (bridge spec 6.2)
@@ -209,6 +239,81 @@
 /* Phones or computers on the setup network at once (bridge spec 9.2). */
 #define SETUP_NETWORK_MAX_STATIONS 4
 
+/* The setup network's channel until the station joins, when it must follow
+ * the station's. Channel 1 is allowed in every country. */
+#define SETUP_NETWORK_CHANNEL 1
+
+/* How often net_machine's timers run; the shortest of them is seconds. */
+#define WIFI_TICK_MS 1000
+
+/* A connection attempt with neither an address nor a failure after this
+ * long is taken as lost and started again. A real one takes under 15 s. */
+#define WIFI_ATTEMPT_TIMEOUT_MS 20000
+
+/* A wrong password usually fails twice in a row; one failure can be a
+ * handshake that merely timed out. */
+#define WIFI_PASSWORD_FAILURES_BEFORE_WRONG 2
+
+/* Scan results fetched from the driver: more networks than a home sees. */
+#define WIFI_SCAN_MAX_RESULTS 32
+
+/* A scan refused while the station is connecting is tried once more after
+ * this long, by which time the attempt has usually finished. */
+#define WIFI_SCAN_RETRY_DELAY_MS 1500
+
+/* How long net_join() and net_finish_setup() wait for room in the event
+ * queue, which the event task drains in milliseconds. */
+#define NET_REQUEST_TIMEOUT_MS 1000
+
+/* DNS-SD TXT entries one advertisement can carry, with room to spare over
+ * those of Link spec 3.1. */
+#define NET_MAX_TXT_ENTRIES 12
+
+/* The setup network's DNS task: small, and below the HTTP servers (5). */
+#define CAPTIVE_DNS_TASK_STACK_BYTES 3072
+#define CAPTIVE_DNS_TASK_PRIORITY 4
+
+/* The DNS task's wait for a question ends this often, so it never blocks
+ * for ever; it simply waits again. */
+#define CAPTIVE_DNS_RECEIVE_TIMEOUT_MS 1000
+
+/* Pause after a socket error, so a broken socket cannot spin the task. */
+#define CAPTIVE_DNS_ERROR_BACKOFF_MS 100
+
+/* ---------------------------------------------------------------------------
+ * HTTP servers and the setup API (bridge spec 8.2, 8.8, 9.3)
+ * ------------------------------------------------------------------------- */
+
+/* Sockets the Link server keeps beside its sessions, so pages and
+ * /dspi/v1/info still load while every session is in use. */
+#define HTTP_LINK_EXTRA_SOCKETS 3
+
+/* Port 80's sockets. A phone's captive-portal browser opens several at once
+ * and keeps them; the least recently used is dropped when all are taken. */
+#define HTTP_SETUP_MAX_SOCKETS 7
+
+/* Each server's task stack; the setup API builds its JSON replies there. */
+#define HTTP_SERVER_STACK_BYTES 6144
+
+/* Most bytes in one batch of a session's frames: one frame of the largest
+ * size, so batching never splits the big frames into extra writes. */
+#define HTTP_BATCH_MAX_BYTES LINK_MAX_FRAME_BYTES
+
+/* Most bytes one run of the send pump writes before the server's task goes
+ * back to reading what clients send. */
+#define HTTP_PUMP_BYTES_PER_RUN 32768
+
+/* A socket close ESP-IDF accepted but has not carried out is asked for
+ * again after this long, so a lost request cannot keep a session open. */
+#define HTTP_CLOSE_RETRY_MS 1000
+
+/* Largest JSON body the setup API reads: an apply request with the longest
+ * network name, password and bridge name, and two PINs, fits in half. */
+#define SETUP_API_MAX_BODY_BYTES 512
+
+/* Networks the setup page lists, strongest first: more than a phone shows. */
+#define SETUP_API_MAX_NETWORKS 24
+
 /* ---------------------------------------------------------------------------
  * BOOT button (bridge spec 12.1)
  * ------------------------------------------------------------------------- */
@@ -240,6 +345,13 @@
  * this out of 255. A plain LED is driven at full brightness. */
 #define LED_WS2812_BRIGHTNESS 48
 
+/* A plain LED's PWM frequency, far above any visible flicker. */
+#define LED_PWM_FREQUENCY_HZ 5000
+
+/* Longest status_led_configure() waits for a frame in progress, which takes
+ * well under a millisecond. */
+#define LED_CONFIGURE_TIMEOUT_MS 100
+
 /* ---------------------------------------------------------------------------
  * Firmware updates (bridge spec 14)
  * ------------------------------------------------------------------------- */
@@ -257,5 +369,103 @@
  * so this bounds the memory an update takes; the client keeps no more than
  * this many chunks unanswered (bridge spec 14.2). */
 #define OTA_QUEUE_DEPTH 2
+
+/* Writing flash is slow, so the ota task runs below the hub task, which
+ * keeps answering while an image goes in. */
+#define OTA_TASK_PRIORITY 3
+#define OTA_TASK_STACK_BYTES 4096
+
+/* How long ota_abort() waits for room in the ota task's queue. A chunk takes
+ * tens of milliseconds to write, so room comes quickly. */
+#define OTA_ABORT_TIMEOUT_MS 100
+
+/* ---------------------------------------------------------------------------
+ * The hub and the hub task (bridge spec 6.2 and 8)
+ * ------------------------------------------------------------------------- */
+
+/* How often hub_tick() runs: a fifth of the fastest poll period (50 ms at
+ * LINK_POLL_MAX_HZ), so polls go out close to their schedule. */
+#define HUB_TICK_MS 10
+
+/* Distinct polls across all sessions; identical polls share one. The poll
+ * budget runs out long before this many different polls are useful. */
+#define HUB_MAX_POLL_GROUPS 32
+
+/* Recent SETs remembered for origin attribution (Link spec 8.3). When full,
+ * the oldest, the least likely to match, is forgotten. */
+#define HUB_ORIGIN_QUEUE_ENTRIES 16
+
+/* After poll.error a failing poll is retried this often until it answers
+ * again; Link spec 8.4 asks only for "a reduced rate". */
+#define HUB_POLL_FAILED_PERIOD_MS 1000
+
+/* hub.stats' avg_rtt_ms is a moving average in which each new round trip
+ * counts 1/HUB_RTT_AVERAGE_WEIGHT: smooth, yet it follows a change within a
+ * few dozen commands. */
+#define HUB_RTT_AVERAGE_WEIGHT 8
+
+/* A request whose answer has not come this long after it became the oldest
+ * is taken as lost on the way and finishes as a timeout. Longer than the
+ * uart task's longest pass (DSPI_UART_ALIVE_WITHIN_MS), so a slow answer
+ * is never given up. */
+#define HUB_REPLY_LOST_AFTER_MS (DSPI_UART_ALIVE_WITHIN_MS + 5000)
+
+/* The hub task's stack holds one event and the hub's JSON work; the hub
+ * itself is static. It runs below the uart task. */
+#define HUB_TASK_STACK_BYTES 6144
+#define HUB_TASK_PRIORITY 5
+
+/* Events waiting for the hub task. The last HUB_EVENT_LIFECYCLE_RESERVE
+ * places are kept for events that must not be lost (sessions opening and
+ * closing, the device coming and going, update progress, a restart): two
+ * per session, two for the device, OTA_QUEUE_DEPTH + 1 for an update, one
+ * restart, and one for each of the six tasks that post, which can race for
+ * the last ordinary place. */
+#define HUB_EVENT_QUEUE_DEPTH 64
+#define HUB_EVENT_LIFECYCLE_RESERVE                                                                \
+    (2 * LINK_MAX_SESSIONS_WITH_PSRAM + 2 + OTA_QUEUE_DEPTH + 1 + 1 + 6)
+
+/* How long a task waits for room in the hub task's queue before it drops
+ * an ordinary event (a message, an answer, a notification) and logs it. A
+ * lifecycle event waits longer, since losing one leaves a slot or the
+ * device stuck. */
+#define HUB_EVENT_POST_TIMEOUT_MS 1000
+#define HUB_LIFECYCLE_POST_TIMEOUT_MS 5000
+
+/* Most another task waits to queue a call on the hub task (hub_task_*()). */
+#define HUB_CALL_TIMEOUT_MS 5000
+
+/* Most a task waits for the lock on the info document and the hub's name,
+ * which is held only for a copy. */
+#define HUB_INFO_LOCK_TIMEOUT_MS 1000
+
+/* Buffers carrying answers and notifications from the uart task to the hub
+ * task, so that path never allocates. Small ones take every notification
+ * and non-bulk answer; large ones the bulk reads, which the UART carries
+ * one at a time. An answer that finds none free arrives as a timeout, a
+ * notification is dropped; both are logged. */
+#define HUB_EVENT_SMALL_BUFFERS 32
+#define HUB_EVENT_SMALL_BUFFER_BYTES DSPI_UART_MAX_GET_REPLY_BYTES
+#define HUB_EVENT_LARGE_BUFFERS 2
+#define HUB_EVENT_LARGE_BUFFER_BYTES LINK_MAX_PAYLOAD_BYTES
+
+/* A restart waits this long so the replies and close frames go out first. */
+#define HUB_RESTART_DELAY_MS 500
+
+/* The hub task counts as alive if its loop has run this recently. It runs
+ * every HUB_TICK_MS; this allows for a long burst of work such as a PIN
+ * hash (bridge spec 14.2). */
+#define HUB_ALIVE_WITHIN_MS 2000
+
+/* hub.wifi.scan runs in its own short-lived task, one scan at a time, so
+ * the hub task never waits seconds for it. The list of networks found is
+ * cut to WIFI_SCAN_MAX_NETWORKS, more than a page shows usefully. */
+#define WIFI_SCAN_TASK_STACK_BYTES 4096
+#define WIFI_SCAN_TASK_PRIORITY 2
+#define WIFI_SCAN_MAX_NETWORKS 24
+
+/* Clock readings before this (2024-01-01) mean SNTP has not set the time
+ * yet, so paired clients' times are left out (bridge spec 8.9). */
+#define CLOCK_SET_AFTER_UNIX_S 1704067200
 
 #endif /* BRIDGE_CONFIG_H */

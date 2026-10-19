@@ -1,3 +1,5 @@
+/* The control-message codec (Link spec 7) against fixtures/messages. */
+
 import { describe, expect, it } from "vitest";
 import {
   type HelloHubMessage,

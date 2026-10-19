@@ -1,5 +1,5 @@
 /*
- * Control-plane messages, DSPi Link protocol spec section 7.
+ * Control-plane messages: the types and codec for Link spec 7 (7.1 to 7.14).
  *
  * Every text frame is one JSON object with a string `t`. Requests carry an
  * integer `id`; replies echo it as `t: "ok"` or `t: "err"`; events have no id.
@@ -7,8 +7,8 @@
  * wire, so the types double as the wire contract.
  *
  * Unknown fields are preserved on decode and unknown `t` values decode to a
- * bare envelope, because spec 10.3 requires both sides to ignore rather than
- * reject what they do not recognise.
+ * bare envelope, because Link spec 10, rule 3, requires both sides to ignore
+ * rather than reject what they do not recognise.
  */
 
 export interface ProtoVersion {
@@ -104,12 +104,22 @@ export interface HelloHubMessage extends Envelope {
 
 export type HelloMessage = HelloClientMessage | HelloHubMessage;
 
-/** A hub hello carries `hub`; a client hello carries `client`. */
-export function isHubHello(msg: HelloMessage): msg is HelloHubMessage {
-  return (msg as HelloHubMessage).hub !== undefined;
+/**
+ * Tells the two hellos apart: a hub hello carries `hub`, a client hello `client`.
+ *
+ * @param message A decoded hello.
+ * @returns True for the hub's hello.
+ */
+export function isHubHello(message: HelloMessage): message is HelloHubMessage {
+  return (message as HelloHubMessage).hub !== undefined;
 }
 
-/** The hello's PIN source, with the spec's default for a hub that omits it. */
+/**
+ * The hello's PIN source, with the spec's default for a hub that omits it.
+ *
+ * @param hello The hub's hello.
+ * @returns "fixed" or "window" (Link spec 6.2).
+ */
 export function pinSourceOf(hello: HelloHubMessage): PinSource {
   return hello.pin_source ?? "window";
 }
@@ -141,7 +151,7 @@ export interface OkMessage extends Envelope {
   granted?: PollGrant[];
   // auth.list
   clients?: AuthClientInfo[];
-  // fw.install
+  // fw.install / hub.update
   xfer?: number;
   // hub.stats
   sessions?: number;
@@ -511,31 +521,42 @@ export type LinkMessage =
   | HubUpdateDoneMessage
   | UnknownMessage;
 
+/** Thrown by decode for a text frame that is not a control message at all. */
 export class LinkMessageError extends Error {
+  /** @param message What is wrong with the text frame. */
   constructor(message: string) {
     super(message);
     this.name = "LinkMessageError";
   }
 }
 
-/** Serialise a control message to the text frame that goes on the socket. */
-export function encode(msg: LinkMessage): string {
-  return JSON.stringify(msg);
+/**
+ * Serialises a control message to the text frame that goes on the socket.
+ *
+ * @param message The message, with its `id` already set for a request.
+ * @returns The JSON text.
+ */
+export function encode(message: LinkMessage): string {
+  return JSON.stringify(message);
 }
 
 /**
- * Parse a text frame. Unknown `t` values come back as UnknownMessage rather
+ * Parses a text frame. Unknown `t` values come back as UnknownMessage rather
  * than throwing; unknown fields on known types are carried through untouched,
  * so decode/encode is lossless and a newer hub's extra keys survive a relay.
  * Only malformed JSON, a non-object, or a missing/non-string `t` is an error.
+ *
+ * @param json The frame's text, or a value already parsed from JSON.
+ * @returns The message.
+ * @throws LinkMessageError when it is not a control message.
  */
-export function decode(json: string | unknown): LinkMessage {
+export function decode(json: unknown): LinkMessage {
   let parsed: unknown = json;
   if (typeof json === "string") {
     try {
       parsed = JSON.parse(json);
-    } catch (e) {
-      throw new LinkMessageError(`not JSON: ${(e as Error).message}`);
+    } catch (error) {
+      throw new LinkMessageError(`not JSON: ${(error as Error).message}`);
     }
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -548,10 +569,52 @@ export function decode(json: string | unknown): LinkMessage {
   return { ...obj } as LinkMessage;
 }
 
-export function isOk(msg: LinkMessage): msg is OkMessage {
-  return msg.t === "ok";
+/**
+ * @param message A decoded message.
+ * @returns True for an `ok` reply.
+ */
+export function isOk(message: LinkMessage): message is OkMessage {
+  return message.t === "ok";
 }
 
-export function isErr(msg: LinkMessage): msg is ErrMessage {
-  return msg.t === "err";
+/**
+ * @param message A decoded message.
+ * @returns True for an `err` reply.
+ */
+export function isErr(message: LinkMessage): message is ErrMessage {
+  return message.t === "err";
+}
+
+/**
+ * The messages a hub sends a client, by type. Because LinkMessage includes
+ * UnknownMessage, whose `t` is any string, a `switch` on `t` cannot narrow;
+ * isMessage does, for these.
+ */
+export interface HubMessageByType {
+  hello: HelloHubMessage;
+  ok: OkMessage;
+  err: ErrMessage;
+  "device.added": DeviceAddedMessage;
+  "device.changed": DeviceChangedMessage;
+  "device.removed": DeviceRemovedMessage;
+  "poll.error": PollErrorMessage;
+  "fw.progress": FwProgressMessage;
+  "fw.done": FwDoneMessage;
+  "hub.config.changed": HubConfigChangedMessage;
+  "hub.update.done": HubUpdateDoneMessage;
+}
+
+/**
+ * Narrows a decoded message by its type. It checks only `t`: the fields are
+ * as the hub sent them, so optional ones may still be missing.
+ *
+ * @param message A decoded message.
+ * @param type The `t` to test for.
+ * @returns True when `message.t` is `type`.
+ */
+export function isMessage<K extends keyof HubMessageByType>(
+  message: LinkMessage,
+  type: K,
+): message is HubMessageByType[K] {
+  return message.t === type;
 }

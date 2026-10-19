@@ -1,14 +1,14 @@
+/* The firmware payload decoders and base64, against payloads captured from a real DSPi. */
+
 import { describe, expect, it } from "vitest";
 import {
   BULK_GLOBAL_OFFSET,
   BULK_MASTER_VOLUME_OFFSET,
   BULK_MIN_WIRE_VERSION,
-  BULK_PARAMS_SIZE,
+  BULK_PARAMS_BYTES,
   BULK_WIRE_VERSION,
   NotifyEvent,
   ParamSource,
-  base64ToBytes,
-  bytesToBase64,
   decodeBulkHeader,
   decodeNotifyPacket,
   decodePlatform,
@@ -18,6 +18,7 @@ import {
   readMasterVolumeDb,
   statusFrameLength,
 } from "../src/decoders.js";
+import { base64ToBytes, bytesToBase64 } from "../src/base64.js";
 import { decodeFrame } from "../src/frames.js";
 import { fixtureBytes, fixtureJson, toHex } from "./fixtures.js";
 
@@ -53,7 +54,7 @@ const platform = fixtureBytes("device", "platform.bin");
 describe("bulk blob from a real board", () => {
   it("is the size the capture recorded", () => {
     expect(bulk.length).toBe(capture.bulk.size);
-    expect(bulk.length).toBe(BULK_PARAMS_SIZE);
+    expect(bulk.length).toBe(BULK_PARAMS_BYTES);
   });
 
   it("decodes the header to the captured values", () => {

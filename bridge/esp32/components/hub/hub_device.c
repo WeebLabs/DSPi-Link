@@ -35,8 +35,12 @@
 #define BULK_CHANNELS_OFFSET 2
 #define BULK_INPUTS_OFFSET 4
 
-/* lock.acquire without a timeout gets the longest one allowed. */
+/* lock.acquire without a timeout gets the longest one allowed (Link spec
+ * 7.7). */
 #define LOCK_MAX_TIMEOUT_MS 60000
+
+/* "255.255.255" and its NUL. */
+#define FIRMWARE_VERSION_TEXT_BYTES 12
 
 /* ---------------------------------------------------------------------------
  * The device object and its events (Link spec 7.4)
@@ -62,10 +66,13 @@ static void format_firmware_version(const dspi_identity_t *identity, char *out, 
 cJSON *hub_device_json(const hub_t *hub)
 {
     const hub_device_t *device = &hub->device;
-    char firmware[16];
+    char firmware[FIRMWARE_VERSION_TEXT_BYTES];
     format_firmware_version(&device->identity, firmware, sizeof(firmware));
 
     cJSON *object = cJSON_CreateObject();
+    if (object == NULL) {
+        return NULL;
+    }
     cJSON_AddNumberToObject(object, "handle", HUB_DEVICE_HANDLE);
     cJSON_AddStringToObject(object, "serial", device->identity.serial);
     cJSON_AddStringToObject(object, "name", device->name);
@@ -93,8 +100,11 @@ cJSON *hub_device_json(const hub_t *hub)
 static void broadcast_device(hub_t *hub, const char *event)
 {
     cJSON *message = cJSON_CreateObject();
+    if (message == NULL) {
+        return;
+    }
     cJSON_AddStringToObject(message, "t", event);
-    cJSON_AddItemToObject(message, "device", hub_device_json(hub));
+    hub_json_add(message, "device", hub_device_json(hub));
     hub_broadcast_json(hub, message);
 }
 
@@ -184,10 +194,14 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
     if (baud != hub->config.settings.uart_baud) {
         /* Detection found the DSPi at another rate: keep it, so the next
          * start begins there, and show it to the settings page (bridge spec
-         * 8.11). The UART already runs at this rate and stays as it is. */
+         * 8.11). The UART already runs at this rate and stays as it is. If
+         * it cannot be saved (the I/O logs why), the next start simply
+         * detects it again. */
         bridge_settings_t settings = hub->config.settings;
         settings.uart_baud = baud;
-        hub_apply_settings(hub, &settings);
+        if (hub_apply_settings(hub, &settings)) {
+            hub_broadcast_config(hub);
+        }
     }
     hub->snapshot.valid = false;
     start_snapshot_refresh(hub);
@@ -319,6 +333,12 @@ static void send_snapshot(hub_t *hub, int slot, int id)
     link_base64_encode(snapshot->status, snapshot->status_length, status_b64);
 
     cJSON *body = cJSON_CreateObject();
+    if (body == NULL) {
+        free(bulk_b64);
+        free(status_b64);
+        hub_reply_error(hub, slot, id, "internal", "out of memory");
+        return;
+    }
     cJSON_AddNumberToObject(body, "handle", HUB_DEVICE_HANDLE);
     if (hub->device.header_known) {
         cJSON_AddNumberToObject(body, "wire_version", hub->device.wire_version);
@@ -331,27 +351,42 @@ static void send_snapshot(hub_t *hub, int slot, int id)
     hub_reply_ok(hub, slot, id, body);
 }
 
+/* Adds `slot`'s request to those waiting for the snapshot. A session has
+ * at most one place, so one client cannot crowd out the rest: a second
+ * request while its first waits is answered `busy`. False then. */
+static bool add_snapshot_waiter(hub_t *hub, int slot, int id)
+{
+    hub_snapshot_t *snapshot = &hub->snapshot;
+    for (size_t i = 0; i < snapshot->waiter_count; i++) {
+        if (snapshot->waiters[i].slot == slot) {
+            hub_reply_error(hub, slot, id, "busy", "this session already waits for a snapshot");
+            return false;
+        }
+    }
+    snapshot->waiters[snapshot->waiter_count++] = (hub_snapshot_waiter_t){
+        .slot = slot, .session_id = hub->sessions[slot].id, .request_id = id};
+    return true;
+}
+
 void hub_handle_device_snapshot(hub_t *hub, int slot, int id, const cJSON *message)
 {
     int handle = -1;
-    hub_json_int(message, "handle", &handle);
+    (void)hub_json_int(message, "handle", &handle); /* Absent: -1, no such device */
     if (handle != HUB_DEVICE_HANDLE || !hub_device_online(hub)) {
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;
     }
 
+    /* While a read is under way `stale` is already cleared, but the cache
+     * still holds the old blob: wait for the read like the first asker. */
     hub_snapshot_t *snapshot = &hub->snapshot;
-    if (snapshot->valid && !snapshot->stale) {
+    if (snapshot->valid && !snapshot->stale && !snapshot->refreshing) {
         send_snapshot(hub, slot, id);
         return;
     }
-    if (snapshot->waiter_count == HUB_MAX_SESSIONS) {
-        hub_reply_error(hub, slot, id, "busy", NULL);
-        return;
+    if (add_snapshot_waiter(hub, slot, id)) { /* Room for one per session */
+        start_snapshot_refresh(hub);
     }
-    snapshot->waiters[snapshot->waiter_count++] = (hub_snapshot_waiter_t){
-        .slot = slot, .session_id = hub->sessions[slot].id, .request_id = id};
-    start_snapshot_refresh(hub);
 }
 
 /* Reads the bulk header for the device object. The first time, the device
@@ -429,7 +464,7 @@ void hub_handle_device_list(hub_t *hub, int slot, int id, const cJSON *message)
     cJSON *body = cJSON_CreateObject();
     cJSON *devices = cJSON_AddArrayToObject(body, "devices");
     if (hub->device.state != HUB_DEVICE_ABSENT) {
-        cJSON_AddItemToArray(devices, hub_device_json(hub));
+        hub_json_append(devices, hub_device_json(hub));
     }
     hub_reply_ok(hub, slot, id, body);
 }
@@ -437,7 +472,7 @@ void hub_handle_device_list(hub_t *hub, int slot, int id, const cJSON *message)
 void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message)
 {
     int handle = -1;
-    hub_json_int(message, "handle", &handle);
+    (void)hub_json_int(message, "handle", &handle); /* Absent: -1, no such device */
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
 
     if (handle != HUB_DEVICE_HANDLE || hub->device.state == HUB_DEVICE_ABSENT) {
@@ -448,8 +483,12 @@ void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message
         hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
         return;
     }
+    if (!hub->io.save_device_name(hub->io.context, hub->device.identity.serial,
+                                  name->valuestring)) {
+        hub_reply_error(hub, slot, id, "internal", "the name could not be saved");
+        return;
+    }
     snprintf(hub->device.name, sizeof(hub->device.name), "%s", name->valuestring);
-    hub->io.save_device_name(hub->io.context, hub->device.identity.serial, hub->device.name);
     hub_reply_ok(hub, slot, id, NULL);
     broadcast_device(hub, "device.changed");
     hub->io.advertise(hub->io.context);
@@ -463,7 +502,7 @@ void hub_handle_lock_acquire(hub_t *hub, int slot, int id, const cJSON *message)
 {
     const hub_session_t *session = &hub->sessions[slot];
     int handle = -1;
-    hub_json_int(message, "handle", &handle);
+    (void)hub_json_int(message, "handle", &handle); /* Absent: -1, no such device */
     if (handle != HUB_DEVICE_HANDLE || !hub_device_online(hub)) {
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;
@@ -513,7 +552,6 @@ void hub_handle_lock_release(hub_t *hub, int slot, int id, const cJSON *message)
 
 void hub_device_session_closed(hub_t *hub, int slot, uint16_t session_id)
 {
-    /* Forget its snapshot requests. */
     hub_snapshot_t *snapshot = &hub->snapshot;
     size_t kept = 0;
     for (size_t i = 0; i < snapshot->waiter_count; i++) {

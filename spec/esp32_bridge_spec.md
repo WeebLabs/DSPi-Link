@@ -272,15 +272,28 @@ session slots, the cached `/dspi/v1/info` document, and the Wi-Fi status.
   notifications between requests and probes for the device.
 - **The HTTP task belongs to ESP-IDF.** Handlers on it only copy input and
   post events to the hub task; they never touch hub state. Outbound frames
-  go through `httpd_ws_send_data_async`, whose completion callback frees
-  each frame and counts it off the session's queue (section 8.2).
+  wait in each session's queue, and one job on the HTTP task sends them in
+  batches without blocking (section 8.2). Closing a socket also goes
+  through that task; a request that finds ESP-IDF's small work queue full
+  is kept and tried again on the next hub tick, so no close is ever lost.
 - **A session's slot is reused only once the hub has seen it close.** The
   HTTP server marks a slot closing when its socket closes, and frees it
   when the hub task has handled the close. A new connection can therefore
   never receive frames the hub meant for the old one.
 - **Wi-Fi, the button and the LED** run from ESP-IDF event callbacks and a
   timer. They post events to the hub task or call the `net` module's
-  functions, which are safe to call from any task.
+  functions, which are safe to call from any task. The button never waits
+  for the hub task: if the hub task cannot take a reset at once, the button
+  erases and restarts by itself, without telling the sessions.
+- **Events carry no heap memory.** Answers and notifications reach the hub
+  task in buffers from a fixed pool. A notification that finds the pool
+  empty is dropped (and the sessions get RESYNC); an answer that finds it
+  empty still reaches its client, as a timeout. Part of the hub task's
+  queue is kept for the events that must never be lost: sessions opening
+  and closing, the DSPi appearing and going, update progress and restart.
+- **No answer holds the queue.** If the uart task's answer to the oldest
+  request has not arrived well after the uart task's own timeouts, the hub
+  finishes that request as a timeout and ignores a late answer.
 
 ### 6.3 Repository layout
 
@@ -343,9 +356,9 @@ the same source compiles into the firmware and into the host tests.
 | `dspi_uart` | The link engine (`dspi_link.c`, portable): one request at a time, the idle gap, retries, recovery after timeouts, baud detection and the device's identity. The uart task (`dspi_uart.c`) runs it on the real UART and reports the device found or lost. | `dspi_frame` |
 | `hub` | The hub state machine (portable): sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration, the hub's own update, with JSON through cJSON. The hub task (`hub_task.c`) runs it and connects it to the HTTP server, the uart task, the ota task, flash and mDNS. | `link_codec`, `link_policy`, `hub_auth`, cJSON |
 | `hub_auth` | PIN hashing and checking, token creation and hashing, rate limits. | mbedtls (behind an interface) |
-| `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, and hands frames to its caller through callbacks, so it does not depend on the hub. | `web_assets`, `setup_api` |
-| `setup_api` | The setup network's endpoints, answering only on the setup network. | `net`, `settings`, `hub` |
-| `net` | Wi-Fi states (section 9.1), setup network, captive DNS, mDNS records, SNTP. | `settings`, `board` |
+| `http_server` | Starts both HTTP servers, upgrades WebSockets, serves static files, and hands frames and setup requests to its caller through callbacks, so it depends on neither the hub nor the setup API. | `web_assets`, `net` |
+| `setup_api` | The setup network's endpoints, answering only on the setup network. | `net`, `settings`, `hub`, `hub_auth`, `dspi_uart`, `board` |
+| `net` | Wi-Fi states (section 9.1), setup network, captive DNS, mDNS records, SNTP. | `settings` |
 | `settings` | Reads and writes every saved value through typed functions, with defaults and a schema version. | `nvs_flash` |
 | `board` | The pin table for the chip the image was built for, and PSRAM detection. | `soc` |
 | `ota` | Writes an image in chunks on its own task, verifies it, switches partitions and confirms a new image after a healthy start. | `app_update` |
@@ -437,7 +450,9 @@ cannot know whether they ran. `BUSY` (0x01) and `BULK_LOCKED` (0x04) are
 passed to the client unchanged, since the firmware has already retried for
 50 ms. When the last attempt gets no answer, the client receives Link
 status `0x82 TIMEOUT`; when it gets an answer that fails its CRC, status
-`0x05 CRC_ERROR`. Every DSPi status is passed on unchanged.
+`0x05 CRC_ERROR`. A damaged frame counts as that answer only if its header
+says it is the kind awaited; a damaged notification followed by silence
+gives `TIMEOUT`. Every DSPi status is passed on unchanged.
 
 ### 7.4 Recovery after a timeout
 
@@ -452,8 +467,10 @@ request, because responses carry no request id. Two rules prevent this:
   since the firmware never returns more. Anything else is a late answer and
   is dropped.
 
-After 3 timeouts in a row the uart task also reinstalls the UART driver,
-which clears a receiver stuck on noise.
+After 3 requests in a row without a valid answer, whether they timed out
+or got a damaged answer, the uart task also reinstalls the UART driver,
+which clears a receiver stuck on noise. Damaged answers count as well,
+because noise is exactly what a stuck receiver produces.
 
 ### 7.5 Finding the baud rate
 
@@ -521,7 +538,12 @@ notifications.
 ### 8.2 Sessions
 
 - The bridge accepts up to 4 sessions, or 8 on a board with PSRAM. Beyond
-  that it answers the WebSocket upgrade with HTTP 503.
+  that it answers the WebSocket upgrade with HTTP 503. A closed session
+  keeps its place for the few tens of milliseconds the hub takes to see it
+  close (section 6.2), so a client that reconnects at once may briefly get
+  503; Link's reconnect backoff covers this.
+- An upgrade that does not ask for the `dspi-link-1` sub-protocol is
+  refused with HTTP 400 (Link spec 4).
 - Keepalive and close codes follow Link spec 4 and 5.
 - Each session has an outbound queue of 32 frames. One job on the HTTP
   server's task sends what waits: each session's frames encoded into one
@@ -596,7 +618,8 @@ found, which gives `wire_version` for the device object.
   "chip": "esp32s3", "psram": true, "heap_free": 182340, "uptime_s": 8812,
   "wifi": {"ssid": "Home", "rssi": -50, "ip": "192.168.1.40", "mac": "a0:b7:65:12:3f:2a"},
   "uart": {"baud": 1000000, "tx_pin": 17, "rx_pin": 18, "live": true,
-           "notify_enable": true, "timeouts": 0, "crc_errors": 0, "retries": 0}
+           "notify_enable": true, "requests": 52113, "timeouts": 0, "crc_errors": 0,
+           "retries": 0}
 }
 ```
 
@@ -643,6 +666,14 @@ The bridge implements Link spec 7.10 to 7.14:
   setup network. With `factory` it erases every NVS namespace the bridge
   owns and restarts into first-time setup with a new hub id.
 - `hub.update` is described in section 14.
+- A change the bridge cannot save or apply (`hub.config.set`, `hub.rename`,
+  `device.rename`) is answered `internal`, and the settings stay as they
+  were. `hub.wifi.scan` is answered `busy` while another scan runs, and
+  `internal` if a scan cannot start. `auth.pair`, `auth.token` and
+  `hub.auth.set` are answered `internal` if the bridge's cryptography fails,
+  and such a failure never counts against the client or changes the PIN.
+- `device.snapshot` keeps one waiting request per session; a second one
+  while the first waits is answered `busy`.
 
 ### 8.11 Configuration keys
 
@@ -700,7 +731,9 @@ refusal can be a handshake that merely timed out), or when 30 s pass
 without an address; the bridge then returns to the network it had, if any.
 
 In `CONNECTING` and `FALLBACK` the station retries with growing delays (5 s,
-10 s, 20 s, then every 30 s). The setup network must share the station's
+10 s, 20 s, then every 30 s). A once-a-second check also schedules a retry
+if an attempt has reported nothing for 20 s, so a lost driver event can
+never leave the station idle. The setup network must share the station's
 channel, so its channel may change while the station searches; phones
 rejoin by themselves.
 
@@ -764,9 +797,12 @@ POST /setup/v1/finish
   out, the PIN stays as it is, which is how the page keeps an existing PIN.
 - `current_pin` is required by `apply` and `finish` when the bridge has a
   PIN. After an `apply` that changed the PIN, `finish` takes the new one.
-- Errors are `4xx` with `{"error": "<code>", "msg": "<plain sentence>"}`.
-  The codes are `bad_request`, `pin_required`, `wrong_pin`, `rate_limited`
-  and `busy`.
+- Errors come with `{"error": "<code>", "msg": "<plain sentence>"}`. The
+  codes are `bad_request` (400), `pin_required` and `wrong_pin` (403),
+  `rate_limited` (429), and `busy` (503, when the bridge could not carry out
+  the request just then; the page may try again).
+- A password is empty for an open network, or 8 to 63 characters, or
+  exactly 64 hex digits, as WPA2 allows.
 
 ---
 
@@ -882,6 +918,10 @@ default.
 - The bridge stores Wi-Fi credentials itself and keeps ESP-IDF's own copy in
   RAM only (`WIFI_STORAGE_RAM`), so forgetting a network is one explicit
   erase.
+- Every key is written before `schema`, so a power cut part way through
+  leaves no schema and the next start begins again from defaults. A key
+  that is missing or invalid at start is saved back with its default, so a
+  generated value such as the hub id is never generated twice.
 - `schema` starts at 1. A firmware that finds an older schema migrates it
   step by step; one that finds a newer schema (after a downgrade) resets the
   `bridge` namespace to defaults and keeps the others.
@@ -908,7 +948,10 @@ the README mentions.
 The action happens on release, and the LED always shows which action a
 release would trigger at that moment. Holding for more than 30 s cancels
 both, for a user who changes their mind. The settings page's Maintenance
-section offers both actions too.
+section offers both actions too. A release normally goes through the hub,
+which closes every session with code 4003 first; if the hub cannot take it
+at once, the button erases and restarts by itself, so a reset works even
+when the rest of the firmware is stuck.
 
 The pin is read every 20 ms, and a press or release counts only after three
 readings in a row agree, which hides contact bounce. The button counts only
@@ -1042,9 +1085,10 @@ C and TypeScript alike.
   parameters, what it returns, and who may call it (which task).
 - Comments explain why, not what. A comment that restates the code is
   removed.
-- Names are whole words, with a component prefix for public symbols
-  (`dspi_uart_send`, `hub_session_close`). Constants carry their unit
-  (`UART_IDLE_GAP_MS`, `MAX_FRAME_BYTES`).
+- Names are whole words, with a prefix for public symbols that names the
+  component or its subject (`dspi_uart_send`, `hub_session_close`; the
+  DSPi's frames use `dspi_`, Link's frames `link_`). Constants carry their
+  unit (`UART_IDLE_GAP_MS`, `MAX_FRAME_BYTES`).
 - Functions stay short (a guideline of 60 lines), return early on errors and
   avoid nesting deeper than three levels.
 - Every tunable number is a named constant in `bridge_config`, with a

@@ -22,11 +22,8 @@ typedef struct {
     bool immutable;   /* Named by content hash, so safe to cache for ever */
 } web_asset_t;
 
-/* The generated table (web_assets_data.c). */
-extern const web_asset_t WEB_ASSETS[];
-extern const size_t WEB_ASSET_COUNT;
-
-/* The asset at `path`, or NULL. */
+/* The asset at `path` ("/index.html"), or NULL. The table is constant,
+ * so any task may call this. */
 const web_asset_t *web_assets_find(const char *path);
 
 #endif /* WEB_ASSETS_H */

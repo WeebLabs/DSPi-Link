@@ -1,5 +1,7 @@
 /*
- * status_led.c - drives the optional status LED. See status_led.h.
+ * status_led.c - drives the optional status LED (bridge spec 13). See
+ * status_led.h. led_pattern.c decides the colour; this file redraws it on a
+ * timer through LEDC for a plain LED or led_strip for a WS2812.
  */
 
 #include "status_led.h"
@@ -18,12 +20,11 @@
 
 static const char *TAG = "status_led";
 
-/* A plain LED's brightness comes from LEDC: 8-bit duty at 5 kHz, far above
- * any visible flicker. */
+/* A plain LED's brightness comes from LEDC: 8-bit duty at
+ * LED_PWM_FREQUENCY_HZ. */
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
 #define LEDC_TIMER LEDC_TIMER_0
 #define LEDC_CHANNEL LEDC_CHANNEL_0
-#define LEDC_FREQUENCY_HZ 5000
 
 /* The RMT clock for the WS2812's 1.25 µs bits. */
 #define WS2812_RESOLUTION_HZ (10 * 1000 * 1000)
@@ -36,6 +37,7 @@ static struct {
     led_pattern_t pattern;
     led_colour_t shown;
     bool shown_valid; /* False after a change, so the next frame is drawn */
+    bool draw_failed; /* A draw has failed since the driver started; logged once */
     status_led_read_inputs_t read_inputs;
     atomic_int button; /* A button_stage_t */
     esp_timer_handle_t timer;
@@ -45,19 +47,29 @@ static struct {
  * Drivers. Called with the lock held.
  * ------------------------------------------------------------------------- */
 
+/* Logs a failure that leaves the LED dark or stuck but harms nothing else. */
+static void warn_on_error(esp_err_t err, const char *what)
+{
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s failed: %s", what, esp_err_to_name(err));
+    }
+}
+
 static void stop_driver(void)
 {
     switch (led_state.type) {
     case SETTINGS_LED_GPIO:
     case SETTINGS_LED_GPIO_ACTIVE_LOW:
-        ledc_stop(LEDC_MODE, LEDC_CHANNEL, led_state.type == SETTINGS_LED_GPIO_ACTIVE_LOW);
-        gpio_reset_pin(led_state.pin);
+        warn_on_error(
+            ledc_stop(LEDC_MODE, LEDC_CHANNEL, led_state.type == SETTINGS_LED_GPIO_ACTIVE_LOW),
+            "Stopping the LED's PWM");
+        warn_on_error(gpio_reset_pin(led_state.pin), "Releasing the LED pin");
         break;
     case SETTINGS_LED_WS2812:
-        led_strip_clear(led_state.strip);
-        led_strip_del(led_state.strip);
+        warn_on_error(led_strip_clear(led_state.strip), "Turning the WS2812 off");
+        warn_on_error(led_strip_del(led_state.strip), "Releasing the WS2812");
         led_state.strip = NULL;
-        gpio_reset_pin(led_state.pin);
+        warn_on_error(gpio_reset_pin(led_state.pin), "Releasing the LED pin");
         break;
     case SETTINGS_LED_NONE:
         break;
@@ -71,7 +83,7 @@ static esp_err_t start_plain_led(uint8_t pin, bool active_low)
         .speed_mode = LEDC_MODE,
         .duty_resolution = LEDC_TIMER_8_BIT,
         .timer_num = LEDC_TIMER,
-        .freq_hz = LEDC_FREQUENCY_HZ,
+        .freq_hz = LED_PWM_FREQUENCY_HZ,
         .clk_cfg = LEDC_AUTO_CLK,
     };
     ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "LEDC timer");
@@ -119,13 +131,15 @@ static esp_err_t start_driver(settings_led_type_t type, uint8_t pin)
         led_state.type = type;
         led_state.pin = pin;
         led_state.shown_valid = false;
+        led_state.draw_failed = false;
     } else {
         ESP_LOGW(TAG, "No status LED on GPIO %u: %s", pin, esp_err_to_name(err));
     }
     return err;
 }
 
-static void draw(led_colour_t colour)
+/* Shows `colour`. Returns the driver's error; the caller logs it. */
+static esp_err_t draw(led_colour_t colour)
 {
     switch (led_state.type) {
     case SETTINGS_LED_GPIO:
@@ -134,19 +148,19 @@ static void draw(led_colour_t colour)
          * its timing (bridge spec 13). */
         uint8_t level = colour.red > colour.green ? colour.red : colour.green;
         level = colour.blue > level ? colour.blue : level;
-        ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, level);
-        ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-        break;
+        const esp_err_t err = ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, level);
+        return err == ESP_OK ? ledc_update_duty(LEDC_MODE, LEDC_CHANNEL) : err;
     }
-    case SETTINGS_LED_WS2812:
-        led_strip_set_pixel(led_state.strip, 0, colour.red * LED_WS2812_BRIGHTNESS / 255,
-                            colour.green * LED_WS2812_BRIGHTNESS / 255,
-                            colour.blue * LED_WS2812_BRIGHTNESS / 255);
-        led_strip_refresh(led_state.strip);
-        break;
+    case SETTINGS_LED_WS2812: {
+        const esp_err_t err = led_strip_set_pixel(
+            led_state.strip, 0, colour.red * LED_WS2812_BRIGHTNESS / 255,
+            colour.green * LED_WS2812_BRIGHTNESS / 255, colour.blue * LED_WS2812_BRIGHTNESS / 255);
+        return err == ESP_OK ? led_strip_refresh(led_state.strip) : err;
+    }
     case SETTINGS_LED_NONE:
         break;
     }
+    return ESP_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -171,10 +185,14 @@ static void frame(void *argument)
         const bool changed = !led_state.shown_valid || colour.red != led_state.shown.red ||
                              colour.green != led_state.shown.green ||
                              colour.blue != led_state.shown.blue;
-        if (changed) {
-            draw(colour);
+        const esp_err_t err = changed ? draw(colour) : ESP_OK;
+        if (changed && err == ESP_OK) {
             led_state.shown = colour;
             led_state.shown_valid = true;
+        } else if (err != ESP_OK && !led_state.draw_failed) {
+            /* Once per driver: a stuck LED would otherwise log 50 times a second. */
+            led_state.draw_failed = true;
+            ESP_LOGW(TAG, "Drawing the status LED failed: %s", esp_err_to_name(err));
         }
     }
     xSemaphoreGive(led_state.lock);
@@ -193,8 +211,9 @@ esp_err_t status_led_start(settings_led_type_t type, uint8_t pin,
     led_pattern_init(&led_state.pattern);
     atomic_store(&led_state.button, BUTTON_STAGE_NONE);
 
-    /* A missing or miswired LED is not worth failing the boot over. */
-    start_driver(type, pin);
+    /* A missing or miswired LED is not worth failing the boot over;
+     * start_driver() has logged it. */
+    (void)start_driver(type, pin);
 
     const esp_timer_create_args_t timer = {.callback = frame, .name = "status_led"};
     ESP_RETURN_ON_ERROR(esp_timer_create(&timer, &led_state.timer), TAG, "timer");
@@ -203,7 +222,9 @@ esp_err_t status_led_start(settings_led_type_t type, uint8_t pin,
 
 esp_err_t status_led_configure(settings_led_type_t type, uint8_t pin)
 {
-    xSemaphoreTake(led_state.lock, portMAX_DELAY);
+    if (xSemaphoreTake(led_state.lock, pdMS_TO_TICKS(LED_CONFIGURE_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     esp_err_t err = ESP_OK;
     if (type != led_state.type || pin != led_state.pin) {
         stop_driver();

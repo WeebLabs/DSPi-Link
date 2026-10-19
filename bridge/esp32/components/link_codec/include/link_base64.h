@@ -2,7 +2,8 @@
  * link_base64.h - standard base64 with padding, for the `_b64` fields of
  * the control plane (Link spec 7.1).
  *
- * Portable: no ESP-IDF headers.
+ * Portable: no ESP-IDF headers, and no state, so any task may call these;
+ * on the bridge the hub task builds device.snapshot replies with them.
  */
 
 #ifndef LINK_BASE64_H

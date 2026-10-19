@@ -352,7 +352,8 @@
     </main>
 
     <script>
-      // The default UART pins on each chip (bridge spec 4.4).
+      // The default UART pins on each chip (bridge spec 4.4). A copy of
+      // components/board/board_tables.c: change both together.
       const PINS = {
         esp32: { tx: 19, rx: 18 },
         esp32s3: { tx: 17, rx: 18 },

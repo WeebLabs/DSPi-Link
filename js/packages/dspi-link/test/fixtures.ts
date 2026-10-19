@@ -1,3 +1,8 @@
+/*
+ * Reads the shared fixtures at the repository root, so these tests check the
+ * same bytes and messages every other Link implementation is tested against.
+ */
+
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

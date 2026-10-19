@@ -1,6 +1,7 @@
 /*
  * The bridge's setup page (bridge spec 10.2): joins the bridge to a home
- * network from a phone on its setup network.
+ * network from a phone on its setup network, through the setup API (bridge
+ * spec 9.3, api.ts).
  *
  *   welcome     -> what the bridge found, and a Get started button
  *   network     -> nearby networks, or a name typed by hand
@@ -14,6 +15,7 @@
  */
 
 import "./setup.css";
+import { LINK_DEFAULT_PORT } from "@dspi/link";
 import { clear, el } from "../dom.js";
 import {
   digitsOnly,
@@ -23,6 +25,14 @@ import {
   PIN_SWITCH_LABEL,
   pinIsValid,
 } from "../pin.js";
+import { statusLine } from "../status.js";
+import {
+  namedNetworks,
+  passwordFits,
+  signalBars,
+  SSID_MAX_BYTES,
+  WIFI_PASSWORD_MAX_LENGTH,
+} from "../wifi.js";
 import {
   apply,
   finish,
@@ -54,6 +64,17 @@ const POLL_INTERVAL_MS = 1000;
  * join the home network, so a few failed polls in a row are expected. */
 const POLL_FAILURES_ALLOWED = 8;
 
+/** The bridge tries a network for up to 30 s (Link spec 7.11); this adds room
+ * for the setup network's own drop-outs before the page gives up. */
+const JOIN_DEADLINE_MS = 45000;
+
+/** The longest name the bridge stores (bridge spec 8.11). */
+const BRIDGE_NAME_MAX_LENGTH = 63;
+
+/** The bars a signal can show. */
+const SIGNAL_BAR_COUNT = 4;
+const SIGNAL_BAR_STEP_PX = 4;
+
 const flow = {
   step: "welcome" as Step,
   state: null as SetupState | null,
@@ -73,6 +94,8 @@ const flow = {
   currentPin: "",
   pinAfterApply: "", // The bridge's PIN once apply has worked, for finish
   error: null as string | null,
+  /** True while /apply is in flight, so a second tap sends nothing. */
+  applying: false,
   finished: false,
 };
 
@@ -100,25 +123,10 @@ function progress(): HTMLElement {
     "aria-valuenow": String(current),
     "aria-label": `Step ${current} of ${STEP_COUNT}`,
   });
-  for (let i = 1; i <= STEP_COUNT; i++) {
-    bar.appendChild(el("span", { class: i <= current ? "done" : "" }));
+  for (let step = 1; step <= STEP_COUNT; step++) {
+    bar.appendChild(el("span", { class: step <= current ? "done" : "" }));
   }
   return bar;
-}
-
-type Tone = "good" | "warn" | "bad";
-
-function status(tone: Tone, title: string, detail?: string): HTMLElement {
-  return el(
-    "div",
-    { class: `status ${tone}`, role: tone === "bad" ? "alert" : "status" },
-    el(
-      "div",
-      {},
-      el("strong", { text: title }),
-      detail ? el("span", { class: "detail", text: detail }) : null,
-    ),
-  );
 }
 
 /** The nodes given, without the nulls that stand for "nothing here". */
@@ -127,7 +135,8 @@ function present(...nodes: (HTMLElement | null)[]): HTMLElement[] {
 }
 
 function errorStatus(): HTMLElement | null {
-  return flow.error ? status("bad", flow.error) : null;
+  // The page's <main> is a polite live region, so only errors need role "alert".
+  return flow.error ? statusLine("bad", flow.error, undefined, true) : null;
 }
 
 interface ButtonOptions {
@@ -151,6 +160,7 @@ function button(
   }) as HTMLButtonElement;
 }
 
+/** A secondary action drawn as a link. */
 function linkButton(label: string, onClick: () => void): HTMLButtonElement {
   return el("button", {
     type: "button",
@@ -166,8 +176,8 @@ function linkButton(label: string, onClick: () => void): HTMLButtonElement {
 function welcome(): HTMLElement[] {
   const dspi = flow.state?.dspi;
   const found = dspi?.found
-    ? status("good", "DSPi found", `Serial ${dspi.serial}`)
-    : status(
+    ? statusLine("good", "DSPi found", dspi.serial ? `Serial ${dspi.serial}` : undefined)
+    : statusLine(
         "warn",
         "DSPi not found yet",
         "Check the three wires, and that the UART control interface is on in DSPi Console. " +
@@ -175,7 +185,7 @@ function welcome(): HTMLElement[] {
       );
   const notifications =
     dspi?.found && dspi.notify_enable === false
-      ? status(
+      ? statusLine(
           "warn",
           "Notifications are off",
           "Turn them on in DSPi Console's UART settings so changes show up straight away.",
@@ -185,26 +195,29 @@ function welcome(): HTMLElement[] {
   return present(
     el("h1", { text: "Let's connect your DSPi Bridge to your Wi-Fi." }),
     el("p", { class: "dim", text: "It takes about a minute." }),
+    errorStatus(),
     found,
     notifications,
     button("Get started", () => goToNetworks(), { primary: true }),
   );
 }
 
-/** Signal strength as 1 to 4 bars, from the RSSI in dBm. */
-function signalStrength(rssi: number): number {
-  return rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : 1;
-}
-
-function signalBars(rssi: number): HTMLElement {
-  const strength = signalStrength(rssi);
+/** The signal as bars; the button's label says it in words. */
+function signalIcon(rssi: number): HTMLElement {
+  const strength = signalBars(rssi);
   const bars = el("span", { class: "bars", "aria-hidden": "true" });
-  for (let i = 1; i <= 4; i++) {
-    bars.appendChild(el("i", { class: i <= strength ? "on" : "", style: `height: ${i * 4}px` }));
+  for (let bar = 1; bar <= SIGNAL_BAR_COUNT; bar++) {
+    bars.appendChild(
+      el("i", {
+        class: bar <= strength ? "on" : "",
+        style: `height: ${bar * SIGNAL_BAR_STEP_PX}px`,
+      }),
+    );
   }
   return bars;
 }
 
+/** A padlock for a secured network. Fixed markup, nothing from the network. */
 function lockIcon(): HTMLElement {
   const icon = el("span", { class: "lock", "aria-hidden": "true" });
   icon.innerHTML =
@@ -230,7 +243,7 @@ function networkList(): HTMLElement {
   for (const network of flow.networks) {
     const label =
       `${network.ssid}, ${network.secure ? "secured" : "open"}, ` +
-      `signal ${signalStrength(network.rssi)} of 4`;
+      `signal ${signalBars(network.rssi)} of ${SIGNAL_BAR_COUNT}`;
     list.appendChild(
       el(
         "li",
@@ -242,7 +255,7 @@ function networkList(): HTMLElement {
             "aria-label": label,
             onclick: () => chooseNetwork(network.ssid, network.secure),
           },
-          signalBars(network.rssi),
+          signalIcon(network.rssi),
           el("span", { class: "ssid", text: network.ssid }),
           network.secure ? lockIcon() : null,
         ),
@@ -261,7 +274,7 @@ function networkStep(): HTMLElement[] {
       autocomplete: "off",
       autocapitalize: "off",
       spellcheck: false,
-      maxLength: 32,
+      maxLength: SSID_MAX_BYTES,
       oninput: (event: Event) => {
         flow.ssid = (event.target as HTMLInputElement).value;
         continueButton.disabled = flow.ssid.trim() === "";
@@ -295,7 +308,7 @@ function networkStep(): HTMLElement[] {
     el(
       "div",
       { class: "input-row" },
-      button("Refresh", () => scan(), { small: true, disabled: flow.scanning }),
+      button("Refresh", () => void scan(), { small: true, disabled: flow.scanning }),
       linkButton("Enter a network name", () => {
         flow.typingName = true;
         flow.error = null;
@@ -313,10 +326,10 @@ function passwordStep(): HTMLElement[] {
     autocomplete: "current-password",
     autocapitalize: "off",
     spellcheck: false,
-    maxLength: 64,
+    maxLength: WIFI_PASSWORD_MAX_LENGTH,
     oninput: (event: Event) => {
       flow.password = (event.target as HTMLInputElement).value;
-      continueButton.disabled = !passwordLooksValid();
+      continueButton.disabled = !passwordFits(flow.password, flow.secure);
     },
   }) as HTMLInputElement;
   const toggle = button(
@@ -331,7 +344,7 @@ function passwordStep(): HTMLElement[] {
   toggle.setAttribute("aria-controls", "password");
   const continueButton = button("Continue", () => goTo("name"), {
     primary: true,
-    disabled: !passwordLooksValid(),
+    disabled: !passwordFits(flow.password, flow.secure),
   });
 
   return present(
@@ -440,13 +453,49 @@ function nameStepProblem(): string | null {
   return null;
 }
 
+/** The bridge's current PIN, asked for when it already has one. */
+function currentPinFields(update: () => void): HTMLElement {
+  return el(
+    "div",
+    {},
+    el("p", {
+      class: "dim small",
+      text: "This bridge already has a PIN. Enter it to change the bridge's settings.",
+    }),
+    pinField("current-pin", "Current PIN", flow.currentPin, (value) => {
+      flow.currentPin = value;
+      update();
+    }),
+  );
+}
+
+/** The new PIN and its confirmation, shown while the switch is on. */
+function newPinFields(update: () => void): HTMLElement {
+  return el(
+    "div",
+    { class: "pin-fields" },
+    pinField("pin", bridgeHasPin() ? "New PIN" : "PIN", flow.pin, (value) => {
+      flow.pin = value;
+      update();
+    }),
+    pinField("pin-confirm", "Enter the PIN again", flow.pinConfirm, (value) => {
+      flow.pinConfirm = value;
+      update();
+    }),
+    bridgeHasPin()
+      ? el("p", { class: "dim small", text: "Leave these empty to keep the current PIN." })
+      : null,
+    el("p", { class: "small", text: PIN_REMINDER }),
+  );
+}
+
 function nameStep(): HTMLElement[] {
   // The fields update the Connect button and the hint as they change, without
   // redrawing the step, so typing never loses focus.
   const hint = el("p", { class: "dim small", role: "status" });
   const update = (): void => {
     const problem = nameStepProblem();
-    connectButton.disabled = problem !== null;
+    connectButton.disabled = problem !== null || flow.applying;
     // Only the mismatch is worth saying out loud; the rest is plain from
     // the empty fields.
     hint.textContent = problem === "The two PINs don't match." ? problem : "";
@@ -455,47 +504,18 @@ function nameStep(): HTMLElement[] {
     type: "text",
     id: "name",
     value: flow.name,
-    maxLength: 63,
+    maxLength: BRIDGE_NAME_MAX_LENGTH,
     oninput: (event: Event) => {
       flow.name = (event.target as HTMLInputElement).value;
       update();
     },
   });
-  const connectButton = button("Connect", () => connect(), { primary: true });
+  const connectButton = button(flow.applying ? "Connecting…" : "Connect", () => void connect(), {
+    primary: true,
+  });
 
-  const currentPin = bridgeHasPin()
-    ? el(
-        "div",
-        {},
-        el("p", {
-          class: "dim small",
-          text: "This bridge already has a PIN. Enter it to change the bridge's settings.",
-        }),
-        pinField("current-pin", "Current PIN", flow.currentPin, (value) => {
-          flow.currentPin = value;
-          update();
-        }),
-      )
-    : null;
-
-  const newPin = flow.pinEnabled
-    ? el(
-        "div",
-        { class: "pin-fields" },
-        pinField("pin", bridgeHasPin() ? "New PIN" : "PIN", flow.pin, (value) => {
-          flow.pin = value;
-          update();
-        }),
-        pinField("pin-confirm", "Enter the PIN again", flow.pinConfirm, (value) => {
-          flow.pinConfirm = value;
-          update();
-        }),
-        bridgeHasPin()
-          ? el("p", { class: "dim small", text: "Leave these empty to keep the current PIN." })
-          : null,
-        el("p", { class: "small", text: PIN_REMINDER }),
-      )
-    : null;
+  const currentPin = bridgeHasPin() ? currentPinFields(update) : null;
+  const newPin = flow.pinEnabled ? newPinFields(update) : null;
 
   update();
   return present(
@@ -528,10 +548,10 @@ function connectingStep(): HTMLElement[] {
 function doneStep(): HTMLElement[] {
   const wifi = flow.state?.wifi;
   const hostname = wifi?.hostname ?? "dspi-bridge";
-  const address = `http://${hostname}.local:11915`;
+  const address = `http://${hostname}.local:${LINK_DEFAULT_PORT}`;
   if (flow.finished) {
     return present(
-      status("good", "All set"),
+      statusLine("good", "All set"),
       el("p", {
         text:
           `The setup network is turning off. Reconnect this device to "${flow.ssid}", ` +
@@ -545,14 +565,17 @@ function doneStep(): HTMLElement[] {
     el("p", { class: "dim", text: "Open it from any device on that network at:" }),
     el("a", { class: "address", href: address, text: address }),
     wifi?.ip
-      ? el("p", { class: "dim small", text: `If that doesn't open, use http://${wifi.ip}:11915` })
+      ? el("p", {
+          class: "dim small",
+          text: `If that doesn't open, use http://${wifi.ip}:${LINK_DEFAULT_PORT}`,
+        })
       : null,
     el("p", {
       text:
         `Reconnect this device to "${flow.ssid}" to open it. ` +
         "DSPi Console will find the bridge by itself.",
     }),
-    button("Finish", () => done(), { primary: true }),
+    button("Finish", () => void done(), { primary: true }),
   );
 }
 
@@ -601,7 +624,7 @@ function goTo(step: Step, error: string | null = null): void {
 function goToNetworks(): void {
   goTo("network");
   if (flow.networks === null) {
-    scan();
+    void scan();
   }
 }
 
@@ -609,7 +632,7 @@ async function scan(): Promise<void> {
   flow.scanning = true;
   render();
   try {
-    flow.networks = await getNetworks();
+    flow.networks = namedNetworks(await getNetworks());
   } catch (error) {
     flow.networks = flow.networks ?? [];
     flow.error = (error as Error).message;
@@ -625,12 +648,6 @@ function chooseNetwork(ssid: string, secure: boolean): void {
   flow.typingName = false;
   flow.password = "";
   goTo(secure ? "password" : "name");
-}
-
-/** Empty for an open network; otherwise 8 to 64 characters, as WPA2 needs. */
-function passwordLooksValid(): boolean {
-  const length = flow.password.length;
-  return flow.secure ? length >= 8 && length <= 64 : length === 0 || length >= 8;
 }
 
 /** What the name step asks `apply` to do to the PIN. */
@@ -657,16 +674,22 @@ function pinOnceApplied(): string {
 }
 
 async function connect(): Promise<void> {
+  if (flow.applying) return;
+  flow.applying = true;
+  flow.error = null;
+  render();
   try {
     await apply(flow.ssid, flow.password, flow.name.trim(), pinChange());
     flow.pinAfterApply = pinOnceApplied();
   } catch (error) {
     flow.error = (error as Error).message;
-    render();
     return;
+  } finally {
+    flow.applying = false;
+    render();
   }
   goTo("connecting");
-  waitForJoin();
+  void waitForJoin();
 }
 
 /** What to tell the user when a join fails, and which step to send them to. */
@@ -687,9 +710,15 @@ function explainFailure(failure: SetupState["wifi"]["failure"]): { message: stri
   }
 }
 
+/** Polls the bridge until the join works, fails, or the deadline passes. */
 async function waitForJoin(): Promise<void> {
+  const deadline = Date.now() + JOIN_DEADLINE_MS;
   let failures = 0;
   for (;;) {
+    if (Date.now() > deadline) {
+      goTo("network", "The bridge took too long to join. Check the network and try again.");
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     let state: SetupState;
     try {
@@ -718,8 +747,10 @@ async function waitForJoin(): Promise<void> {
 async function done(): Promise<void> {
   try {
     await finish(flow.pinAfterApply);
-  } catch {
-    // The setup network goes off by itself two minutes after the join anyway.
+  } catch (error) {
+    // Not worth troubling the user: the setup network goes off by itself two
+    // minutes after the join anyway.
+    console.warn("setup: finish failed:", error);
   }
   flow.finished = true;
   render();
@@ -745,4 +776,4 @@ async function start(): Promise<void> {
   render();
 }
 
-start();
+void start();

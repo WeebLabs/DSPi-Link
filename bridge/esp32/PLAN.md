@@ -265,6 +265,48 @@ user's to make.
 **Done when** every item passes on every chip and the specs are marked as
 implemented.
 
+**Status (2026-10-19):** under way. The ESP32-S3 has passed everything below;
+the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
+
+- `tools/link_conformance.mjs` runs the hub half of the Link spec 12
+  checklist against a live bridge. On the ESP32-S3 every item passes:
+  - discovery and the info endpoint;
+  - the sub-protocol and hello first;
+  - `max_inflight` and ordering;
+  - poll fan-out and stop;
+  - the device going offline, being removed and returning on the same
+    handle;
+  - close codes and a reconnect storm, with no lost session and free heap
+    unchanged.
+
+  It found two gaps, now fixed: a WebSocket without `dspi-link-1` was
+  accepted, and a burst of disconnects could overflow ESP-IDF's small
+  control queue and lose a close until the keepalive reclaimed it.
+- The client half of the checklist is met by the web client: manual entry,
+  tokens keyed on `hid`, the prompt worded from `pin_source`, `caps` and
+  `limits` used, echoes suppressed by `origin`, state re-read on gaps and
+  RESYNC, and device features gated on the device's own version. Browsers
+  cannot browse DNS-SD, so the web client relies on manual entry and the
+  page's own origin; DSPi Console covers DNS-SD.
+- Every file was reviewed against section 16. The review found about 70
+  bugs and many smaller standards issues, and all were fixed. Among the
+  bugs:
+  - the setup page's PIN check failing open when the hub was busy, and a
+    failed hash letting any PIN through;
+  - heap use and a possible NULL dereference on the notification path;
+  - lifecycle events that could be dropped;
+  - a Wi-Fi retry that could stop for good;
+  - unsafe reads across tasks;
+  - a stale socket confusing the JS client;
+  - a meter gradient that showed red at any level.
+
+  145 host tests and 150 JS tests pass. All four chips build without
+  warnings, QEMU passes on three, and `link_smoke.mjs` and
+  `link_conformance.mjs --offline` pass on the ESP32-S3.
+- Left: the same bench run on the ESP32, ESP32-C3 and ESP32-C6, the
+  setup journey on an Android phone, DSPi Console against the PIN, and
+  marking the specs implemented once every chip passes.
+
 ---
 
 ## Work outside this repository

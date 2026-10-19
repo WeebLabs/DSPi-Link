@@ -1,7 +1,9 @@
 /*
  * settings_model.c - defaults and validation for the bridge's settings.
  *
- * Implements bridge spec 8.11 and 11. Portable: no ESP-IDF headers.
+ * Implements bridge spec 8.11 and 11. Kept apart from settings.c, which
+ * stores the values, so the rules run in the host tests. Portable: no
+ * ESP-IDF headers.
  */
 
 #include "settings_model.h"
@@ -194,10 +196,16 @@ const char *settings_model_find_problem(const bridge_settings_t *settings,
     return NULL;
 }
 
+/* How many keys settings_model_find_problem() can name: hub_id, name,
+ * hostname, uart.tx_pin, uart.rx_pin, uart.baud, led.type and led.pin.
+ * Repair fixes at least one per pass, so this bounds its loop. */
+#define FIELD_COUNT 8
+
 /* Puts back the default for the key named by `field`, a path returned by
  * settings_model_find_problem. Pins are reset in pairs so a half-changed
- * pair cannot leave both on one pin. */
-static void restore_default(bridge_settings_t *settings, const bridge_settings_t *defaults,
+ * pair cannot leave both on one pin. Returns false for a key it does not
+ * know, so a key added to find_problem without a repair here is caught. */
+static bool restore_default(bridge_settings_t *settings, const bridge_settings_t *defaults,
                             const char *field)
 {
     if (strcmp(field, "hub_id") == 0) {
@@ -211,27 +219,30 @@ static void restore_default(bridge_settings_t *settings, const bridge_settings_t
         settings->uart_rx_pin = defaults->uart_rx_pin;
     } else if (strcmp(field, "uart.baud") == 0) {
         settings->uart_baud = defaults->uart_baud;
-    } else {
-        /* "led.type" or "led.pin": switch the LED off rather than guess a pin. */
+    } else if (strcmp(field, "led.type") == 0 || strcmp(field, "led.pin") == 0) {
+        /* Switch the LED off rather than guess a pin. */
         settings->led_type = SETTINGS_LED_NONE;
         settings->led_pin = BOARD_PIN_NONE;
+    } else {
+        return false;
     }
+    return true;
 }
 
-size_t settings_model_repair(bridge_settings_t *settings, const bridge_settings_t *defaults,
-                             const board_table_t *board)
+bool settings_model_repair(bridge_settings_t *settings, const bridge_settings_t *defaults,
+                           const board_table_t *board, size_t *repaired)
 {
-    /* Each pass fixes one key, so the number of keys bounds the loop. */
-    const size_t max_passes = 8;
-    size_t repaired = 0;
-
-    for (size_t pass = 0; pass < max_passes; pass++) {
+    *repaired = 0;
+    for (size_t pass = 0; pass < FIELD_COUNT; pass++) {
         const char *field = settings_model_find_problem(settings, board);
         if (field == NULL) {
-            break;
+            return true;
         }
-        restore_default(settings, defaults, field);
-        repaired++;
+        if (!restore_default(settings, defaults, field)) {
+            return false;
+        }
+        (*repaired)++;
     }
-    return repaired;
+    /* Every key was reset and something is still wrong: the defaults are. */
+    return settings_model_find_problem(settings, board) == NULL;
 }

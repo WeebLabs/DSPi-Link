@@ -122,7 +122,9 @@ A client must accept a bare host or `host:port` typed by the user and derive
 - **Text frames carry JSON control messages** (section 7).
 - **Binary frames carry data-plane frames** (section 8).
 - WebSocket ping/pong is the keepalive. The hub pings every 10 s and closes a
-  session that has not answered within 30 s. Clients may ping too.
+  session that has not answered within 30 s. Clients may ping too; a client
+  whose ping goes unanswered treats the connection as lost, closes it and
+  reconnects.
 - A single WebSocket frame carries exactly one message. Message size limit is
   advertised by the hub in `hello` (`limits.max_frame`, at least 16384 bytes).
 - Connections are multiplexed: one session may address every device the hub
@@ -182,7 +184,7 @@ Close codes used by hubs:
 | 1000 | Normal close. |
 | 1001 | Keepalive failure: no inbound frame for 30 s. Clients reconnect with backoff and re-read state. |
 | 1011 | Client stopped reading: the connection stayed unwritable for 10 s. Clients reconnect with backoff and re-read state. |
-| 4000 | Protocol error (malformed message, unknown sub-protocol). |
+| 4000 | Protocol error (malformed message, unknown sub-protocol). Clients do not reconnect: the same client would fail the same way. |
 | 4001 | Authentication timeout or failure limit reached. |
 | 4002 | Token revoked. |
 | 4003 | Hub shutting down. Clients reconnect with backoff (1 s, 2 s, 4 s, ... capped at 30 s). |
@@ -485,9 +487,11 @@ in each `POLL` frame.
 The hub may grant a lower rate than requested to stay inside
 `poll_budget_bps`; it reports the granted rates. Poll commands must be
 classed *read*. A subscription ends when the session closes, when the device
-goes offline, or on `poll.unsubscribe`. Hubs must stop polling a device the
-moment no session subscribes, since RTA and some meters switch themselves off
-when unread and keeping them alive costs device CPU.
+goes offline, or on `poll.unsubscribe`. A client that still wants a feed
+subscribes again when the device comes back online. A `poll.subscribe` for a
+slot the session already uses replaces that slot's poll. Hubs must stop
+polling a device the moment no session subscribes, since RTA and some meters
+switch themselves off when unread and keeping them alive costs device CPU.
 
 ### 7.7 Locks
 
@@ -718,7 +722,7 @@ its USB result onto the same table. Codes from 0x80 are Link-level.
 | 0x07 | FRAME_ERROR | Malformed frame between bridge and device. |
 | 0x80 | NO_DEVICE | No device at this handle, or it is offline. |
 | 0x81 | DENIED | The session's role does not permit this command. |
-| 0x82 | TIMEOUT | The hub gave up waiting for the device (default 2 s, 5 s for bulk). The command may or may not have executed. |
+| 0x82 | TIMEOUT | The hub gave up waiting for the device (over USB at least 2 s, 5 s for bulk; see the rules below). The command may or may not have executed. |
 | 0x83 | TOO_LARGE | Payload exceeds `limits.max_payload`. |
 | 0x84 | RATE_LIMITED | Too many in-flight commands; see `max_inflight`. |
 | 0x85 | LOCKED | Another session holds the device lock. |
@@ -769,9 +773,13 @@ Rules:
   chunked forms (0xA2/0xA3) over Link; how the hub moves the blob to the
   device is its own business (single-shot on macOS, chunked on a Windows hub
   in future, one UART frame on a bridge).
-- **Timeouts.** The hub waits at least 2 s for a response, 5 s for bulk, then
-  answers `TIMEOUT`. Flash-writing commands can blind the device for about
-  45 ms; hubs must not treat one timeout as a device loss.
+- **Timeouts.** The hub waits long enough for its link to the device, then
+  answers `TIMEOUT`. Over USB that is at least 2 s for a response and 5 s
+  for bulk. A hub whose link has known, bounded timing may wait less, and
+  its own specification gives the figures; a bridge on a 1 Mbaud UART waits
+  about 160 ms, 280 ms for bulk (`esp32_bridge_spec.md` section 7.2).
+  Flash-writing commands can blind the device for about 45 ms; hubs must
+  not treat one timeout as a device loss.
 - **Bootloader entry (0xF0)** is `config` class. After it, the hub reports
   the device `offline`, then `removed` if it does not return within 60 s
   (Console hubs that were asked to install firmware handle this themselves).

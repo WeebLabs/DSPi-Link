@@ -3,7 +3,8 @@
  *
  * Feed it one sample of the pin at a time; it debounces, times the hold,
  * says which action a release would trigger right now (for the LED), and
- * reports the action itself on release:
+ * reports the action itself on release. With the BUTTON_*_HOLD_MS values
+ * in bridge_config.h:
  *
  *   held under 5 s     nothing
  *   held 5 to 15 s     forget Wi-Fi
@@ -46,6 +47,7 @@ typedef struct {
     button_stage_t stage;
 } button_machine_t;
 
+/* Starts a machine with the button not yet seen released. */
 void button_machine_init(button_machine_t *machine);
 
 /* Feeds one sample: `down` is true while the button is pressed. Returns the

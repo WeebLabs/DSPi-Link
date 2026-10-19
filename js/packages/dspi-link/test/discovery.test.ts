@@ -1,3 +1,5 @@
+/* Manual host entry and the URLs derived from it, Link spec 3.2 and 3.3. */
+
 import { describe, expect, it } from "vitest";
 import { infoUrl, parseHostInput, webSocketUrl } from "../src/discovery.js";
 
@@ -28,6 +30,10 @@ describe("manual host entry, spec 3.3", () => {
       port: 11915,
       secure: false,
     });
+  });
+
+  it("brackets a bare IPv6 address instead of reading a port from it", () => {
+    expect(parseHostInput("fe80::1")).toEqual({ host: "[fe80::1]", port: 11915, secure: false });
   });
 
   it("builds the info and WebSocket URLs", () => {

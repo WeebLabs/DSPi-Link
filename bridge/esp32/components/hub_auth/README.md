@@ -3,7 +3,9 @@
 The bridge's optional PIN (bridge spec 8.9): the PIN stored as a salted
 PBKDF2 hash, paired clients' tokens stored as SHA-256 hashes, and the
 pairing rate limits of Link spec 6.2. Crypto, randomness, time and saving
-come in through `hub_auth_io_t`, so the logic runs on a computer too.
+come in through `hub_auth_io_t`, so the logic runs on a computer too. If
+the random source or a hash fails, nothing is set, issued or accepted: the
+functions answer `HUB_AUTH_UNAVAILABLE`.
 
 | File | What it does | Portable |
 |------|--------------|----------|

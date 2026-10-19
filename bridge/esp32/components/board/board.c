@@ -1,8 +1,9 @@
 /*
  * board.c - picks the pin table for this chip and reports PSRAM.
  *
- * The ESP-IDF side of the board component; the tables themselves live in
- * the portable board_tables.c.
+ * Implements bridge spec 4.1 (supported chips, PSRAM and the session limit)
+ * and the chip choice of 4.4. The ESP-IDF side of the board component; the
+ * tables themselves live in the portable board_tables.c.
  */
 
 #include "board.h"

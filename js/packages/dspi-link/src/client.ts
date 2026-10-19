@@ -1,24 +1,35 @@
 /*
  * LinkClient: one authenticated WebSocket session to a DSPi Link hub.
  *
- * Owns the handshake (spec 5), request/reply correlation on both planes, the
- * device inventory, poll subscriptions and reconnection. It does not interpret
- * command payloads; those are the device's bytes and the caller's business.
+ * Owns the handshake and authentication (Link spec 5 and 6), request and
+ * reply correlation on both planes (7.1 and 8.2), the device inventory (7.4),
+ * poll subscriptions (7.6), locks (7.7), the hub administration calls (7.9 to
+ * 7.13), keepalive and reconnection. Firmware upload (7.14) is in
+ * hubUpdate.ts. It does not interpret command payloads: those are the
+ * device's bytes and the caller's business.
+ *
+ * Every JavaScript program that talks Link, the hub's own web page included,
+ * goes through this class, so the session rules live in one place.
  */
 
 import {
+  LINK_LIBRARY_VERSION,
+  LINK_PROTO_VERSION,
+  LINK_SUBPROTOCOL,
+} from "./constants.js";
+import { base64ToBytes } from "./base64.js";
+import { asError, LinkCommandError, LinkProtocolError } from "./errors.js";
+import {
   type CmdRequestFrame,
   type CmdResponseFrame,
-  type FwDataAckFrame,
   type NotifyFrame,
   type PollFrame,
   type ResyncFrame,
-  LinkFrameError,
   LinkStatus,
   decodeFrame,
   encodeFrame,
-  statusName,
 } from "./frames.js";
+import { HubUpdater, type HubUpdateOptions } from "./hubUpdate.js";
 import {
   type AuthClientInfo,
   type AuthPairMessage,
@@ -26,15 +37,14 @@ import {
   type DeviceInfo,
   type ErrMessage,
   type HelloHubMessage,
+  type HubAuthSetMessage,
   type HubConfig,
-  type HubConfigChangedMessage,
-  type HubUpdateDoneMessage,
   type HubLimits,
   type HubResetLevel,
   type LinkCapability,
-  type LinkErrorCode,
   type LinkMessage,
   type LinkRole,
+  type LockAcquireMessage,
   type OkMessage,
   type PollGrant,
   type PollRequest,
@@ -43,14 +53,12 @@ import {
   type WifiNetwork,
   decode as decodeMessage,
   encode as encodeMessage,
+  isMessage,
 } from "./messages.js";
-import { base64ToBytes } from "./decoders.js";
-import { sha256Hex } from "./sha256.js";
 
-export const LINK_SUBPROTOCOL = "dspi-link-1";
-export const LINK_DEFAULT_PORT = 11915;
-export const LINK_WS_PATH = "/dspi/v1";
+export type { HubUpdateOptions } from "./hubUpdate.js";
 
+/** Where a LinkClient is in its session's life. */
 export type LinkClientState =
   | "idle"
   | "connecting"
@@ -64,7 +72,11 @@ export type LinkClientState =
   | "reconnecting"
   | "closed";
 
-/** Why the socket closed, for the codes hubs use (spec 5). */
+/**
+ * Why the socket closed, for the close codes of Link spec 5. 1001 (keepalive
+ * failure), 1011 (client stopped reading) and any other code are "abnormal",
+ * which the client retries.
+ */
 export type LinkCloseReason =
   | "normal"
   | "protocol_error"
@@ -73,6 +85,12 @@ export type LinkCloseReason =
   | "shutting_down"
   | "abnormal";
 
+/**
+ * Maps a WebSocket close code to its meaning.
+ *
+ * @param code The close event's code.
+ * @returns The reason the code stands for (Link spec 5).
+ */
 export function closeReasonFor(code: number): LinkCloseReason {
   switch (code) {
     case 1000:
@@ -90,6 +108,16 @@ export function closeReasonFor(code: number): LinkCloseReason {
   }
 }
 
+/** Reasons a retry would end the same way: a deliberate close, a protocol
+ * mismatch, a refused auth or a revoked token. */
+const FINAL_CLOSE_REASONS: ReadonlySet<LinkCloseReason> = new Set([
+  "normal",
+  "protocol_error",
+  "auth_failed",
+  "revoked",
+]);
+
+/** The payload of the `close` event. */
 export interface LinkCloseInfo {
   code: number;
   reason: LinkCloseReason;
@@ -98,27 +126,33 @@ export interface LinkCloseInfo {
   message?: string;
 }
 
+/** Settings for a LinkClient; every one has a default. */
 export interface LinkClientOptions {
   /** WebSocket implementation, for Node versions or tests without a global one. */
   webSocket?: WebSocketLike;
   /** Reconnect after an unexpected close. Off by default so tests stay deterministic. */
   reconnect?: boolean;
-  /** Backoff cap, spec 5. Delays run 1, 2, 4, ... up to this. */
+  /** Backoff cap, Link spec 5. Delays run 1, 2, 4, ... seconds up to this. */
   reconnectMaxMs?: number;
   /** How long a tunnelled command may take before it rejects. */
   commandTimeoutMs?: number;
   /** How long a control-plane request may take before it rejects. */
   requestTimeoutMs?: number;
+  /** How long from opening the socket to `ready` or `awaiting_pairing`. */
+  handshakeTimeoutMs?: number;
   /** Keepalive period. 0 disables it. */
   pingIntervalMs?: number;
 }
 
+/** What connect() tells the hub about this client. */
 export interface ConnectOptions {
   /** Name the hub shows in its client list. */
   clientName: string;
   /** Stored pairing token, if this client has one for this hub. */
   token?: string;
+  /** The application's name, sent in hello. */
   app?: string;
+  /** The application's version, sent in hello. */
   version?: string;
   /** Role to ask for when pairing. */
   role?: LinkRole;
@@ -127,19 +161,21 @@ export interface ConnectOptions {
 /** The subset of the WebSocket constructor this client needs. */
 export type WebSocketLike = new (url: string, protocols?: string | string[]) => WebSocketInstance;
 
+/** The subset of a WebSocket this client needs. */
 export interface WebSocketInstance {
   binaryType?: string;
   readyState: number;
   send(data: string | ArrayBufferLike | ArrayBufferView): void;
   close(code?: number, reason?: string): void;
-  onopen: ((ev: unknown) => void) | null;
-  onclose: ((ev: { code?: number; reason?: string }) => void) | null;
-  onerror: ((ev: unknown) => void) | null;
-  onmessage: ((ev: { data: unknown }) => void) | null;
+  onopen: ((event: unknown) => void) | null;
+  onclose: ((event: { code?: number; reason?: string }) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  onmessage: ((event: { data: unknown }) => void) | null;
   /** Present on Node's `ws`; absent in browsers, which cannot send control pings. */
   ping?: () => void;
 }
 
+/** The reply to device.snapshot (Link spec 7.5), with the blobs decoded. */
 export interface SnapshotResult {
   handle: number;
   wire_version?: number;
@@ -152,76 +188,20 @@ export interface SnapshotResult {
   status?: Uint8Array;
 }
 
-/** A control-plane `err` reply turned into a rejection. */
-export class LinkProtocolError extends Error {
-  readonly code: LinkErrorCode;
-  /** The hub's own sentence, when it gave one. */
-  readonly detail?: string;
-  /** For a rejected hub.config.set: the offending key, as "uart.tx_pin". */
-  readonly field?: string;
-  constructor(code: LinkErrorCode, message?: string, field?: string) {
-    super(message ? `${code}: ${message}` : code);
-    this.name = "LinkProtocolError";
-    this.code = code;
-    this.detail = message;
-    this.field = field;
-  }
-}
-
-/** The reply to hub.config.get (spec 7.10). */
+/** The reply to hub.config.get (Link spec 7.10). */
 export interface HubConfigResult {
   config: HubConfig;
   /** The permitted values of keys that come from a fixed set. */
   options: HubConfig;
 }
 
-/** The reply to hub.wifi.scan (spec 7.11). */
+/** The reply to hub.wifi.scan (Link spec 7.11). */
 export interface WifiScanResult {
   current: WifiCurrent | null;
   networks: WifiNetwork[];
 }
 
-/** A Wi-Fi scan takes a few seconds and the hub answers within 10 s, so
- * this leaves room for the round trip on top. */
-const WIFI_SCAN_TIMEOUT_MS = 15000;
-
-export interface HubUpdateOptions {
-  /** The new firmware's version, for the hub's log; optional (spec 7.14). */
-  version?: string;
-  /** Called as chunks are acknowledged, with the bytes written so far. */
-  onProgress?: (written: number, total: number) => void;
-}
-
-/** FWDATA chunks sent ahead of their acks. A bridge holds two waiting to be
- * written (bridge spec 14.2), so a third would be refused. */
-const UPDATE_WINDOW = 2;
-
-/** The longest a chunk may wait for its ack. Writing to flash can pause
- * for a few seconds; the hub gives up on a stalled update after 30 s. */
-const UPDATE_ACK_TIMEOUT_MS = 35000;
-
-/** How long hub.update.done may take after the last ack: the hub checks
- * the whole image first. */
-const UPDATE_DONE_TIMEOUT_MS = 30000;
-
-interface PendingAck {
-  resolve: () => void;
-  reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-/** A CMD response whose status was not OK, for callers that want a throw. */
-export class LinkCommandError extends Error {
-  readonly status: number;
-  readonly response: CmdResponseFrame;
-  constructor(response: CmdResponseFrame) {
-    super(`command failed: ${statusName(response.status)}`);
-    this.name = "LinkCommandError";
-    this.status = response.status;
-    this.response = response;
-  }
-}
-
+/** The events a LinkClient emits, with their payloads. */
 export interface LinkClientEventMap {
   state: { state: LinkClientState; previous: LinkClientState };
   devices: DeviceInfo[];
@@ -229,7 +209,7 @@ export interface LinkClientEventMap {
   poll: PollFrame;
   resync: ResyncFrame;
   message: LinkMessage;
-  /** The hub's configuration changed, by this session or another (spec 7.10). */
+  /** The hub's configuration changed, by this session or another (Link spec 7.10). */
   hubConfig: HubConfig;
   error: Error;
   close: LinkCloseInfo;
@@ -237,23 +217,48 @@ export interface LinkClientEventMap {
 
 type Listener<K extends keyof LinkClientEventMap> = (payload: LinkClientEventMap[K]) => void;
 
-interface PendingRequest {
-  resolve: (msg: OkMessage) => void;
-  reject: (err: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-interface PendingCommand {
-  resolve: (frame: CmdResponseFrame) => void;
-  reject: (err: Error) => void;
+interface Pending<T> {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
 const RECONNECT_BASE_MS = 1000;
+const DEFAULT_RECONNECT_MAX_MS = 30000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 10000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10000;
+/** Enough for a slow LAN and a hub that reads its device list before answering. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15000;
+/** Half the hub's 30 s idle limit (Link spec 5, close code 1001). */
+const DEFAULT_PING_INTERVAL_MS = 15000;
 
+/** A Wi-Fi scan takes a few seconds and the hub answers within 10 s, so
+ * this leaves room for the round trip on top. */
+const WIFI_SCAN_TIMEOUT_MS = 15000;
+
+/** An open-access hub ignores the PIN of auth.pair (Link spec 6.1). */
+const OPEN_ACCESS_PIN = "000000";
+
+/** The FWDATA chunk bound to assume when a hub's hello gives no max_frame. */
+const DEFAULT_MAX_FRAME_BYTES = 16384;
+
+/** Request ids stay positive 31-bit integers, which every JSON parser holds exactly. */
+const MAX_REQUEST_ID = 0x7fffffff;
+/** CMD tags are u16, and 0 is never used. */
+const MAX_COMMAND_TAG = 0xffff;
+
+/** The close code a client sends when it gives up on a socket itself. */
+const CLIENT_CLOSE_CODE = 1000;
+/** The code this client reports for a socket it abandoned (no close event came). */
+const ABANDONED_CLOSE_CODE = 1006;
+
+/** Error codes that mean the hub refused the stored token itself. */
+const TOKEN_REJECTION_CODES: ReadonlySet<string> = new Set(["unauthenticated", "denied"]);
+
+/** One session to a hub. See the file comment. */
 export class LinkClient {
-  private ws: WebSocketInstance | null = null;
-  private readonly WS: WebSocketLike;
+  private socket: WebSocketInstance | null = null;
+  private readonly WebSocketConstructor: WebSocketLike;
   private readonly options: Required<Omit<LinkClientOptions, "webSocket">>;
 
   private url = "";
@@ -269,40 +274,51 @@ export class LinkClient {
 
   private nextId = 1;
   private nextTag = 1;
-  private pendingRequests = new Map<number, PendingRequest>();
-  private pendingCommands = new Map<number, PendingCommand>();
+  private readonly pendingRequests = new Map<number, Pending<OkMessage>>();
+  private readonly pendingCommands = new Map<number, Pending<CmdResponseFrame>>();
 
-  /** FWDATA chunks waiting for their acks, keyed "xfer:offset". */
-  private pendingAcks = new Map<string, PendingAck>();
+  /** Remembered so a reconnect, or a device coming back, restores the same meter feeds. */
+  private readonly pollSubscriptions = new Map<number, Map<number, PollRequest>>();
 
-  /** Remembered so a reconnect restores the same meter feeds. */
-  private pollSubscriptions = new Map<number, Map<number, PollRequest>>();
-
-  private listeners = new Map<string, Set<(payload: never) => void>>();
+  private readonly listeners = new Map<string, Set<(payload: never) => void>>();
 
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private manualClose = false;
-  private handshake: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  private handshake: Pending<void> | null = null;
 
-  constructor(opts: LinkClientOptions = {}) {
-    const impl = opts.webSocket ?? (globalThis as { WebSocket?: WebSocketLike }).WebSocket;
-    if (!impl) {
+  private readonly updater = new HubUpdater({
+    request: (message, timeoutMs) => this.request(message, timeoutMs),
+    onMessage: (listener) => this.on("message", listener),
+    sendFrame: (frame) => this.requireSocket().send(encodeFrame(frame)),
+    maxFrameBytes: () => this.limits?.max_frame ?? DEFAULT_MAX_FRAME_BYTES,
+  });
+
+  /**
+   * @param options Timeouts, reconnection and the WebSocket implementation.
+   * @throws Error when there is no global WebSocket and none is given.
+   */
+  constructor(options: LinkClientOptions = {}) {
+    const implementation =
+      options.webSocket ?? (globalThis as { WebSocket?: WebSocketLike }).WebSocket;
+    if (!implementation) {
       throw new Error("no WebSocket available; pass options.webSocket");
     }
-    this.WS = impl;
+    this.WebSocketConstructor = implementation;
     this.options = {
-      reconnect: opts.reconnect ?? false,
-      reconnectMaxMs: opts.reconnectMaxMs ?? 30000,
-      commandTimeoutMs: opts.commandTimeoutMs ?? 10000,
-      requestTimeoutMs: opts.requestTimeoutMs ?? 10000,
-      pingIntervalMs: opts.pingIntervalMs ?? 15000,
+      reconnect: options.reconnect ?? false,
+      reconnectMaxMs: options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS,
+      commandTimeoutMs: options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+      requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      handshakeTimeoutMs: options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS,
+      pingIntervalMs: options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS,
     };
   }
 
   // -- accessors ------------------------------------------------------------
 
+  /** Where the session is now; the `state` event reports every change. */
   get state(): LinkClientState {
     return this._state;
   }
@@ -312,6 +328,7 @@ export class LinkClient {
     return this._hub;
   }
 
+  /** The hub's id (`hub.id` in hello), the key to store its token under (Link spec 6.2). */
   get hubId(): string | null {
     return this._hub?.hub.id ?? null;
   }
@@ -321,10 +338,12 @@ export class LinkClient {
     return this._session;
   }
 
+  /** The role the hub granted, once authenticated. */
   get role(): LinkRole | null {
     return this._role;
   }
 
+  /** The commands this session may not send, from the auth ok (Link spec 6.3). */
   get policy(): PolicyDescriptor | null {
     return this._policy;
   }
@@ -334,51 +353,75 @@ export class LinkClient {
     return this._token;
   }
 
+  /** The capabilities in the hub's hello; empty before it arrives. */
   get caps(): LinkCapability[] {
     return this._hub?.caps ?? [];
   }
 
+  /** The limits in the hub's hello, once it has arrived. */
   get limits(): HubLimits | null {
     return this._hub?.limits ?? null;
   }
 
+  /**
+   * @param name A capability name (Link spec 7.2).
+   * @returns True when the hub's hello lists it.
+   */
   hasCap(name: LinkCapability): boolean {
     return this.caps.includes(name);
   }
 
+  /** Every device the hub shares, in handle order. */
   get deviceList(): DeviceInfo[] {
     return [...this.devices.values()].sort((a, b) => a.handle - b.handle);
   }
 
+  /**
+   * @param handle A device handle.
+   * @returns The device, or undefined when the hub has none with that handle.
+   */
   device(handle: number): DeviceInfo | undefined {
     return this.devices.get(handle);
   }
 
   // -- events ---------------------------------------------------------------
 
-  on<K extends keyof LinkClientEventMap>(event: K, fn: Listener<K>): () => void {
-    let set = this.listeners.get(event as string);
+  /**
+   * Listens for an event.
+   *
+   * @param event The event's name.
+   * @param listener Called with the event's payload.
+   * @returns A function that removes the listener; call it when done.
+   */
+  on<K extends keyof LinkClientEventMap>(event: K, listener: Listener<K>): () => void {
+    let set = this.listeners.get(event);
     if (!set) {
       set = new Set();
-      this.listeners.set(event as string, set);
+      this.listeners.set(event, set);
     }
-    set.add(fn as (payload: never) => void);
-    return () => this.off(event, fn);
+    set.add(listener as (payload: never) => void);
+    return () => this.off(event, listener);
   }
 
-  off<K extends keyof LinkClientEventMap>(event: K, fn: Listener<K>): void {
-    this.listeners.get(event as string)?.delete(fn as (payload: never) => void);
+  /**
+   * Removes a listener added with on().
+   *
+   * @param event The event's name.
+   * @param listener The listener to remove.
+   */
+  off<K extends keyof LinkClientEventMap>(event: K, listener: Listener<K>): void {
+    this.listeners.get(event)?.delete(listener as (payload: never) => void);
   }
 
   private emit<K extends keyof LinkClientEventMap>(event: K, payload: LinkClientEventMap[K]): void {
-    const set = this.listeners.get(event as string);
+    const set = this.listeners.get(event);
     if (!set) return;
-    for (const fn of [...set]) {
+    for (const listener of [...set]) {
       try {
-        (fn as Listener<K>)(payload);
-      } catch (e) {
+        (listener as Listener<K>)(payload);
+      } catch (error) {
         // A listener throwing must not tear down the socket loop.
-        if (event !== "error") this.emit("error", e as Error);
+        if (event !== "error") this.emit("error", asError(error));
       }
     }
   }
@@ -393,13 +436,19 @@ export class LinkClient {
   // -- connection -----------------------------------------------------------
 
   /**
-   * Open a session. Resolves once the handshake settles: `ready` when the hub
-   * accepted us, `awaiting_pairing` when it wants a PIN (call `pair`).
+   * Opens a session, replacing any session this client already has.
+   *
+   * @param url The hub's WebSocket URL, as webSocketUrl() builds it.
+   * @param options The name, token and role to present.
+   * @returns Resolves once the handshake settles: `ready` when the hub
+   *   accepted us, `awaiting_pairing` when it wants a PIN (call pair()).
+   *   Rejects when the socket closes or the hub does not answer in time.
    */
-  connect(url: string, opts: ConnectOptions): Promise<void> {
+  connect(url: string, options: ConnectOptions): Promise<void> {
+    this.releaseSocket(new Error("replaced by a new connection"));
     this.url = url;
-    this.connectOptions = opts;
-    this._token = opts.token ?? null;
+    this.connectOptions = options;
+    this._token = options.token ?? null;
     this.manualClose = false;
     this.reconnectAttempt = 0;
     return this.open();
@@ -409,76 +458,132 @@ export class LinkClient {
     this.cancelReconnect();
     this.setState("connecting");
     return new Promise<void>((resolve, reject) => {
-      this.handshake = { resolve, reject };
-      let ws: WebSocketInstance;
+      let socket: WebSocketInstance;
       try {
-        ws = new this.WS(this.url, LINK_SUBPROTOCOL);
-      } catch (e) {
-        this.handshake = null;
+        socket = new this.WebSocketConstructor(this.url, LINK_SUBPROTOCOL);
+      } catch (error) {
         this.setState("closed");
-        reject(e as Error);
+        reject(asError(error));
         return;
       }
-      this.ws = ws;
-      try {
-        ws.binaryType = "arraybuffer";
-      } catch {
-        // Some implementations only allow this after open; harmless either way.
-      }
-      ws.onopen = () => this.onOpen();
-      ws.onmessage = (ev) => this.onMessage(ev.data);
-      ws.onerror = () => this.emit("error", new Error("websocket error"));
-      ws.onclose = (ev) => this.onClose(ev?.code ?? 1006, ev?.reason);
+      const timer = setTimeout(
+        () => this.onHandshakeTimeout(socket),
+        this.options.handshakeTimeoutMs,
+      );
+      this.handshake = { resolve, reject, timer };
+      this.attach(socket);
     });
   }
 
-  /** Close the session and stop reconnecting. */
-  disconnect(code = 1000, reason = "client closing"): void {
-    this.manualClose = true;
+  /**
+   * Makes `socket` the current one. Every handler checks that it still is,
+   * so a socket that has been replaced or abandoned can no longer touch the
+   * session, even if its close event arrives late.
+   */
+  private attach(socket: WebSocketInstance): void {
+    this.socket = socket;
+    try {
+      socket.binaryType = "arraybuffer";
+    } catch {
+      // Some implementations only allow this after open; harmless either way.
+    }
+    socket.onopen = () => {
+      if (socket === this.socket) this.onOpen();
+    };
+    socket.onmessage = (event) => {
+      if (socket === this.socket) this.onMessage(event.data);
+    };
+    socket.onerror = () => {
+      if (socket === this.socket) this.emit("error", new Error("websocket error"));
+    };
+    socket.onclose = (event) => {
+      if (socket === this.socket) this.onClose(event?.code ?? ABANDONED_CLOSE_CODE, event?.reason);
+    };
+  }
+
+  /** Stops listening to `socket` and closes it. */
+  private detach(socket: WebSocketInstance, code: number, reason: string): void {
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    try {
+      socket.close(code, reason);
+    } catch {
+      // Already closing or closed; nothing is listening to it any more anyway.
+    }
+  }
+
+  /** Drops the current socket, if any, failing everything that waited on it. */
+  private releaseSocket(error: Error, code = CLIENT_CLOSE_CODE, reason = "client closing"): void {
     this.cancelReconnect();
     this.stopPing();
-    const ws = this.ws;
-    this.ws = null;
-    try {
-      ws?.close(code, reason);
-    } catch {
-      // Already closing; nothing useful to do.
-    }
-    this.failPending(new Error("disconnected"));
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) this.detach(socket, code, reason);
+    this.failPending(error);
+    this.rejectHandshake(error);
+  }
+
+  /**
+   * Closes the session and stops reconnecting. Emits `close` at once, since
+   * the socket's own close event is no longer listened to.
+   *
+   * @param code The close code to send (1000, or 3000 to 4999).
+   * @param reason The close reason to send.
+   */
+  disconnect(code = CLIENT_CLOSE_CODE, reason = "client closing"): void {
+    this.manualClose = true;
+    const wasOpen = this.socket !== null;
+    this.releaseSocket(new Error("disconnected"), code, reason);
     this.setState("closed");
+    if (wasOpen) {
+      this.emit("close", { code, reason: closeReasonFor(code), willReconnect: false, message: reason });
+    }
   }
 
   private onOpen(): void {
     this.setState("handshaking");
     this.send({
       t: "hello",
-      proto: { major: 1, minor: 2 },
+      proto: { ...LINK_PROTO_VERSION },
       client: {
         name: this.connectOptions.clientName,
         app: this.connectOptions.app ?? "dspi-link-js",
-        version: this.connectOptions.version ?? "1.2.0",
+        version: this.connectOptions.version ?? LINK_LIBRARY_VERSION,
       },
     });
   }
 
+  /** The hub said nothing useful in time: give up on this socket as if it had dropped. */
+  private onHandshakeTimeout(socket: WebSocketInstance): void {
+    if (socket !== this.socket) return;
+    this.rejectHandshake(new Error("the hub did not answer in time"));
+    this.abandonSocket(socket, "handshake timed out");
+  }
+
+  /**
+   * Gives up on a socket that is open but useless (no answer to the
+   * handshake or to keepalives). A browser may not report such a socket
+   * closed for minutes, so the client treats it as an abnormal close now,
+   * which reconnects when reconnection is on.
+   */
+  private abandonSocket(socket: WebSocketInstance, reason: string): void {
+    this.detach(socket, CLIENT_CLOSE_CODE, reason);
+    this.onClose(ABANDONED_CLOSE_CODE, reason);
+  }
+
   private onClose(code: number, message?: string): void {
     this.stopPing();
-    this.ws = null;
+    this.socket = null;
     const reason = closeReasonFor(code);
-    // A revoked token or a rejected auth will fail the same way on retry, so
-    // those close codes end the session instead of starting a backoff loop.
-    const retryable = reason !== "normal" && reason !== "auth_failed" && reason !== "revoked";
-    const willReconnect = this.options.reconnect && !this.manualClose && retryable;
+    const willReconnect =
+      this.options.reconnect && !this.manualClose && !FINAL_CLOSE_REASONS.has(reason);
 
     this.failPending(new Error(`connection closed (${code})`));
     if (reason === "revoked") this._token = null;
     this.emit("close", { code, reason, willReconnect, message });
-
-    if (this.handshake) {
-      const { reject } = this.handshake;
-      this.handshake = null;
-      reject(new Error(`connection closed during handshake (${code})`));
-    }
+    this.rejectHandshake(new Error(`connection closed during handshake (${code})`));
 
     if (willReconnect) {
       this.setState("reconnecting");
@@ -489,15 +594,15 @@ export class LinkClient {
   }
 
   private scheduleReconnect(): void {
-    const delay = Math.min(
+    const delayMs = Math.min(
       RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
       this.options.reconnectMaxMs,
     );
     this.reconnectAttempt++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.open().catch((e) => this.emit("error", e as Error));
-    }, delay);
+      this.open().catch((error: unknown) => this.emit("error", asError(error)));
+    }, delayMs);
   }
 
   private cancelReconnect(): void {
@@ -519,60 +624,58 @@ export class LinkClient {
   }
 
   private onText(text: string): void {
-    let msg: LinkMessage;
+    let message: LinkMessage;
     try {
-      msg = decodeMessage(text);
-    } catch (e) {
-      this.emit("error", e as Error);
+      message = decodeMessage(text);
+    } catch (error) {
+      this.emit("error", asError(error));
       return;
     }
-    this.emit("message", msg);
+    this.emit("message", message);
 
-    switch (msg.t) {
-      case "hello":
-        this.onHubHello(msg as HelloHubMessage);
-        return;
-      case "ok":
-      case "err":
-        this.settleRequest(msg as OkMessage | ErrMessage);
-        return;
-      case "device.added":
-      case "device.changed": {
-        const dev = (msg as { device?: DeviceInfo }).device;
-        if (dev) {
-          this.devices.set(dev.handle, dev);
-          this.emit("devices", this.deviceList);
-        }
-        return;
-      }
-      case "device.removed": {
-        const handle = (msg as { handle?: number }).handle;
-        if (handle !== undefined && this.devices.delete(handle)) {
-          this.pollSubscriptions.delete(handle);
-          this.emit("devices", this.deviceList);
-        }
-        return;
-      }
-      case "hub.config.changed": {
-        const config = (msg as HubConfigChangedMessage).config;
-        if (config) this.emit("hubConfig", config);
-        return;
-      }
-      default:
-        // Unknown events are dropped, per spec 10.3; `message` already fired.
-        return;
+    if (isMessage(message, "hello")) {
+      this.onHubHello(message);
+    } else if (isMessage(message, "ok") || isMessage(message, "err")) {
+      this.settleRequest(message);
+    } else if (isMessage(message, "device.added") || isMessage(message, "device.changed")) {
+      if (message.device) this.onDeviceUpdate(message.device);
+    } else if (isMessage(message, "device.removed")) {
+      this.onDeviceRemoved(message.handle);
+    } else if (isMessage(message, "hub.config.changed")) {
+      if (message.config) this.emit("hubConfig", message.config);
     }
+    // Anything else is an event this client does not act on (Link spec 10,
+    // rule 3); listeners of `message` have already seen it.
+  }
+
+  private onDeviceUpdate(device: DeviceInfo): void {
+    const previous = this.devices.get(device.handle);
+    this.devices.set(device.handle, device);
+    this.emit("devices", this.deviceList);
+    // A device going offline ends its poll subscriptions at the hub (Link
+    // spec 7.6), so they are sent again when it comes back.
+    if (previous && previous.state !== "online" && device.state === "online") {
+      this.restorePolls(device.handle).catch((error: unknown) =>
+        this.emit("error", asError(error)),
+      );
+    }
+  }
+
+  private onDeviceRemoved(handle: number | undefined): void {
+    if (handle === undefined || !this.devices.delete(handle)) return;
+    this.pollSubscriptions.delete(handle);
+    this.emit("devices", this.deviceList);
   }
 
   private onBinary(bytes: Uint8Array): void {
     let frame;
     try {
       frame = decodeFrame(bytes);
-    } catch (e) {
-      if (e instanceof LinkFrameError) this.emit("error", e);
+    } catch (error) {
+      this.emit("error", asError(error));
       return;
     }
-    if (!frame) return; // Unknown frame type: drop it (spec 10.4).
+    if (!frame) return; // Unknown frame type: drop it (Link spec 10, rule 4).
 
     switch (frame.type) {
       case "cmd_response": {
@@ -593,38 +696,32 @@ export class LinkClient {
         this.emit("resync", frame);
         return;
       case "fwdata_ack":
-        this.settleAck(frame);
+        this.updater.settleAck(frame);
         return;
       default:
         return;
     }
   }
 
-  private settleAck(frame: FwDataAckFrame): void {
-    const key = `${frame.tag}:${frame.offset}`;
-    const pending = this.pendingAcks.get(key);
-    if (!pending) return;
-    this.pendingAcks.delete(key);
-    clearTimeout(pending.timer);
-    if (frame.status === 0) pending.resolve();
-    else pending.reject(new Error(`the hub refused the chunk at offset ${frame.offset}`));
-  }
-
   private onHubHello(hello: HelloHubMessage): void {
     this._hub = hello;
+    const socket = this.socket;
     if (hello.auth === "none") {
       // Open access opens the session on hello, but the client still needs its
       // session id to suppress its own notification echoes, and auth.pair is
-      // the documented way to ask for it (spec 6.1). The PIN is ignored.
+      // the documented way to ask for it (Link spec 6.1).
       this.setState("authenticating");
-      this.sendPair("000000", this.connectOptions.clientName, this.connectOptions.role).catch(
-        (e) => this.onAuthFailed(e as Error),
+      const { clientName, role } = this.connectOptions;
+      this.sendPair(OPEN_ACCESS_PIN, clientName, role).catch((error: unknown) =>
+        this.onAuthFailed(asError(error), socket),
       );
       return;
     }
     if (this._token) {
       this.setState("authenticating");
-      this.sendToken(this._token).catch((e) => this.onAuthFailed(e as Error));
+      this.sendToken(this._token).catch((error: unknown) =>
+        this.onAuthFailed(asError(error), socket),
+      );
       return;
     }
     this.setState("awaiting_pairing");
@@ -632,109 +729,154 @@ export class LinkClient {
   }
 
   private async sendToken(token: string): Promise<void> {
-    const ok = await this.request<AuthTokenMessage>({ t: "auth.token", id: 0, token });
-    await this.onAuthenticated(ok);
+    const message: AuthTokenMessage = { t: "auth.token", id: 0, token };
+    const reply = await this.request(message);
+    await this.onAuthenticated(reply);
   }
 
   /**
-   * The automatic half of the handshake could not authenticate. A rejected
-   * token is not fatal: drop it and let the user pair again. If the socket has
-   * already gone, onClose owns the state and there is nothing to say here.
+   * The automatic half of the handshake could not authenticate on `socket`.
+   * If that socket has gone, onClose owns the state and the token is kept for
+   * the next connection: losing the network is not the token's fault. Only a
+   * refusal by the hub drops the token; then, or after a timeout, the user
+   * can pair again.
    */
-  private onAuthFailed(e: Error): void {
-    this._token = null;
-    this.emit("error", e);
-    if (!this.ws) return;
+  private onAuthFailed(error: Error, socket: WebSocketInstance | null): void {
+    if (socket !== this.socket) return;
+    this.emit("error", error);
+    if (error instanceof LinkProtocolError && TOKEN_REJECTION_CODES.has(error.code)) {
+      this._token = null;
+    }
     this.setState("awaiting_pairing");
     this.settleHandshake();
   }
 
   private async sendPair(pin: string, name: string, role?: LinkRole): Promise<string | null> {
-    const body: AuthPairMessage = { t: "auth.pair", id: 0, pin, name };
-    if (role) body.role = role;
-    const ok = await this.request<AuthPairMessage>(body);
-    await this.onAuthenticated(ok);
+    const message: AuthPairMessage = { t: "auth.pair", id: 0, pin, name };
+    if (role) message.role = role;
+    const reply = await this.request(message);
+    await this.onAuthenticated(reply);
     return this._token;
   }
 
-  private async onAuthenticated(ok: OkMessage): Promise<void> {
-    this._session = ok.session ?? null;
-    this._role = ok.role ?? null;
-    this._policy = ok.policy ?? null;
-    if (typeof ok.token === "string") this._token = ok.token;
+  private async onAuthenticated(reply: OkMessage): Promise<void> {
+    this._session = reply.session ?? null;
+    this._role = reply.role ?? null;
+    this._policy = reply.policy ?? null;
+    if (typeof reply.token === "string") this._token = reply.token;
     this.setState("ready");
     this.reconnectAttempt = 0;
     this.startPing();
     try {
       await this.refreshDevices();
       await this.restorePollSubscriptions();
-    } catch (e) {
-      this.emit("error", e as Error);
+    } catch (error) {
+      this.emit("error", asError(error));
     }
     this.settleHandshake();
   }
 
   private settleHandshake(): void {
-    if (!this.handshake) return;
-    const { resolve } = this.handshake;
+    const handshake = this.handshake;
+    if (!handshake) return;
     this.handshake = null;
-    resolve();
+    clearTimeout(handshake.timer);
+    handshake.resolve();
+  }
+
+  private rejectHandshake(error: Error): void {
+    const handshake = this.handshake;
+    if (!handshake) return;
+    this.handshake = null;
+    clearTimeout(handshake.timer);
+    handshake.reject(error);
   }
 
   // -- public API -----------------------------------------------------------
 
   /**
-   * Pair with a PIN the hub is showing. Returns the long-lived token to store
-   * against the hub id (null when the hub runs open access and issues none).
+   * Pairs with a PIN the hub is showing, or the hub's fixed PIN.
+   *
+   * @param pin The 6-digit PIN.
+   * @param clientName The name to list this client under; defaults to connect()'s.
+   * @param role The role to ask for; the hub may grant another.
+   * @returns The long-lived token to store against the hub id, or null when
+   *   the hub runs open access and issues none. Rejects with
+   *   LinkProtocolError for a wrong PIN, leaving the state awaiting_pairing.
    */
   pair(pin: string, clientName?: string, role?: LinkRole): Promise<string | null> {
     const name = clientName ?? this.connectOptions.clientName;
     if (clientName) this.connectOptions.clientName = clientName;
     if (role) this.connectOptions.role = role;
     this.setState("authenticating");
-    return this.sendPair(pin, name, role ?? this.connectOptions.role).catch((e) => {
+    return this.sendPair(pin, name, role ?? this.connectOptions.role).catch((error: unknown) => {
       this.setState("awaiting_pairing");
-      throw e;
+      throw error;
     });
   }
 
-  /** Re-read the inventory and replace the cached device map. */
+  /**
+   * Re-reads the inventory and replaces the cached device map.
+   *
+   * @returns The devices, in handle order.
+   */
   async refreshDevices(): Promise<DeviceInfo[]> {
-    const ok = await this.request({ t: "device.list", id: 0 });
-    this.devices = new Map((ok.devices ?? []).map((d) => [d.handle, d]));
+    const reply = await this.request({ t: "device.list", id: 0 });
+    this.devices = new Map((reply.devices ?? []).map((device) => [device.handle, device]));
     this.emit("devices", this.deviceList);
     return this.deviceList;
   }
 
-  /** Tunnel one vendor command and wait for its response frame (spec 8.2). */
-  command(req: Omit<CmdRequestFrame, "type" | "tag">): Promise<CmdResponseFrame> {
-    const ws = this.requireSocket();
+  /**
+   * Tunnels one vendor command and waits for its response frame (Link spec 8.2).
+   *
+   * @param request The command; the tag is chosen here.
+   * @returns The response, whatever its status. Rejects on a timeout or a
+   *   closed session.
+   */
+  command(request: Omit<CmdRequestFrame, "type" | "tag">): Promise<CmdResponseFrame> {
+    const socket = this.requireSocket();
     const tag = this.allocateTag();
-    const frame: CmdRequestFrame = { ...req, type: "cmd_request", tag };
+    const frame: CmdRequestFrame = { ...request, type: "cmd_request", tag };
     return new Promise<CmdResponseFrame>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingCommands.delete(tag);
-        reject(new Error(`command 0x${req.bRequest.toString(16)} timed out`));
+        reject(new Error(`command 0x${request.bRequest.toString(16)} timed out`));
       }, this.options.commandTimeoutMs);
       this.pendingCommands.set(tag, { resolve, reject, timer });
       try {
-        ws.send(encodeFrame(frame));
-      } catch (e) {
+        socket.send(encodeFrame(frame));
+      } catch (error) {
         this.pendingCommands.delete(tag);
         clearTimeout(timer);
-        reject(e as Error);
+        reject(asError(error));
       }
     });
   }
 
-  /** command(), rejecting when the hub or device did not answer OK. */
-  async commandOk(req: Omit<CmdRequestFrame, "type" | "tag">): Promise<Uint8Array> {
-    const res = await this.command(req);
-    if (res.status !== LinkStatus.OK) throw new LinkCommandError(res);
-    return res.payload;
+  /**
+   * command(), rejecting when the hub or device did not answer OK.
+   *
+   * @param request The command.
+   * @returns The response payload.
+   * @throws LinkCommandError for a status other than OK.
+   */
+  async commandOk(request: Omit<CmdRequestFrame, "type" | "tag">): Promise<Uint8Array> {
+    const response = await this.command(request);
+    if (response.status !== LinkStatus.OK) throw new LinkCommandError(response);
+    return response.payload;
   }
 
-  /** Convenience GET: `wLength` is the number of bytes requested. */
+  /**
+   * A GET command.
+   *
+   * @param handle The device.
+   * @param bRequest The vendor command id.
+   * @param wLength The number of bytes requested.
+   * @param wValue The command's wValue.
+   * @param wIndex 2 for application commands.
+   * @returns The response frame.
+   */
   get(
     handle: number,
     bRequest: number,
@@ -745,7 +887,16 @@ export class LinkClient {
     return this.command({ handle, direction: "get", bRequest, wValue, wIndex, wLength });
   }
 
-  /** Convenience SET. */
+  /**
+   * A SET command.
+   *
+   * @param handle The device.
+   * @param bRequest The vendor command id.
+   * @param payload The bytes to send; wLength is their length.
+   * @param wValue The command's wValue.
+   * @param wIndex 2 for application commands.
+   * @returns The response frame.
+   */
   set(
     handle: number,
     bRequest: number,
@@ -756,100 +907,173 @@ export class LinkClient {
     return this.command({ handle, direction: "set", bRequest, wValue, wIndex, payload });
   }
 
-  /** The hub's cached bulk blob and status frame, one round trip (spec 7.5). */
+  /**
+   * The hub's cached bulk blob and status frame, one round trip (Link spec 7.5).
+   *
+   * @param handle The device.
+   * @returns The reply, with `bulk` and `status` decoded from base64.
+   */
   async snapshot(handle: number): Promise<SnapshotResult> {
-    const ok = await this.request({ t: "device.snapshot", id: 0, handle });
+    const reply = await this.request({ t: "device.snapshot", id: 0, handle });
     const result: SnapshotResult = {
-      handle: ok.handle ?? handle,
-      wire_version: ok.wire_version,
-      age_ms: ok.age_ms,
-      bulk_b64: ok.bulk_b64,
-      status_b64: ok.status_b64,
+      handle: reply.handle ?? handle,
+      wire_version: reply.wire_version,
+      age_ms: reply.age_ms,
+      bulk_b64: reply.bulk_b64,
+      status_b64: reply.status_b64,
     };
-    if (ok.bulk_b64) result.bulk = base64ToBytes(ok.bulk_b64);
-    if (ok.status_b64) result.status = base64ToBytes(ok.status_b64);
+    if (reply.bulk_b64) result.bulk = base64ToBytes(reply.bulk_b64);
+    if (reply.status_b64) result.status = base64ToBytes(reply.status_b64);
     return result;
   }
 
-  /** Subscribe to periodic GETs the hub pushes back as POLL frames (spec 7.6). */
+  /**
+   * Subscribes to periodic GETs the hub pushes back as POLL frames (Link spec
+   * 7.6). The subscription is remembered from the moment it is asked for, so
+   * an unsubscribe sent before the reply arrives still wins, and it is sent
+   * again after a reconnect or when the device comes back online.
+   *
+   * @param handle The device.
+   * @param polls The polls, each in its own slot.
+   * @returns The rates the hub granted.
+   */
   async subscribePolls(handle: number, polls: PollRequest[]): Promise<PollGrant[]> {
-    const ok = await this.request({ t: "poll.subscribe", id: 0, handle, polls });
     let slots = this.pollSubscriptions.get(handle);
     if (!slots) {
       slots = new Map();
       this.pollSubscriptions.set(handle, slots);
     }
-    for (const p of polls) slots.set(p.slot, p);
-    return ok.granted ?? [];
+    for (const poll of polls) slots.set(poll.slot, poll);
+    try {
+      const reply = await this.request({ t: "poll.subscribe", id: 0, handle, polls });
+      return reply.granted ?? [];
+    } catch (error) {
+      for (const poll of polls) {
+        if (slots.get(poll.slot) === poll) slots.delete(poll.slot);
+      }
+      throw error;
+    }
   }
 
+  /**
+   * Ends poll subscriptions. They are forgotten here first, so they are never
+   * restored even if the request fails.
+   *
+   * @param handle The device.
+   * @param slots The slots to end.
+   */
   async unsubscribePolls(handle: number, slots: number[]): Promise<void> {
     const known = this.pollSubscriptions.get(handle);
-    if (known) for (const s of slots) known.delete(s);
+    if (known) for (const slot of slots) known.delete(slot);
     await this.request({ t: "poll.unsubscribe", id: 0, handle, slots });
   }
 
   private async restorePollSubscriptions(): Promise<void> {
-    for (const [handle, slots] of this.pollSubscriptions) {
-      if (slots.size === 0) continue;
-      await this.request({ t: "poll.subscribe", id: 0, handle, polls: [...slots.values()] });
-    }
+    for (const handle of this.pollSubscriptions.keys()) await this.restorePolls(handle);
   }
 
+  private async restorePolls(handle: number): Promise<void> {
+    const slots = this.pollSubscriptions.get(handle);
+    if (!slots || slots.size === 0) return;
+    await this.request({ t: "poll.subscribe", id: 0, handle, polls: [...slots.values()] });
+  }
+
+  /**
+   * Takes a device's exclusive lock (Link spec 7.7).
+   *
+   * @param handle The device.
+   * @param reason Shown to other clients.
+   * @param timeoutMs When the hub releases it by itself; the hub caps it at 60 s.
+   */
   async acquireLock(handle: number, reason?: string, timeoutMs?: number): Promise<void> {
-    const msg: Record<string, unknown> = { t: "lock.acquire", id: 0, handle };
-    if (reason) msg.reason = reason;
-    if (timeoutMs !== undefined) msg.timeout_ms = timeoutMs;
-    await this.request(msg as unknown as LinkMessage);
+    const message: LockAcquireMessage = { t: "lock.acquire", id: 0, handle };
+    if (reason) message.reason = reason;
+    if (timeoutMs !== undefined) message.timeout_ms = timeoutMs;
+    await this.request(message);
   }
 
+  /**
+   * Releases a lock this session holds.
+   *
+   * @param handle The device.
+   */
   async releaseLock(handle: number): Promise<void> {
     await this.request({ t: "lock.release", id: 0, handle });
   }
 
+  /**
+   * Changes a device's hub-stored name (Link spec 7.4; capability "rename").
+   *
+   * @param handle The device.
+   * @param name The new name.
+   */
   async renameDevice(handle: number, name: string): Promise<void> {
     await this.request({ t: "device.rename", id: 0, handle, name });
   }
 
-  // -- hub administration (admin role; spec 7.9 to 7.13) -------------------
+  // -- hub administration (admin role; Link spec 7.9 to 7.13) ---------------
   //
   // Each group needs its capability in the hub's hello (hasCap): "rename",
   // "hub_config", "wifi", "auth_config" and "reset".
 
+  /**
+   * Renames the hub itself (Link spec 7.9).
+   *
+   * @param name The new name.
+   */
   async renameHub(name: string): Promise<void> {
     await this.request({ t: "hub.rename", id: 0, name });
   }
 
-  /** The hub's counters. The bridge adds fields of its own. */
+  /**
+   * The hub's counters (Link spec 7.9). A bridge adds a `bridge` object.
+   *
+   * @returns The whole ok reply.
+   */
   hubStats(): Promise<OkMessage> {
     return this.request({ t: "hub.stats", id: 0 });
   }
 
+  /**
+   * Reads the hub's settings (Link spec 7.10).
+   *
+   * @returns The configuration and the permitted values of its fixed-set keys.
+   */
   async getHubConfig(): Promise<HubConfigResult> {
-    const ok = await this.request({ t: "hub.config.get", id: 0 });
-    return { config: ok.config ?? {}, options: ok.options ?? {} };
+    const reply = await this.request({ t: "hub.config.get", id: 0 });
+    return { config: reply.config ?? {}, options: reply.options ?? {} };
   }
 
   /**
-   * Changes only the keys in `change`; nested objects merge. Resolves to the
-   * whole configuration after the change. A rejected value rejects with a
-   * LinkProtocolError whose `field` names the key.
+   * Changes only the keys in `change`; nested objects merge (Link spec 7.10).
+   *
+   * @param change The keys to change.
+   * @returns The whole configuration after the change. A rejected value
+   *   rejects with a LinkProtocolError whose `field` names the key.
    */
   async setHubConfig(change: HubConfig): Promise<HubConfig> {
-    const ok = await this.request({ t: "hub.config.set", id: 0, config: change });
-    return ok.config ?? {};
-  }
-
-  /** Nearby networks, strongest first, and the one the hub is on. */
-  async scanWifi(): Promise<WifiScanResult> {
-    const ok = await this.request({ t: "hub.wifi.scan", id: 0 }, WIFI_SCAN_TIMEOUT_MS);
-    return { current: ok.current ?? null, networks: ok.networks ?? [] };
+    const reply = await this.request({ t: "hub.config.set", id: 0, config: change });
+    return reply.config ?? {};
   }
 
   /**
-   * Asks the hub to move to another network. Resolving means the hub took the
-   * request, not that the join worked: the hub then closes every session
-   * (code 4003) and either joins or goes back to its old network.
+   * Scans for Wi-Fi networks (Link spec 7.11).
+   *
+   * @returns Nearby networks, strongest first, and the one the hub is on.
+   */
+  async scanWifi(): Promise<WifiScanResult> {
+    const reply = await this.request({ t: "hub.wifi.scan", id: 0 }, WIFI_SCAN_TIMEOUT_MS);
+    return { current: reply.current ?? null, networks: reply.networks ?? [] };
+  }
+
+  /**
+   * Asks the hub to move to another network (Link spec 7.11). Resolving
+   * means the hub took the request, not that the join worked: the hub then
+   * closes every session (code 4003) and either joins or goes back to its
+   * old network.
+   *
+   * @param ssid The network to join.
+   * @param password Its password; empty for an open network.
    */
   async joinWifi(ssid: string, password: string): Promise<void> {
     await this.request({ t: "hub.wifi.join", id: 0, ssid, password });
@@ -857,227 +1081,145 @@ export class LinkClient {
 
   /**
    * Turns on a fixed PIN (a 6-digit `pin`), window PINs (`pin` left out), or
-   * open access (`mode` "none"). Every token is revoked; this session stays
-   * open and, in pin mode, gets a fresh token, which is returned and kept
-   * here for reconnecting. Store it as connect() would.
+   * open access (`mode` "none") (Link spec 7.12). Every token is revoked;
+   * this session stays open and, in pin mode, gets a fresh token, which is
+   * kept here for reconnecting.
+   *
+   * @param mode "pin" or "none".
+   * @param pin The fixed PIN, for mode "pin".
+   * @returns The new token, to store as connect() would, or null.
    */
   async setAuth(mode: "none" | "pin", pin?: string): Promise<string | null> {
-    const msg: Record<string, unknown> = { t: "hub.auth.set", id: 0, mode };
-    if (pin !== undefined) msg.pin = pin;
-    const ok = await this.request(msg);
-    this._token = typeof ok.token === "string" ? ok.token : null;
+    const message: HubAuthSetMessage = { t: "hub.auth.set", id: 0, mode };
+    if (pin !== undefined) message.pin = pin;
+    const reply = await this.request(message);
+    this._token = typeof reply.token === "string" ? reply.token : null;
     return this._token;
   }
 
-  /** The paired clients, for a hub in pin mode (spec 6.2). */
+  /**
+   * The paired clients, for a hub in pin mode (Link spec 6.2 and 7.3).
+   *
+   * @returns One record per paired client.
+   */
   async listClients(): Promise<AuthClientInfo[]> {
-    const ok = await this.request({ t: "auth.list", id: 0 });
-    return ok.clients ?? [];
+    const reply = await this.request({ t: "auth.list", id: 0 });
+    return reply.clients ?? [];
   }
 
-  /** Revokes one client's token; its live sessions close with code 4002. */
-  async revokeClient(cid: number): Promise<void> {
-    await this.request({ t: "auth.revoke", id: 0, cid });
+  /**
+   * Revokes one client's token; its live sessions close with code 4002.
+   *
+   * @param clientId The client's `cid` from listClients().
+   */
+  async revokeClient(clientId: number): Promise<void> {
+    await this.request({ t: "auth.revoke", id: 0, cid: clientId });
   }
 
-  /** The hub replies ok, then closes every session (4003) and restarts. */
+  /** Restarts the hub (Link spec 7.13): it replies ok, then closes every session (4003). */
   async restartHub(): Promise<void> {
     await this.request({ t: "hub.restart", id: 0 });
   }
 
-  /** Erases the network connection only, or all hub state, then restarts. */
+  /**
+   * Erases the network connection only, or all hub state, then restarts
+   * (Link spec 7.13).
+   *
+   * @param level "network" or "factory".
+   */
   async resetHub(level: HubResetLevel): Promise<void> {
     await this.request({ t: "hub.reset", id: 0, level });
   }
 
   /**
-   * Installs new firmware on the hub itself (spec 7.14; capability
-   * "hub_update"). Sends `image` as FWDATA chunks, a few ahead of their
-   * acks, and resolves with the new version once the hub has checked it.
-   * The hub then closes every session (4003) and restarts into it; the
-   * `hello` after reconnecting shows which firmware is running. Rejects
-   * with the hub's reason if it refuses the image.
+   * Installs new firmware on the hub itself (Link spec 7.14; capability
+   * "hub_update"). The hub then closes every session (4003) and restarts
+   * into it; the `hello` after reconnecting shows which firmware is running.
+   *
+   * @param image The whole firmware file.
+   * @param options The version to log and a progress callback.
+   * @returns The new version, once the hub has checked the image. Rejects
+   *   with the hub's reason if it refuses the request or the image.
    */
-  async updateHub(image: Uint8Array, options: HubUpdateOptions = {}): Promise<string> {
-    const request: Record<string, unknown> = {
-      t: "hub.update",
-      id: 0,
-      size: image.length,
-      sha256: sha256Hex(image),
-    };
-    if (options.version) request.version = options.version;
-    const done = this.nextMessage<HubUpdateDoneMessage>("hub.update.done");
-    const ok = await this.request(request);
-    const xfer = ok.xfer as number;
-
-    // A refusal can arrive at any point; it ends the upload with the hub's
-    // own reason rather than a bare "chunk refused".
-    const refused = done.promise.then((message) => {
-      if (!message.ok) throw new LinkProtocolError("internal", message.msg ?? "update refused");
-      return new Promise<never>(() => {}); // A success settles nothing here
-    });
-    refused.catch(() => {}); // Handled below; never an unhandled rejection
-
-    try {
-      await Promise.race([this.sendImage(xfer, image, options.onProgress), refused]);
-      const result = await withTimeout(done.promise, UPDATE_DONE_TIMEOUT_MS, "hub.update.done");
-      if (!result.ok) throw new LinkProtocolError("internal", result.msg ?? "update refused");
-      return result.version ?? options.version ?? "";
-    } catch (error) {
-      // Prefer the hub's explanation if it follows right behind.
-      const message = await withTimeout(done.promise, 2000, "").catch(() => null);
-      if (message && !message.ok) {
-        throw new LinkProtocolError("internal", message.msg ?? "update refused");
-      }
-      throw error;
-    } finally {
-      done.cancel();
-      this.dropAcks(xfer);
-    }
-  }
-
-  /** Forgets the chunks of `xfer` still waiting for acks, once the update
-   * is over either way. */
-  private dropAcks(xfer: number): void {
-    for (const [key, pending] of this.pendingAcks) {
-      if (key.startsWith(`${xfer}:`)) {
-        clearTimeout(pending.timer);
-        this.pendingAcks.delete(key);
-      }
-    }
-  }
-
-  /** Sends the chunks of one transfer, keeping UPDATE_WINDOW unanswered. */
-  private async sendImage(
-    xfer: number,
-    image: Uint8Array,
-    onProgress?: (written: number, total: number) => void,
-  ): Promise<void> {
-    const chunkBytes = (this.limits?.max_frame ?? 16384) - 8;
-    const inFlight: Array<Promise<number>> = [];
-    let written = 0;
-    for (let offset = 0; offset < image.length; offset += chunkBytes) {
-      if (inFlight.length >= UPDATE_WINDOW) {
-        written += await inFlight.shift()!;
-        onProgress?.(written, image.length);
-      }
-      const data = image.subarray(offset, offset + chunkBytes);
-      const chunk = this.sendChunk(xfer, offset, data).then(() => data.length);
-      chunk.catch(() => {}); // Awaited in turn below; a later chunk may fail first
-      inFlight.push(chunk);
-    }
-    for (const chunk of inFlight) {
-      written += await chunk;
-      onProgress?.(written, image.length);
-    }
-  }
-
-  private sendChunk(xfer: number, offset: number, data: Uint8Array): Promise<void> {
-    const ws = this.requireSocket();
-    const key = `${xfer}:${offset}`;
-    return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingAcks.delete(key);
-        reject(new Error(`no answer for the chunk at offset ${offset}`));
-      }, UPDATE_ACK_TIMEOUT_MS);
-      this.pendingAcks.set(key, { resolve, reject, timer });
-      ws.send(encodeFrame({ type: "fwdata", tag: xfer, offset, data }));
-    });
-  }
-
-  /** The next message of type `t`, as a promise that can be called off. */
-  private nextMessage<T extends LinkMessage>(t: string): {
-    promise: Promise<T>;
-    cancel: () => void;
-  } {
-    let stop = (): void => {};
-    const promise = new Promise<T>((resolve) => {
-      stop = this.on("message", (message) => {
-        if (message.t === t) {
-          stop();
-          resolve(message as T);
-        }
-      });
-    });
-    return { promise, cancel: () => stop() };
+  updateHub(image: Uint8Array, options: HubUpdateOptions = {}): Promise<string> {
+    return this.updater.run(image, options);
   }
 
   // -- plumbing -------------------------------------------------------------
 
-  /** Send a request and wait for its ok/err. `id` is assigned here. */
+  /**
+   * Sends a request and waits for its ok or err. The `id` is assigned here.
+   *
+   * @param message The request; any `id` in it is replaced.
+   * @param timeoutMs How long to wait for the reply.
+   * @returns The ok reply. Rejects with LinkProtocolError for an err reply,
+   *   or Error on a timeout or a closed session.
+   */
   request<T extends LinkMessage = LinkMessage>(
-    msg: T | Record<string, unknown>,
+    message: T | Record<string, unknown>,
     timeoutMs = this.options.requestTimeoutMs,
   ): Promise<OkMessage> {
-    const ws = this.requireSocket();
+    const socket = this.requireSocket();
     const id = this.nextId++;
-    if (this.nextId > 0x7fffffff) this.nextId = 1;
-    const framed = { ...(msg as Record<string, unknown>), id } as LinkMessage;
+    if (this.nextId > MAX_REQUEST_ID) this.nextId = 1;
+    const framed = { ...(message as Record<string, unknown>), id } as LinkMessage;
     return new Promise<OkMessage>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(id);
-        reject(new Error(`request ${String((msg as { t: string }).t)} timed out`));
+        reject(new Error(`request ${framed.t} timed out`));
       }, timeoutMs);
       this.pendingRequests.set(id, { resolve, reject, timer });
       try {
-        ws.send(encodeMessage(framed));
-      } catch (e) {
+        socket.send(encodeMessage(framed));
+      } catch (error) {
         this.pendingRequests.delete(id);
         clearTimeout(timer);
-        reject(e as Error);
+        reject(asError(error));
       }
     });
   }
 
-  private settleRequest(msg: OkMessage | ErrMessage): void {
-    const id = msg.id;
-    if (id === undefined) return;
-    const pending = this.pendingRequests.get(id);
+  private settleRequest(reply: OkMessage | ErrMessage): void {
+    if (reply.id === undefined) return;
+    const pending = this.pendingRequests.get(reply.id);
     if (!pending) return;
-    this.pendingRequests.delete(id);
+    this.pendingRequests.delete(reply.id);
     clearTimeout(pending.timer);
-    if (msg.t === "ok") pending.resolve(msg as OkMessage);
-    else {
-      const err = msg as ErrMessage;
-      pending.reject(new LinkProtocolError(err.code, err.msg, err.field));
-    }
+    if (reply.t === "ok") pending.resolve(reply);
+    else pending.reject(new LinkProtocolError(reply.code, reply.msg, reply.field));
   }
 
-  private send(msg: LinkMessage): void {
-    this.requireSocket().send(encodeMessage(msg));
+  private send(message: LinkMessage): void {
+    this.requireSocket().send(encodeMessage(message));
   }
 
   private requireSocket(): WebSocketInstance {
-    if (!this.ws) throw new Error("not connected");
-    return this.ws;
+    if (!this.socket) throw new Error("not connected");
+    return this.socket;
   }
 
   /** u16 request ids, skipping 0 and anything still outstanding. */
   private allocateTag(): number {
-    for (let i = 0; i < 0x10000; i++) {
+    for (let attempt = 0; attempt < MAX_COMMAND_TAG; attempt++) {
       const tag = this.nextTag;
-      this.nextTag = this.nextTag >= 0xffff ? 1 : this.nextTag + 1;
+      this.nextTag = this.nextTag >= MAX_COMMAND_TAG ? 1 : this.nextTag + 1;
       if (!this.pendingCommands.has(tag)) return tag;
     }
     throw new Error("no free command tag");
   }
 
-  private failPending(err: Error): void {
-    for (const [, p] of this.pendingRequests) {
-      clearTimeout(p.timer);
-      p.reject(err);
+  private failPending(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
     }
     this.pendingRequests.clear();
-    for (const [, p] of this.pendingCommands) {
-      clearTimeout(p.timer);
-      p.reject(err);
+    for (const pending of this.pendingCommands.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
     }
     this.pendingCommands.clear();
-    for (const [, p] of this.pendingAcks) {
-      clearTimeout(p.timer);
-      p.reject(err);
-    }
-    this.pendingAcks.clear();
+    this.updater.failAll(error);
   }
 
   private startPing(): void {
@@ -1095,52 +1237,37 @@ export class LinkClient {
 
   /**
    * Keepalive. Browsers cannot send a WebSocket control ping, so where the
-   * implementation offers one (Node's `ws`) we use it, and otherwise we send a
-   * cheap request instead. The hub answers `unknown_type`, which is a perfectly
-   * good round trip: it proves the socket is not half open.
+   * implementation offers one (Node's `ws`) it is used, and otherwise a cheap
+   * request goes instead. The hub answers `unknown_type`, which is a perfectly
+   * good round trip. No answer at all means the socket is half open, and it
+   * is abandoned so reconnection can start.
    */
   private ping(): void {
-    const ws = this.ws;
-    if (!ws) return;
-    if (typeof ws.ping === "function") {
+    const socket = this.socket;
+    if (!socket) return;
+    if (typeof socket.ping === "function") {
       try {
-        ws.ping();
-      } catch (e) {
-        this.emit("error", e as Error);
+        socket.ping();
+      } catch (error) {
+        this.emit("error", asError(error));
       }
       return;
     }
-    this.request({ t: "ping" }).catch((e) => {
-      if (e instanceof LinkProtocolError) return; // err reply is still a live socket
-      this.emit("error", e as Error);
+    this.request({ t: "ping" }).catch((error: unknown) => {
+      if (error instanceof LinkProtocolError) return; // An err reply proves the socket is live.
+      if (socket !== this.socket) return; // Closed meanwhile; onClose has handled it.
+      this.emit("error", asError(error));
+      this.abandonSocket(socket, "keepalive failed");
     });
   }
 }
 
-/** Normalise whatever the socket handed us into bytes we can decode. */
+/** Normalises whatever the socket handed over into bytes that can be decoded. */
 function toBytes(data: unknown): Uint8Array | null {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) {
-    const v = data as ArrayBufferView;
-    return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   }
   return null;
-}
-
-/** `promise`, or a rejection after `ms` naming `what`. */
-function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
 }

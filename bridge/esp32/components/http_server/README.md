@@ -7,12 +7,13 @@ caller through callbacks, so it does not depend on the hub.
 
 | File | What it does | Portable |
 |------|--------------|----------|
-| `include/http_server.h`, `http_server.c` | Starts the servers, upgrades WebSockets, serves the embedded pages, and sends each session's queued frames in batches without waiting. | no |
+| `include/http_server.h`, `http_server.c` | Starts the servers, upgrades WebSockets, serves the embedded pages, sends each session's queued frames in batches without waiting, and closes sockets only from the server's own task, retrying when ESP-IDF's work queue is full. | no |
 | `include/ws_header.h`, `ws_header.c` | Encodes WebSocket frame headers (RFC 6455). | yes |
 
 Public API: `http_server_start()`, `http_server_send()`,
 `http_server_ping()`, `http_server_close()`, `http_server_release_slot()`,
-`http_server_service()`; `ws_header_encode()`.
+`http_server_service()`, `http_server_peer_address()`;
+`ws_header_encode()`.
 
 Tests: `test/host/test_ws_header.c`; the rest is checked on a board with
 `tools/link_smoke.mjs`.

@@ -18,7 +18,9 @@
 
 #include "esp_http_server.h"
 
-/* Answers one request from the setup network. */
+/* Answers one request from the setup network, on port 80's server task
+ * (http_server calls it). Returns ESP_OK once a reply has gone, or the
+ * error that stopped one, which makes the server close the socket. */
 esp_err_t setup_api_handle(httpd_req_t *request);
 
 #endif /* SETUP_API_H */

@@ -1,44 +1,9 @@
-/* Plain and entirely self-contained: no web fonts, no CDN, so the page works
-   on a LAN with no internet and on a hub that serves two files. Dark by
-   default, light when the system asks for it (bridge spec 10.4). */
+/* The control page's look (bridge spec 10.4): mobile first, the system font,
+   no web fonts and nothing loaded from elsewhere, so the page works on a LAN
+   with no internet and fits in a microcontroller's flash. The colours are in
+   tokens.css, shared with the setup page. */
 
-:root {
-  --bg: #131518;
-  --panel: #1c1f24;
-  --panel-2: #23272e;
-  --line: #2f343c;
-  --text: #e6e8ec;
-  --dim: #9aa2ad;
-  --accent: #5aa9e6;
-  --accent-text: #0d1116;
-  --good: #55c26a;
-  --warn: #e0a33e;
-  --bad: #e05a5a;
-  --good-soft: #17271b;
-  --warn-soft: #2b2213;
-  --bad-soft: #2d1718;
-  color-scheme: dark;
-}
-
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f5f7;
-    --panel: #ffffff;
-    --panel-2: #f0f2f5;
-    --line: #d9dde3;
-    --text: #16181d;
-    --dim: #5d6573;
-    --accent: #2563eb;
-    --accent-text: #ffffff;
-    --good: #15803d;
-    --warn: #a15c07;
-    --bad: #b91c1c;
-    --good-soft: #e7f6ec;
-    --warn-soft: #fdf3e2;
-    --bad-soft: #fde8e8;
-    color-scheme: light;
-  }
-}
+@import "./tokens.css";
 
 * {
   box-sizing: border-box;
@@ -48,7 +13,14 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+  font:
+    15px/1.45 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
     sans-serif;
 }
 
@@ -77,7 +49,7 @@ p {
 }
 
 .panel {
-  background: var(--panel);
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 16px;
@@ -107,7 +79,7 @@ p {
 input[type="text"],
 input[type="password"],
 select {
-  background: var(--panel-2);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 6px;
   color: var(--text);
@@ -116,15 +88,16 @@ select {
   min-width: 0;
 }
 
-input:focus,
-select:focus,
-button:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 button {
-  background: var(--panel-2);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 6px;
   color: var(--text);
@@ -152,7 +125,7 @@ button.danger {
 
 dialog.confirm button.danger {
   background: var(--bad);
-  color: #ffffff;
+  color: var(--bad-text);
   font-weight: 600;
 }
 
@@ -163,6 +136,17 @@ button:disabled {
 
 .grow {
   flex: 1 1 200px;
+}
+
+/* A label above a row of fields on the connect screen. */
+.field-label {
+  display: block;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+.field-label.spaced {
+  margin-top: 16px;
 }
 
 .badge {
@@ -224,6 +208,7 @@ input[type="range"] {
 /* Meters */
 
 .meters {
+  --meter-height: 120px;
   display: flex;
   gap: 6px;
   align-items: flex-end;
@@ -245,8 +230,8 @@ input[type="range"] {
   position: relative;
   width: 100%;
   flex: 1 1 auto;
-  height: 120px;
-  background: var(--panel-2);
+  height: var(--meter-height);
+  background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: 3px;
   overflow: hidden;
@@ -258,11 +243,33 @@ input[type="range"] {
   right: 0;
   bottom: 0;
   height: 0%;
-  background: linear-gradient(to top, var(--good) 0%, var(--good) 70%, var(--warn) 90%, var(--bad) 100%);
+  /* The colours belong to the scale, not to the bar: sized to the whole
+     track and anchored at the bottom, a quiet signal stays green and only a
+     loud one reaches amber and red. */
+  background: linear-gradient(
+      to top,
+      var(--good) 0%,
+      var(--good) 70%,
+      var(--warn) 90%,
+      var(--bad) 100%
+    )
+    bottom / 100% var(--meter-height) no-repeat;
 }
 
 .meter.clipped .track {
   border-color: var(--bad);
+}
+
+/* Said in words as well as in red (bridge spec 10.4). */
+.meter .clip-mark {
+  visibility: hidden;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bad);
+}
+
+.meter.clipped .clip-mark {
+  visibility: visible;
 }
 
 .meter .label {
@@ -486,7 +493,7 @@ input.pin {
 }
 
 .network-list button:hover {
-  background: var(--panel-2);
+  background: var(--surface-2);
 }
 
 .client-list li {
@@ -498,9 +505,27 @@ input.pin {
 
 .maintenance-row {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
   gap: 16px;
-  align-items: center;
   padding: 12px 0;
+}
+
+/* Stacked, the explanation takes only the height its words need. */
+.maintenance-row .grow {
+  flex: none;
+}
+
+/* Side by side once there is room for the button next to its explanation. */
+@media (min-width: 481px) {
+  .maintenance-row {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .maintenance-row .grow {
+    flex: 1 1 200px;
+  }
 }
 
 .maintenance-row + .maintenance-row {
@@ -527,7 +552,7 @@ input.pin {
 }
 
 .wiring .board {
-  fill: var(--panel-2);
+  fill: var(--surface-2);
   stroke: var(--line);
 }
 
@@ -567,7 +592,7 @@ input.pin {
 
 dialog.confirm {
   max-width: min(440px, calc(100vw - 32px));
-  background: var(--panel);
+  background: var(--surface);
   color: var(--text);
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -580,16 +605,4 @@ dialog.confirm::backdrop {
 
 dialog.confirm h3 {
   margin-top: 0;
-}
-
-@media (max-width: 480px) {
-  .maintenance-row {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  /* Stacked, the explanation takes only the height its words need. */
-  .maintenance-row .grow {
-    flex: none;
-  }
 }

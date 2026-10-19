@@ -3,6 +3,8 @@
  * 9.3).
  */
 
+#include <string.h>
+
 #include "check.h"
 #include "link_policy.h"
 
@@ -38,10 +40,19 @@ static void roles_allow_their_classes(void)
     CHECK(link_policy_role_allows(LINK_ROLE_ADMIN, LINK_CLASS_CONFIG));
 }
 
+static void role_names_are_the_wire_names(void)
+{
+    CHECK_STR_EQ(link_policy_role_name(LINK_ROLE_VIEWER), "viewer");
+    CHECK_STR_EQ(link_policy_role_name(LINK_ROLE_ADMIN), "admin");
+    /* A corrupt role must not pass for a real one. */
+    CHECK_STR_EQ(link_policy_role_name((link_role_t)9), "unknown");
+}
+
 void test_link_policy(void)
 {
     RUN(each_direction_has_its_own_class);
     RUN(write_as_read_commands_are_not_read);
     RUN(unlisted_commands_and_directions_are_config);
     RUN(roles_allow_their_classes);
+    RUN(role_names_are_the_wire_names);
 }

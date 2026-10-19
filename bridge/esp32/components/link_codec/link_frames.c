@@ -80,13 +80,13 @@ bool link_decode_cmd_request(const uint8_t *frame, size_t length, link_cmd_reque
 
 bool link_decode_fwdata(const uint8_t *frame, size_t length, link_fwdata_chunk_t *out)
 {
-    if (length < 8 || frame[0] != LINK_FRAME_FWDATA) {
+    if (length < LINK_FWDATA_HEADER_BYTES || frame[0] != LINK_FRAME_FWDATA) {
         return false;
     }
     out->transfer = get_u16(&frame[2]);
     out->offset = get_u32(&frame[4]);
-    out->data = &frame[8];
-    out->length = length - 8;
+    out->data = &frame[LINK_FWDATA_HEADER_BYTES];
+    out->length = length - LINK_FWDATA_HEADER_BYTES;
     return true;
 }
 
@@ -118,7 +118,9 @@ size_t link_encode_notify(uint8_t *out, size_t capacity, uint16_t sequence, uint
     out[4] = handle;
     out[5] = 0;
     put_u16(&out[6], origin);
-    memcpy(&out[8], packet, length);
+    if (length > 0) {
+        memcpy(&out[8], packet, length);
+    }
     return total;
 }
 
@@ -142,7 +144,7 @@ size_t link_encode_poll(uint8_t *out, size_t capacity, uint16_t sequence, uint8_
 size_t link_encode_fwdata_ack(uint8_t *out, size_t capacity, uint16_t transfer, uint32_t offset,
                               uint8_t status)
 {
-    const size_t total = 9;
+    const size_t total = LINK_FWDATA_ACK_BYTES;
     if (capacity < total) {
         return 0;
     }
@@ -154,7 +156,7 @@ size_t link_encode_fwdata_ack(uint8_t *out, size_t capacity, uint16_t transfer, 
 
 size_t link_encode_resync(uint8_t *out, size_t capacity, uint8_t handle, uint8_t reason)
 {
-    const size_t total = 6;
+    const size_t total = LINK_RESYNC_BYTES;
     if (capacity < total) {
         return 0;
     }

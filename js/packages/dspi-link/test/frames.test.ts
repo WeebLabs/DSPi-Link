@@ -1,3 +1,5 @@
+/* The binary frame codec (Link spec 8) against fixtures/frames and hand-made frames. */
+
 import { describe, expect, it } from "vitest";
 import {
   FrameType,

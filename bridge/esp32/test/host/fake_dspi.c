@@ -1,5 +1,6 @@
 /*
- * fake_dspi.c - see fake_dspi.h.
+ * fake_dspi.c - a simulated DSPi for the link engine's host tests (bridge
+ * spec 17). See fake_dspi.h.
  */
 
 #include "fake_dspi.h"
@@ -72,6 +73,11 @@ void fake_dspi_notify(fake_dspi_t *fake, const uint8_t *packet, size_t length, u
     uint8_t frame[96];
     const size_t frame_length = test_build_device_frame(0x40, 0, packet, length, frame);
     send_bytes(fake, frame, frame_length, fake->now_ms + delay_ms);
+}
+
+void fake_dspi_send_raw(fake_dspi_t *fake, const uint8_t *bytes, size_t length, uint32_t delay_ms)
+{
+    send_bytes(fake, bytes, length, fake->now_ms + delay_ms);
 }
 
 static const uint8_t *canned_reply(const fake_dspi_t *fake, uint8_t request, size_t *length)
@@ -217,7 +223,7 @@ static bool port_restart(void *context)
 {
     fake_dspi_t *fake = context;
     fake->restarts++;
-    return true;
+    return !fake->restart_fails;
 }
 
 static uint32_t port_now_ms(void *context)

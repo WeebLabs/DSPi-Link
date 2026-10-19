@@ -12,7 +12,8 @@
  *   notification: A5 40   00     length(2) packet    crc(2)
  *
  * Portable: no ESP-IDF headers. The parser never allocates; the caller
- * gives it the payload buffer.
+ * gives it the payload buffer. These functions keep no shared state: a
+ * parser belongs to whichever task feeds it (the uart task on the bridge).
  */
 
 #ifndef DSPI_FRAME_H
@@ -101,7 +102,9 @@ typedef enum {
 } dspi_parse_result_t;
 
 /* A finished frame. `payload` points into the parser's buffer and stays
- * valid until the next byte is fed. */
+ * valid until the next byte is fed. For a discarded frame (BAD_CRC or
+ * TOO_LONG) the fields hold what the frame claimed and `payload` is NULL,
+ * so the caller can tell whether it might have been the answer it awaits. */
 typedef struct {
     uint8_t type;   /* DSPI_FRAME_TYPE_SET_RESPONSE, _GET_RESPONSE or _NOTIFICATION */
     uint8_t status; /* DSPI_STATUS_*; 0 for a notification */
@@ -147,7 +150,9 @@ bool dspi_parser_in_frame(const dspi_parser_t *parser);
  * Feeds one received byte.
  *
  * Unknown type bytes and bytes outside a frame are noise and are skipped,
- * as the firmware does. On DSPI_PARSE_FRAME, `frame` describes the frame.
+ * as the firmware does. On DSPI_PARSE_FRAME, `frame` describes the frame;
+ * on DSPI_PARSE_BAD_CRC and DSPI_PARSE_TOO_LONG it describes what the
+ * discarded frame claimed to be. Returns what this byte completed.
  */
 dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame);
 

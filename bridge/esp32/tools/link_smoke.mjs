@@ -69,7 +69,9 @@ async function main() {
         `${volumeDb.toFixed(1)} dB, age ${snapshot.age_ms} ms, ${Date.now() - started} ms`);
 
   // Nudge the volume and watch both sessions hear it. The DSPi announces
-  // only real changes, so writing the same value would stay silent.
+  // only real changes, so writing the same value would stay silent. Whatever
+  // fails from here on, the finally block puts the volume back and lets go
+  // of the lock, so the DSPi ends as it started.
   const heard = { writer: null, listener: null };
   writer.on("notify", (frame) => { heard.writer ??= frame; });
   listener.on("notify", (frame) => { heard.listener ??= frame; });
@@ -78,34 +80,42 @@ async function main() {
     handle, direction: "set", bRequest: REQ_SET_MASTER_VOLUME, wValue: 0, wIndex: 2,
     payload: asBytes(db),
   });
-  await writer.commandOk({
-    handle, direction: "set", bRequest: REQ_SET_MASTER_VOLUME, wValue: 0, wIndex: 2,
-    payload: asBytes(volumeDb - 0.5),
-  });
-  await wait(500);
-  await setVolume(writer, volumeDb); // Restore
-  check(heard.listener !== null, "the other session heard the notification");
-  if (heard.listener) {
-    const packet = decodeNotifyPacket(heard.listener.packet);
-    check(heard.listener.origin === writer.session,
-          `origin is the writer's session (${heard.listener.origin}), event ${packet?.event}`);
+  let locked = false;
+  try {
+    await writer.commandOk({
+      handle, direction: "set", bRequest: REQ_SET_MASTER_VOLUME, wValue: 0, wIndex: 2,
+      payload: asBytes(volumeDb - 0.5),
+    });
+    await wait(500);
+    check(heard.listener !== null, "the other session heard the notification");
+    if (heard.listener) {
+      const packet = decodeNotifyPacket(heard.listener.packet);
+      check(heard.listener.origin === writer.session,
+            `origin is the writer's session (${heard.listener.origin}), event ${packet?.event}`);
+    }
+    check(heard.writer?.origin === writer.session, "the writer can recognise its own echo");
+
+    const statusLength = 2 * header.numChannels + 7;
+    let polls = 0;
+    listener.on("poll", () => { polls++; });
+    const grants = await listener.subscribePolls(handle, [
+      { slot: 3, req: REQ_GET_STATUS, val: 9, idx: 2, len: statusLength, hz: 10 },
+    ]);
+    await wait(2000);
+    await listener.unsubscribePolls(handle, [3]);
+    check(polls >= 15, `meter polls at ${grants[0]?.hz} Hz: ${polls} frames in 2 s`);
+
+    await writer.acquireLock(handle, "link_smoke", 5000);
+    locked = true;
+    const blocked = await setVolume(listener, volumeDb);
+    check(blocked.status === 0x85, `a write from another session is LOCKED (0x${blocked.status.toString(16)})`);
+  } finally {
+    if (locked) {
+      await writer.releaseLock(handle);
+    }
+    const restored = await setVolume(writer, volumeDb);
+    check(restored.status === 0, `the volume is back at ${volumeDb.toFixed(1)} dB`);
   }
-  check(heard.writer?.origin === writer.session, "the writer can recognise its own echo");
-
-  const statusLength = 2 * header.numChannels + 7;
-  let polls = 0;
-  listener.on("poll", () => { polls++; });
-  const grants = await listener.subscribePolls(handle, [
-    { slot: 3, req: REQ_GET_STATUS, val: 9, idx: 2, len: statusLength, hz: 10 },
-  ]);
-  await wait(2000);
-  await listener.unsubscribePolls(handle, [3]);
-  check(polls >= 15, `meter polls at ${grants[0]?.hz} Hz: ${polls} frames in 2 s`);
-
-  await writer.acquireLock(handle, "link_smoke", 5000);
-  const blocked = await setVolume(listener, volumeDb);
-  check(blocked.status === 0x85, `a write from another session is LOCKED (0x${blocked.status.toString(16)})`);
-  await writer.releaseLock(handle);
 
   const stats = await writer.request({ t: "hub.stats", id: 0 });
   check(typeof stats.uptime_s === "number", `hub.stats: ${JSON.stringify(stats.bridge?.uart)}`);

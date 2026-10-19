@@ -46,6 +46,7 @@ add_executable(host_tests
     test_fixture.c
     test_link_policy.c
     test_link_frames.c
+    test_link_base64.c
     test_hub.c
     test_net.c
     test_ws_header.c

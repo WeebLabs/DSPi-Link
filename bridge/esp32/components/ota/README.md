@@ -15,4 +15,4 @@ Public API: `ota_start()`, `ota_capacity()`, `ota_begin()`, `ota_write()`,
 Tests: the hub's half has host tests in `test/host/test_hub.c`. This half
 needs flash, so it is checked on a board: an update, a confirmed image
 surviving a restart, an image that crashes rolling back, and wrong files
-being refused (see `PLAN.md`, phase 6).
+being refused.

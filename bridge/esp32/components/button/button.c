@@ -1,5 +1,7 @@
 /*
- * button.c - samples the BOOT button on a timer. See button.h.
+ * button.c - samples the BOOT button on a timer and feeds button_machine
+ * (bridge spec 12.1). See button.h. The machine decides what a hold means;
+ * this file only reads the pin and reports to the handlers.
  */
 
 #include "button.h"
@@ -52,9 +54,11 @@ static void sample(void *argument)
         }
     }
     if (action != BUTTON_ACTION_NONE) {
-        ESP_LOGW(TAG, "BOOT button released after a long hold: %s",
+        ESP_LOGI(TAG, "BOOT button released after a long hold: %s",
                  action == BUTTON_ACTION_FACTORY_RESET ? "factory reset" : "forgetting Wi-Fi");
-        button_state.handlers.action(button_state.handlers.context, action);
+        if (button_state.handlers.action != NULL) {
+            button_state.handlers.action(button_state.handlers.context, action);
+        }
     }
 }
 

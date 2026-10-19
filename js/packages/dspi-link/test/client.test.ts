@@ -1,15 +1,18 @@
+/*
+ * LinkClient against the in-process FakeHub: the handshake, correlation,
+ * events, polls, administration, firmware upload and close handling of Link
+ * spec 5 to 8, and the races and timeouts of a session that goes wrong.
+ */
+
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import {
-  LINK_SUBPROTOCOL,
-  LinkClient,
-  LinkCommandError,
-  LinkProtocolError,
-  closeReasonFor,
-} from "../src/client.js";
+import { LinkClient, closeReasonFor } from "../src/client.js";
+import { LINK_SUBPROTOCOL } from "../src/constants.js";
+import { LinkCommandError, LinkProtocolError } from "../src/errors.js";
 import { LinkStatus } from "../src/frames.js";
-import { bytesToBase64 } from "../src/decoders.js";
+import { bytesToBase64 } from "../src/base64.js";
 import type { DeviceInfo } from "../src/messages.js";
-import { FakeHub, settle, type FakeHubConfig } from "./fakeHub.js";
+import { FakeHub, settle, waitFor, type FakeHubConfig } from "./fakeHub.js";
 import { fixtureBytes, fixtureJson } from "./fixtures.js";
 
 const DEVICE: DeviceInfo = {
@@ -506,5 +509,177 @@ describe("close handling", () => {
     hub.socket.serverClose(1006);
     await expect(inflight).rejects.toThrow(/closed/);
     client.disconnect();
+  });
+});
+
+describe("sessions that go wrong", () => {
+  const POLL = { slot: 0, req: 0x50, val: 9, idx: 2, len: 41, hz: 10 };
+
+  /** The listeners of `event` registered on a client, read for leak checks. */
+  function listenerCount(client: LinkClient, event: string): number {
+    const listeners = (client as unknown as { listeners: Map<string, Set<unknown>> }).listeners;
+    return listeners.get(event)?.size ?? 0;
+  }
+
+  it("ignores a stale socket after reconnecting", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = new LinkClient({
+      webSocket: hub.webSocket,
+      pingIntervalMs: 0,
+      reconnect: true,
+      reconnectMaxMs: 5,
+    });
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const old = hub.socket;
+    old.serverClose(4003);
+    await waitFor(() => hub.sockets.length === 2 && client.state === "ready");
+
+    // The old socket speaks again: a duplicate close and a late event.
+    old.serverClose(1006);
+    old.deliverText({ t: "device.removed", handle: 0, serial: DEVICE.serial });
+    await settle();
+    expect(client.state).toBe("ready");
+    expect(client.deviceList).toHaveLength(1);
+    await expect(client.get(0, 0x7f, 6)).resolves.toMatchObject({ status: LinkStatus.OK });
+    client.disconnect();
+  });
+
+  it("replaces the old socket when connect is called again", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const first = hub.socket;
+    client.disconnect();
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+
+    expect(first.readyState).toBe(3);
+    first.serverClose(1006); // Its close event, arriving late
+    await settle();
+    expect(client.state).toBe("ready");
+    expect(hub.sockets).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it("keeps the token when the socket closes during auth, and uses it again", async () => {
+    const hub = new FakeHub({ auth: "pin", validToken: "GOOD", ignore: ["auth.token"] });
+    const client = new LinkClient({
+      webSocket: hub.webSocket,
+      pingIntervalMs: 0,
+      reconnect: true,
+      reconnectMaxMs: 5,
+    });
+    const connecting = client.connect("ws://hub/dspi/v1", { clientName: "Test", token: "GOOD" });
+    await waitFor(() => hub.received.some((message) => message.t === "auth.token"));
+    hub.config.ignore = [];
+    hub.socket.serverClose(1006);
+    await expect(connecting).rejects.toThrow(/closed/);
+    expect(client.token).toBe("GOOD");
+
+    await waitFor(() => client.state === "ready");
+    expect(hub.received.filter((message) => message.t === "auth.token")).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it("removes its listener when the hub refuses hub.update", async () => {
+    const hub = new FakeHub({
+      auth: "none",
+      role: "admin",
+      onRequest: (message) =>
+        message.t === "hub.update" ? { t: "err", code: "busy", msg: "an update is running" } : null,
+    });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const before = listenerCount(client, "message");
+
+    await expect(client.updateHub(new Uint8Array(1000))).rejects.toBeInstanceOf(LinkProtocolError);
+    expect(listenerCount(client, "message")).toBe(before);
+    client.disconnect();
+  });
+
+  it("closes a socket that stops answering keepalives", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = new LinkClient({
+      webSocket: hub.webSocket,
+      pingIntervalMs: 20,
+      requestTimeoutMs: 30,
+      reconnect: false,
+    });
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    let closed: { reason: string } | null = null;
+    client.on("close", (info) => (closed = info));
+    hub.config.ignore = ["ping"];
+
+    await waitFor(() => client.state === "closed");
+    expect(closed).toMatchObject({ reason: "abnormal" });
+    expect(hub.socket.readyState).toBe(3);
+    client.disconnect();
+  });
+
+  it("gives up on a hub that never answers hello", async () => {
+    const hub = new FakeHub({ auth: "none", ignore: ["hello"] });
+    const client = new LinkClient({
+      webSocket: hub.webSocket,
+      pingIntervalMs: 0,
+      handshakeTimeoutMs: 30,
+    });
+    await expect(client.connect("ws://hub/dspi/v1", { clientName: "Test" })).rejects.toThrow(
+      "the hub did not answer in time",
+    );
+    expect(client.state).toBe("closed");
+    expect(hub.socket.readyState).toBe(3);
+  });
+
+  it("subscribes to polls again when a device comes back online", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.subscribePolls(0, [POLL]);
+
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "offline" } });
+    await settle();
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "online" } });
+    await settle();
+
+    const subscribes = hub.received.filter((message) => message.t === "poll.subscribe");
+    expect(subscribes).toHaveLength(2);
+    expect(subscribes[1]).toMatchObject({ handle: 0, polls: [POLL] });
+    client.disconnect();
+  });
+
+  it("does not restore a subscription ended before its reply arrived", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const subscribing = client.subscribePolls(0, [POLL]);
+    const unsubscribing = client.unsubscribePolls(0, [POLL.slot]);
+    await Promise.all([subscribing, unsubscribing]);
+
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "offline" } });
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "online" } });
+    await settle();
+    expect(hub.received.filter((message) => message.t === "poll.subscribe")).toHaveLength(1);
+    client.disconnect();
+  });
+
+  it("does not reconnect after a protocol error", async () => {
+    const hub = new FakeHub({ auth: "none" });
+    const client = new LinkClient({ webSocket: hub.webSocket, pingIntervalMs: 0, reconnect: true });
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    let info: { willReconnect: boolean } | null = null;
+    client.on("close", (close) => (info = close));
+    hub.socket.serverClose(4000);
+    await settle();
+    expect(info).toMatchObject({ willReconnect: false });
+    expect(client.state).toBe("closed");
+  });
+});
+
+describe("constants", () => {
+  it("names the version in package.json", async () => {
+    const { LINK_LIBRARY_VERSION } = await import("../src/constants.js");
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
+    expect(LINK_LIBRARY_VERSION).toBe(packageJson.version);
   });
 });

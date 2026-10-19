@@ -1,64 +1,71 @@
 /*
- * DSPi web UI, v1.
+ * The control page every hub serves from / (bridge spec 10.1; README "The web
+ * app").
  *
- * Four screens: connect (find and authenticate to a hub), the device list,
- * one device's master volume and meters, and, for a bridge, its settings
- * (settings.ts). The page defaults to the origin that served it, which is the
- * common case: a hub serving this bundle from /.
+ * Four screens: connect (find a hub and authenticate, Link spec 3.3 and 6),
+ * the device list (7.4), one device's volume and meters (device/page.ts), and
+ * for a bridge its settings (settings/page.ts). The page defaults to the
+ * origin that served it, which is the common case: a hub serving this bundle
+ * from /. This file owns the session and decides which screen shows.
  */
 
 import {
+  LINK_DEFAULT_PORT,
   LinkClient,
   LinkProtocolError,
   type DeviceInfo,
   type HubInfo,
+  type LinkCloseInfo,
+  type LinkRole,
   fetchHubInfo,
   pinSourceOf,
   webSocketUrl,
 } from "@dspi/link";
-import { clear, el } from "./dom.js";
-import { createDevicePage, type DevicePageHandles } from "./device.js";
-import { createSettingsPage, type SettingsPageHandles } from "./settings.js";
+import { append, clear, el } from "./dom.js";
+import { createDevicePage, type DevicePageHandles } from "./device/page.js";
+import { describeProblem } from "./problems.js";
+import { createSettingsPage, type SettingsPageHandles } from "./settings/page.js";
+import {
+  forgetToken,
+  loadClientName,
+  loadHost,
+  loadToken,
+  saveClientName,
+  saveHost,
+  saveToken,
+} from "./storage.js";
 import "./style.css";
 
-const STORAGE_HOST = "dspi-link.host";
-const STORAGE_NAME = "dspi-link.client_name";
-/** Tokens are keyed on the hub id, never the address, which changes (spec 6.2). */
-const tokenKey = (hubId: string) => `dspi-link.token.${hubId}`;
+/** States in which a session exists, so Connect would replace it. */
+const SESSION_STATES = new Set([
+  "connecting",
+  "handshaking",
+  "authenticating",
+  "awaiting_pairing",
+  "reconnecting",
+]);
 
-function readStorage(key: string): string | null {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null; // Private mode or blocked storage: work without persistence.
-  }
-}
-
-function writeStorage(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // Nothing to do; the session still works, it just will not be remembered.
-  }
-}
-
-function removeStorage(key: string): void {
-  try {
-    localStorage.removeItem(key);
-  } catch {
-    // Same as above.
-  }
-}
+/** The roles a window-PIN hub can grant, in words (Link spec 6.3). */
+const ROLE_CHOICES: Array<{ role: LinkRole; label: string }> = [
+  { role: "control", label: "Control: change the DSPi's settings" },
+  { role: "viewer", label: "Viewer: watch only" },
+  { role: "admin", label: "Admin: everything, including the hub's own settings" },
+];
 
 /** Where to look for a hub before the user types anything. */
 function defaultHost(): string {
-  const stored = readStorage(STORAGE_HOST);
+  const stored = loadHost();
   if (stored) return stored;
   if (location.protocol.startsWith("http") && location.host) return location.host;
-  return "localhost:11915";
+  return `localhost:${LINK_DEFAULT_PORT}`;
 }
 
 const pageIsSecure = location.protocol === "https:";
+
+/** The first pattern that matches the user agent, or null. */
+function firstMatch(agent: string, names: Array<[RegExp, string]>): string | null {
+  return names.find(([pattern]) => pattern.test(agent))?.[1] ?? null;
+}
 
 /**
  * A name for the hub's list of paired clients that tells this browser apart
@@ -67,28 +74,20 @@ const pageIsSecure = location.protocol === "https:";
  */
 function defaultClientName(): string {
   const agent = navigator.userAgent;
-  const browser = /Edg\//.test(agent)
-    ? "Edge"
-    : /Firefox\//.test(agent)
-      ? "Firefox"
-      : /Chrome\//.test(agent)
-        ? "Chrome"
-        : /Safari\//.test(agent)
-          ? "Safari"
-          : null;
-  const device = /iPhone/.test(agent)
-    ? "iPhone"
-    : /iPad/.test(agent)
-      ? "iPad"
-      : /Android/.test(agent)
-        ? "Android"
-        : /Mac OS X/.test(agent)
-          ? "Mac"
-          : /Windows/.test(agent)
-            ? "Windows"
-            : /Linux/.test(agent)
-              ? "Linux"
-              : null;
+  const browser = firstMatch(agent, [
+    [/Edg\//, "Edge"],
+    [/Firefox\//, "Firefox"],
+    [/Chrome\//, "Chrome"],
+    [/Safari\//, "Safari"],
+  ]);
+  const device = firstMatch(agent, [
+    [/iPhone/, "iPhone"],
+    [/iPad/, "iPad"],
+    [/Android/, "Android"],
+    [/Mac OS X/, "Mac"],
+    [/Windows/, "Windows"],
+    [/Linux/, "Linux"],
+  ]);
   if (browser && device) return `Web UI, ${browser} on ${device}`;
   return "Web UI";
 }
@@ -99,7 +98,24 @@ function pairingProblem(error: unknown): string {
     if (error.code === "unauthenticated" || error.code === "denied") return "That PIN isn't right.";
     if (error.code === "rate_limited") return "Too many wrong PINs. Wait a minute and try again.";
   }
-  return (error as Error).message;
+  return describeProblem(error);
+}
+
+/** Why a session ended for good, in words, or null when nothing needs saying. */
+function closeProblem(info: LinkCloseInfo): string | null {
+  if (info.willReconnect) return null;
+  switch (info.reason) {
+    case "normal":
+      return null;
+    case "auth_failed":
+      return "The hub closed the connection: too many wrong PINs, or none in time. Wait a minute and connect again.";
+    case "revoked":
+      return "This browser was removed from the hub's paired list. Connect and enter the PIN again.";
+    case "protocol_error":
+      return "This page and the hub don't understand each other. Update the hub's firmware, then reload this page.";
+    default:
+      return "The connection to the hub was lost.";
+  }
 }
 
 const app = document.getElementById("app")!;
@@ -111,7 +127,7 @@ let infoError: string | null = null;
 let connectError: string | null = null;
 let pairError: string | null = null;
 let busy = false;
-let clientName = readStorage(STORAGE_NAME) ?? defaultClientName();
+let clientName = loadClientName() ?? defaultClientName();
 let selectedHandle: number | null = null;
 let devicePage: DevicePageHandles | null = null;
 /** True while the bridge settings are open; kept across a reconnect, so a
@@ -131,152 +147,169 @@ function render(): void {
   // A live device page keeps its poll subscription and its meter DOM; tearing
   // it down and rebuilding it on every unrelated event would resubscribe at
   // 10 Hz and flicker the bars.
-  if (
-    client.state === "ready" &&
-    selectedHandle !== null &&
-    devicePage?.handle === selectedHandle
-  ) {
-    return;
-  }
+  const ready = client.state === "ready";
+  if (ready && selectedHandle !== null && devicePage?.handle === selectedHandle) return;
   // The settings page keeps half-typed values and its own refresh timer.
-  if (client.state === "ready" && settingsOpen && settingsPage) {
-    return;
-  }
+  if (ready && settingsOpen && settingsPage) return;
   closeDevicePage();
   closeSettingsPage();
   clear(app);
-  if (client.state === "ready") {
-    if (settingsOpen && canOpenSettings()) renderSettings();
-    else if (selectedHandle !== null) renderDevice(selectedHandle);
-    else renderDeviceList();
-  } else {
-    renderConnect();
+  if (!ready) renderConnect();
+  else if (settingsOpen && canOpenSettings()) renderSettings();
+  else if (selectedHandle !== null) renderDevice(selectedHandle);
+  else renderDeviceList();
+}
+
+async function probe(hostField: HTMLInputElement): Promise<void> {
+  host = hostField.value.trim() || defaultHost();
+  saveHost(host);
+  info = null;
+  infoError = null;
+  busy = true;
+  render();
+  try {
+    info = await fetchHubInfo(host, pageIsSecure);
+  } catch (error) {
+    infoError = describeProblem(error);
+  } finally {
+    busy = false;
+    render();
   }
 }
 
-function renderConnect(): void {
-  const hostField = el("input", {
+async function connect(nameField: HTMLInputElement): Promise<void> {
+  clientName = nameField.value.trim() || defaultClientName();
+  saveClientName(clientName);
+  connectError = null;
+  notice = null;
+  busy = true;
+  render();
+  const hubId = info?.hub.id;
+  const token = hubId ? (loadToken(hubId) ?? undefined) : undefined;
+  try {
+    await client.connect(webSocketUrl(host, info ?? undefined, pageIsSecure), {
+      clientName,
+      token,
+      app: "DSPi Web",
+      version: __APP_VERSION__,
+    });
+    // The client drops a token only when the hub refused it.
+    if (token && hubId && client.state === "awaiting_pairing" && client.token === null) {
+      forgetToken(hubId);
+    }
+  } catch (error) {
+    connectError = describeProblem(error);
+  } finally {
+    busy = false;
+    render();
+  }
+}
+
+/** A text field on the connect screen; its <label> points at `id`. */
+function connectField(id: string, value: string, helpId?: string): HTMLInputElement {
+  return el("input", {
     type: "text",
+    id,
     class: "grow",
-    value: host,
-    placeholder: "host or host:port",
+    value,
     autocapitalize: "off",
+    "aria-describedby": helpId ?? null,
   }) as HTMLInputElement;
+}
 
-  const nameField = el("input", {
-    type: "text",
-    class: "grow",
-    value: clientName,
-    placeholder: "This client's name",
-  }) as HTMLInputElement;
+function hubPanel(): HTMLElement {
+  const panel = el("div", { class: "panel", role: "status" });
+  if (busy && !info) {
+    panel.appendChild(el("p", { class: "dim", text: "Looking for a hub…" }));
+    return panel;
+  }
+  if (!info) {
+    panel.append(
+      el("h1", { text: "DSPi" }),
+      el("p", { class: infoError ? "error" : "dim", text: infoError ?? "No hub found yet." }),
+    );
+    return panel;
+  }
+  const facts = [info.hub.kind, info.hub.version ? `version ${info.hub.version}` : null]
+    .filter(Boolean)
+    .join(", ");
+  const shared = info.devices?.length
+    ? `${info.devices.length} DSPi${info.devices.length === 1 ? "" : "s"} shared`
+    : null;
+  append(panel, [
+    el("h1", { text: info.hub.name }),
+    el("p", { class: "dim", text: facts }),
+    el("p", {
+      class: "dim",
+      text: info.auth === "pin" ? "Needs a PIN" : "Open to everyone on this network",
+    }),
+    shared ? el("p", { class: "dim", text: shared }) : null,
+  ]);
+  return panel;
+}
 
-  const probe = async (): Promise<void> => {
-    host = hostField.value.trim() || defaultHost();
-    writeStorage(STORAGE_HOST, host);
-    info = null;
-    infoError = null;
-    busy = true;
-    render();
-    try {
-      info = await fetchHubInfo(host, pageIsSecure);
-    } catch (e) {
-      infoError = (e as Error).message;
-    } finally {
-      busy = false;
-      render();
-    }
-  };
-
-  const connect = async (): Promise<void> => {
-    clientName = nameField.value.trim() || defaultClientName();
-    writeStorage(STORAGE_NAME, clientName);
-    connectError = null;
-    busy = true;
-    render();
-    try {
-      const hubId = info?.hub.id;
-      const token = hubId ? (readStorage(tokenKey(hubId)) ?? undefined) : undefined;
-      await client.connect(webSocketUrl(host, info ?? undefined, pageIsSecure), {
-        clientName,
-        token,
-        app: "DSPi Web",
-        version: "1.2.0",
+function connectPanel(): HTMLElement {
+  const hostField = connectField("hub-address", host);
+  hostField.placeholder = `name.local or name.local:${LINK_DEFAULT_PORT}`;
+  const nameField = connectField("client-name", clientName, "client-name-help");
+  const sessionOpen = SESSION_STATES.has(client.state);
+  const action = sessionOpen
+    ? el("button", { type: "button", text: "Stop", onClick: disconnect })
+    : el("button", {
+        type: "button",
+        class: "primary",
+        text: "Connect",
+        disabled: busy,
+        onClick: () => void connect(nameField),
       });
-    } catch (e) {
-      connectError = (e as Error).message;
-    } finally {
-      busy = false;
-      render();
-    }
-  };
+  return el(
+    "div",
+    { class: "panel" },
+    el("label", { for: "hub-address", class: "field-label", text: "Hub address" }),
+    el(
+      "div",
+      { class: "row" },
+      hostField,
+      el("button", {
+        type: "button",
+        text: "Find",
+        disabled: busy || sessionOpen,
+        onClick: () => void probe(hostField),
+      }),
+    ),
+    el("label", { for: "client-name", class: "field-label spaced", text: "Name this browser" }),
+    el("div", { class: "row" }, nameField, action),
+    el("p", {
+      class: "dim small",
+      id: "client-name-help",
+      text: "The hub lists paired browsers by this name.",
+    }),
+    connectError ? el("p", { class: "error", role: "alert", text: connectError }) : null,
+  );
+}
 
+function renderConnect(): void {
   if (notice) {
     app.appendChild(
       el("div", { class: "panel notice", role: "status" }, el("p", { text: notice })),
     );
   }
-
-  const hubPanel = el("div", { class: "panel" });
-  if (busy && !info) {
-    hubPanel.appendChild(el("p", { class: "dim", text: "Looking for a hub..." }));
-  } else if (info) {
-    hubPanel.appendChild(el("h1", { text: info.hub.name }));
-    const facts = [info.hub.kind, info.hub.version ? `v${info.hub.version}` : null]
-      .filter(Boolean)
-      .join(", ");
-    hubPanel.appendChild(el("p", { class: "dim", text: facts }));
-    hubPanel.appendChild(
-      el("p", { class: "dim", text: info.auth === "pin" ? "Pairing required" : "Open access" }),
-    );
-    if (info.devices?.length) {
-      hubPanel.appendChild(
-        el("p", {
-          class: "dim",
-          text: `${info.devices.length} device${info.devices.length === 1 ? "" : "s"} shared`,
-        }),
-      );
-    }
-  } else {
-    hubPanel.appendChild(el("h1", { text: "DSPi" }));
-    hubPanel.appendChild(
-      el("p", { class: infoError ? "error" : "dim", text: infoError ?? "No hub found yet." }),
-    );
-  }
-
-  app.appendChild(hubPanel);
-
-  app.appendChild(
-    el(
-      "div",
-      { class: "panel" },
-      el("h2", { text: "Hub" }),
-      el(
-        "div",
-        { class: "row" },
-        hostField,
-        el("button", { type: "button", text: "Find", disabled: busy, onClick: () => void probe() }),
-      ),
-      el("h2", { text: "Connect as", style: "margin-top:16px" }),
-      el(
-        "div",
-        { class: "row" },
-        nameField,
-        el("button", {
-          type: "button",
-          class: "primary",
-          text: "Connect",
-          disabled: busy,
-          onClick: () => void connect(),
-        }),
-      ),
-      connectError ? el("p", { class: "error", text: connectError }) : null,
-    ),
-  );
-
+  app.append(hubPanel(), connectPanel());
   if (client.state === "awaiting_pairing") app.appendChild(renderPairing());
   if (client.state === "reconnecting") {
-    app.appendChild(el("p", { class: "dim", text: "Connection lost, retrying..." }));
+    app.appendChild(
+      el("p", { class: "dim", role: "status", text: "Connection lost, trying again…" }),
+    );
   }
+}
+
+/** The role picker for a window-PIN hub. */
+function roleField(): HTMLSelectElement {
+  return el(
+    "select",
+    { id: "pair-role" },
+    ...ROLE_CHOICES.map(({ role, label }) => el("option", { value: role, text: label })),
+  ) as HTMLSelectElement;
 }
 
 /**
@@ -288,57 +321,50 @@ function renderConnect(): void {
 function renderPairing(): HTMLElement {
   const fixed = client.hub ? pinSourceOf(client.hub) === "fixed" : false;
   const hubWord = client.hub?.hub.kind === "bridge" ? "bridge" : "hub";
-
   const pinField = el("input", {
     type: fixed ? "password" : "text",
+    id: "pair-pin",
     inputmode: "numeric",
     autocomplete: "off",
     class: "grow",
-    placeholder: "6-digit PIN",
     maxlength: "6",
   }) as HTMLInputElement;
-
-  const roleField = fixed
-    ? null
-    : (el(
-        "select",
-        { "aria-label": "Role" },
-        el("option", { value: "control", text: "Control" }),
-        el("option", { value: "viewer", text: "Viewer" }),
-        el("option", { value: "admin", text: "Admin" }),
-      ) as HTMLSelectElement);
+  const role = fixed ? null : roleField();
 
   const submit = async (): Promise<void> => {
     pairError = null;
     busy = true;
     render();
     try {
-      const role = roleField ? (roleField.value as "viewer" | "control" | "admin") : undefined;
-      const token = await client.pair(pinField.value.trim(), clientName, role);
+      const chosen = role ? (role.value as LinkRole) : undefined;
+      const token = await client.pair(pinField.value.trim(), clientName, chosen);
       const hubId = client.hubId ?? info?.hub.id;
-      if (token && hubId) writeStorage(tokenKey(hubId), token);
-    } catch (e) {
-      pairError = pairingProblem(e);
+      if (token && hubId) saveToken(hubId, token);
+    } catch (error) {
+      pairError = pairingProblem(error);
     } finally {
       busy = false;
       render();
     }
   };
+  pinField.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") void submit();
+  });
+  setTimeout(() => pinField.focus(), 0);
 
   const prompt = fixed
     ? `This ${hubWord} is protected with a PIN. Enter the ${hubWord}'s PIN; this browser remembers it after that.`
     : "This hub needs a PIN. Open its pairing window and enter the PIN shown on the hub.";
-
-  const panel = el(
+  return el(
     "div",
     { class: "panel" },
     el("h2", { text: fixed ? `Enter the ${hubWord}'s PIN` : "Pairing" }),
     el("p", { class: "dim", text: prompt }),
+    el("label", { for: "pair-pin", class: "field-label", text: "PIN (6 digits)" }),
     el(
       "div",
       { class: "row" },
       pinField,
-      roleField,
       el("button", {
         type: "button",
         class: "primary",
@@ -347,13 +373,12 @@ function renderPairing(): HTMLElement {
         onClick: () => void submit(),
       }),
     ),
-    pairError ? el("p", { class: "error", text: pairError }) : null,
+    role
+      ? el("label", { for: "pair-role", class: "field-label spaced", text: "Access to ask for" })
+      : null,
+    role,
+    pairError ? el("p", { class: "error", role: "alert", text: pairError }) : null,
   );
-  pinField.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") void submit();
-  });
-  setTimeout(() => pinField.focus(), 0);
-  return panel;
 }
 
 function renderDeviceList(): void {
@@ -371,30 +396,25 @@ function renderDeviceList(): void {
       el(
         "div",
         { class: "row" },
-        el("span", { class: "badge", text: client.role ?? "" }),
+        el("span", { class: "badge", text: client.role ? `Role: ${client.role}` : "" }),
         canOpenSettings()
-          ? el("button", {
-              type: "button",
-              text: "Bridge settings",
-              onClick: () => {
-                settingsOpen = true;
-                render();
-              },
-            })
+          ? el("button", { type: "button", text: "Bridge settings", onClick: openSettings })
           : null,
         el("button", { type: "button", text: "Disconnect", onClick: disconnect }),
       ),
     ),
   );
-
   const panel = el("div", { class: "panel" }, el("h2", { text: "Devices" }));
   if (devices.length === 0) {
-    panel.appendChild(el("p", { class: "dim", text: "This hub is not sharing any device." }));
+    panel.appendChild(el("p", { class: "dim", text: "This hub is not sharing any DSPi." }));
   }
-  for (const device of devices) {
-    panel.appendChild(deviceRow(device));
-  }
+  for (const device of devices) panel.appendChild(deviceRow(device));
   app.appendChild(panel);
+}
+
+function openSettings(): void {
+  settingsOpen = true;
+  render();
 }
 
 function deviceRow(device: DeviceInfo): HTMLElement {
@@ -451,12 +471,11 @@ function firmwareOutcome(): { tone: "good" | "bad"; text: string } | undefined {
   const running = client.hub?.hub.version ?? "";
   const expected = expectedFirmware;
   expectedFirmware = null;
-  return running === expected
-    ? { tone: "good", text: `Firmware ${expected} is installed.` }
-    : {
-        tone: "bad",
-        text: `The bridge is running firmware ${running}: firmware ${expected} did not start properly, so the bridge went back.`,
-      };
+  if (running === expected) return { tone: "good", text: `Firmware ${expected} is installed.` };
+  return {
+    tone: "bad",
+    text: `The bridge is running firmware ${running}: firmware ${expected} did not start properly, so the bridge went back.`,
+  };
 }
 
 function renderSettings(): void {
@@ -472,17 +491,16 @@ function renderSettings(): void {
     onToken: (token) => {
       const hubId = client.hubId;
       if (!hubId) return;
-      if (token) writeStorage(tokenKey(hubId), token);
-      else removeStorage(tokenKey(hubId));
+      if (token) saveToken(hubId, token);
+      else forgetToken(hubId);
     },
     onLeaving: (message, willReconnect) => {
       notice = message;
-      if (!willReconnect) {
-        // The bridge is leaving this network for good; stop trying to reach it.
-        settingsOpen = false;
-        client.disconnect();
-        render();
-      }
+      if (willReconnect) return;
+      // The bridge is leaving this network for good; stop trying to reach it.
+      settingsOpen = false;
+      client.disconnect();
+      render();
     },
   });
   app.appendChild(settingsPage.root);
@@ -519,20 +537,19 @@ client.on("devices", () => {
   if (selectedHandle !== null && !client.device(selectedHandle)) selectedHandle = null;
   if (selectedHandle === null) render();
 });
-client.on("close", (c) => {
-  if (c.reason === "revoked" && client.hubId) removeStorage(tokenKey(client.hubId));
-  if (!c.willReconnect && c.reason !== "normal") {
-    connectError = `Connection closed (${c.code}, ${c.reason})`;
-  }
+client.on("close", (close) => {
+  if (close.reason === "revoked" && client.hubId) forgetToken(client.hubId);
+  const problem = closeProblem(close);
+  if (problem) connectError = problem;
 });
-client.on("error", (e) => console.warn("link:", e.message));
+client.on("error", (error) => console.warn("link:", error.message));
 
 render();
 void (async () => {
   try {
     info = await fetchHubInfo(host, pageIsSecure);
-  } catch (e) {
-    infoError = (e as Error).message;
+  } catch (error) {
+    infoError = describeProblem(error);
   }
   render();
 })();

@@ -1,10 +1,13 @@
 /*
- * hub_admin.c - administering the hub: its settings, its Wi-Fi, its PIN and
- * paired clients, and restarting or resetting it.
+ * hub_admin.c - administering the hub: its statistics and name, its
+ * settings, its Wi-Fi, its PIN and paired clients, and restarting or
+ * resetting it.
  *
- * Implements Link spec 7.3 (auth.list, auth.revoke, auth.set_role) and 7.10
- * to 7.13, as bridge spec 8.9 to 8.11 describe. Every message here requires
- * admin; on the bridge every authenticated session is admin.
+ * Implements Link spec 7.3 (auth.list, auth.revoke, auth.set_role), 7.9
+ * (hub.stats, hub.rename) and 7.10 to 7.13, as bridge spec 8.7 and 8.9 to
+ * 8.11 describe, and the setup page's PIN calls (bridge spec 9.3). The
+ * messages that change something require admin; on the bridge every
+ * authenticated session is admin.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -25,18 +28,89 @@ bool hub_require_admin(hub_t *hub, int slot, int id)
 }
 
 /* ---------------------------------------------------------------------------
+ * Statistics and the hub's name (Link spec 7.9)
+ * ------------------------------------------------------------------------- */
+
+void hub_handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message)
+{
+    (void)message;
+    unsigned open_sessions = 0;
+    for (size_t i = 0; i < hub->config.max_sessions; i++) {
+        open_sessions += hub->sessions[i].state == HUB_SESSION_OPEN ? 1 : 0;
+    }
+
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddNumberToObject(body, "sessions", open_sessions);
+    cJSON_AddNumberToObject(body, "uptime_s", (hub_now(hub) - hub->started_ms) / 1000);
+
+    cJSON *devices = cJSON_AddArrayToObject(body, "devices");
+    if (hub->device.state != HUB_DEVICE_ABSENT) {
+        cJSON *device = cJSON_CreateObject();
+        cJSON_AddNumberToObject(device, "handle", HUB_DEVICE_HANDLE);
+        cJSON_AddNumberToObject(device, "cmds", hub->device.commands);
+        cJSON_AddNumberToObject(device, "errors", hub->device.errors);
+        cJSON_AddNumberToObject(device, "avg_rtt_ms", hub->device.average_rtt_ms);
+        cJSON_AddNumberToObject(device, "notify_dropped", hub->device.notifications_dropped);
+        hub_json_append(devices, device);
+    }
+
+    cJSON *bridge = cJSON_AddObjectToObject(body, "bridge");
+    if (hub->io.describe_bridge != NULL && bridge != NULL) {
+        hub->io.describe_bridge(hub->io.context, bridge);
+    }
+    hub_reply_ok(hub, slot, id, body);
+}
+
+hub_change_result_t hub_rename(hub_t *hub, const char *name)
+{
+    if (!settings_name_is_valid(name)) {
+        return HUB_CHANGE_INVALID;
+    }
+    bridge_settings_t settings = hub->config.settings;
+    snprintf(settings.name, sizeof(settings.name), "%s", name);
+    if (!hub_apply_settings(hub, &settings)) {
+        return HUB_CHANGE_FAILED;
+    }
+    hub_broadcast_config(hub);
+    return HUB_CHANGE_OK;
+}
+
+void hub_handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message)
+{
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
+    const hub_change_result_t result =
+        cJSON_IsString(name) ? hub_rename(hub, name->valuestring) : HUB_CHANGE_INVALID;
+    if (result == HUB_CHANGE_INVALID) {
+        hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
+    } else if (result == HUB_CHANGE_FAILED) {
+        hub_reply_error(hub, slot, id, "internal", "the name could not be saved");
+    } else {
+        hub_reply_ok(hub, slot, id, NULL);
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Settings (Link spec 7.10)
  * ------------------------------------------------------------------------- */
 
-void hub_apply_settings(hub_t *hub, const bridge_settings_t *settings)
+bool hub_apply_settings(hub_t *hub, const bridge_settings_t *settings)
 {
+    if (!hub->io.apply_settings(hub->io.context, settings)) {
+        return false;
+    }
     hub->config.settings = *settings;
-    hub->io.apply_settings(hub->io.context, settings);
     hub->io.advertise(hub->io.context);
+    return true;
+}
 
+void hub_broadcast_config(hub_t *hub)
+{
     cJSON *event = cJSON_CreateObject();
+    if (event == NULL) {
+        return;
+    }
     cJSON_AddStringToObject(event, "t", "hub.config.changed");
-    cJSON_AddItemToObject(event, "config", hub_config_to_json(settings));
+    hub_json_add(event, "config", hub_config_to_json(&hub->config.settings));
     hub_broadcast_json(hub, event);
 }
 
@@ -47,8 +121,8 @@ void hub_handle_config_get(hub_t *hub, int slot, int id, const cJSON *message)
         return;
     }
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddItemToObject(body, "config", hub_config_to_json(&hub->config.settings));
-    cJSON_AddItemToObject(body, "options", hub_config_options(hub->config.board));
+    hub_json_add(body, "config", hub_config_to_json(&hub->config.settings));
+    hub_json_add(body, "options", hub_config_options(hub->config.board));
     hub_reply_ok(hub, slot, id, body);
 }
 
@@ -61,23 +135,20 @@ void hub_handle_config_set(hub_t *hub, int slot, int id, const cJSON *message)
     const char *problem = hub_config_apply(cJSON_GetObjectItemCaseSensitive(message, "config"),
                                            &hub->config.settings, hub->config.board, &updated);
     if (problem != NULL) {
-        cJSON *reply = cJSON_CreateObject();
-        cJSON_AddStringToObject(reply, "t", "err");
-        if (id >= 0) {
-            cJSON_AddNumberToObject(reply, "id", id);
-        }
-        cJSON_AddStringToObject(reply, "code", "bad_request");
-        cJSON_AddStringToObject(reply, "msg", "a setting is unknown or not allowed");
-        cJSON_AddStringToObject(reply, "field", problem); /* Link spec 7.10 */
-        hub_send_json(hub, slot, reply);
+        hub_reply_error_field(hub, slot, id, "bad_request", "a setting is unknown or not allowed",
+                              problem);
+        return;
+    }
+    if (!hub_apply_settings(hub, &updated)) {
+        hub_reply_error(hub, slot, id, "internal", "the settings could not be saved or applied");
         return;
     }
 
-    /* Reply before applying, so the reply leads hub.config.changed. */
+    /* The reply leads hub.config.changed (Link spec 7.10). */
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddItemToObject(body, "config", hub_config_to_json(&updated));
+    hub_json_add(body, "config", hub_config_to_json(&updated));
     hub_reply_ok(hub, slot, id, body);
-    hub_apply_settings(hub, &updated);
+    hub_broadcast_config(hub);
 }
 
 /* ---------------------------------------------------------------------------
@@ -92,7 +163,13 @@ void hub_handle_wifi_scan(hub_t *hub, int slot, int id, const cJSON *message)
     }
     /* A scan takes seconds; the I/O runs it in the background and answers
      * through hub_reply_later(). */
-    hub->io.start_wifi_scan(hub->io.context, slot, hub->sessions[slot].id, id);
+    const hub_io_result_t started =
+        hub->io.start_wifi_scan(hub->io.context, slot, hub->sessions[slot].id, id);
+    if (started == HUB_IO_BUSY) {
+        hub_reply_error(hub, slot, id, "busy", "a scan is already running");
+    } else if (started != HUB_IO_OK) {
+        hub_reply_error(hub, slot, id, "internal", "the bridge could not start a scan");
+    }
 }
 
 void hub_handle_wifi_join(hub_t *hub, int slot, int id, const cJSON *message)
@@ -182,7 +259,7 @@ void hub_handle_auth_list(hub_t *hub, int slot, int id, const cJSON *message)
             cJSON_AddStringToObject(entry, "last_seen", when);
         }
         cJSON_AddBoolToObject(entry, "online", client_online(hub, clients[i].cid));
-        cJSON_AddItemToArray(list, entry);
+        hub_json_append(list, entry);
     }
     hub_reply_ok(hub, slot, id, body);
 }
@@ -214,6 +291,51 @@ void hub_handle_auth_set_role(hub_t *hub, int slot, int id, const cJSON *message
     hub_reply_error(hub, slot, id, "unsupported", "every client of this hub is admin");
 }
 
+bool hub_pin_enabled(const hub_t *hub)
+{
+    return hub_auth_pin_enabled(&hub->auth);
+}
+
+hub_auth_result_t hub_check_pin(hub_t *hub, uint32_t address, const char *pin)
+{
+    return hub_auth_check_pin(&hub->auth, address, pin);
+}
+
+/* Sets the PIN (or clears it, `pin` NULL) for hub.auth.set and the setup
+ * page alike. Every paired client is forgotten, so no session keeps a
+ * client id; with a new PIN every session but `keep_slot` (-1 for none) is
+ * closed to pair again. */
+static hub_auth_result_t change_pin(hub_t *hub, const char *pin, int keep_slot)
+{
+    const hub_auth_result_t result = hub_auth_set_pin(&hub->auth, pin);
+    if (result != HUB_AUTH_OK) {
+        return result;
+    }
+    for (size_t slot = 0; slot < hub->config.max_sessions; slot++) {
+        hub->sessions[slot].cid = 0;
+    }
+    if (pin != NULL) {
+        hub_close_sessions(hub, CLOSE_TOKEN_REVOKED, keep_slot);
+    }
+    hub->io.advertise(hub->io.context);
+    return HUB_AUTH_OK;
+}
+
+hub_auth_result_t hub_set_pin(hub_t *hub, const char *pin)
+{
+    return change_pin(hub, pin, -1);
+}
+
+/* Replies to a failed PIN change. */
+static void reply_pin_failure(hub_t *hub, int slot, int id, hub_auth_result_t result)
+{
+    if (result == HUB_AUTH_INVALID_PIN) {
+        hub_reply_error(hub, slot, id, "bad_request", "the PIN must be six digits");
+    } else {
+        hub_reply_error(hub, slot, id, "internal", "the bridge could not store the PIN");
+    }
+}
+
 void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message)
 {
     if (!hub_require_admin(hub, slot, id)) {
@@ -221,38 +343,42 @@ void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message)
     }
     const cJSON *mode = cJSON_GetObjectItemCaseSensitive(message, "mode");
     const cJSON *pin = cJSON_GetObjectItemCaseSensitive(message, "pin");
-    hub_session_t *session = &hub->sessions[slot];
-
-    if (cJSON_IsString(mode) && strcmp(mode->valuestring, "none") == 0) {
-        /* Everyone stays connected and is admin (Link spec 7.12). */
-        hub_auth_set_pin(&hub->auth, NULL);
-        session->cid = 0;
-        hub->io.advertise(hub->io.context);
-        hub_reply_ok(hub, slot, id, NULL);
-        return;
-    }
-    if (!cJSON_IsString(mode) || strcmp(mode->valuestring, "pin") != 0) {
+    const bool mode_none = cJSON_IsString(mode) && strcmp(mode->valuestring, "none") == 0;
+    const bool mode_pin = cJSON_IsString(mode) && strcmp(mode->valuestring, "pin") == 0;
+    if (!mode_none && !mode_pin) {
         hub_reply_error(hub, slot, id, "bad_request", "mode must be none or pin");
         return;
     }
-    if (pin == NULL) {
+    if (mode_pin && pin == NULL) {
         hub_reply_error(hub, slot, id, "unsupported", "this hub uses a fixed PIN only");
         return;
     }
-    if (!cJSON_IsString(pin) || !hub_auth_set_pin(&hub->auth, pin->valuestring)) {
-        hub_reply_error(hub, slot, id, "bad_request", "the PIN must be six digits");
+    if (mode_pin && !cJSON_IsString(pin)) {
+        reply_pin_failure(hub, slot, id, HUB_AUTH_INVALID_PIN);
         return;
     }
 
-    /* Every token is revoked. The client that set the PIN stays paired
-     * with a fresh token; everyone else pairs again (Link spec 7.12). */
+    /* `none`: everyone stays connected and is admin. `pin`: every token is
+     * revoked; the client that set the PIN stays paired with a fresh token
+     * and everyone else pairs again (Link spec 7.12). */
+    const hub_auth_result_t changed = change_pin(hub, mode_pin ? pin->valuestring : NULL, slot);
+    if (changed != HUB_AUTH_OK) {
+        reply_pin_failure(hub, slot, id, changed);
+        return;
+    }
+    if (mode_none) {
+        hub_reply_ok(hub, slot, id, NULL);
+        return;
+    }
+    hub_session_t *session = &hub->sessions[slot];
     char token[HUB_AUTH_TOKEN_CHARS + 1];
-    hub_auth_issue(&hub->auth, session->client_name, token, &session->cid);
+    if (hub_auth_issue(&hub->auth, session->client_name, token, &session->cid) != HUB_AUTH_OK) {
+        hub_reply_error(hub, slot, id, "internal", "the PIN is set, but pair again to get a token");
+        return;
+    }
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "token", token);
     hub_reply_ok(hub, slot, id, body);
-    hub_close_sessions(hub, CLOSE_TOKEN_REVOKED, slot);
-    hub->io.advertise(hub->io.context);
 }
 
 /* ---------------------------------------------------------------------------

@@ -2,42 +2,10 @@
    following the system, the system font, and nothing loaded from elsewhere,
    because the setup network has no internet. */
 
-:root {
-  --bg: #f4f5f7;
-  --card: #ffffff;
-  --line: #dfe2e7;
-  --text: #16181d;
-  --dim: #5d6573;
-  --accent: #2563eb;
-  --accent-text: #ffffff;
-  --good: #15803d;
-  --good-soft: #e7f6ec;
-  --warn: #a15c07;
-  --warn-soft: #fdf3e2;
-  --bad: #b91c1c;
-  --bad-soft: #fde8e8;
-  --focus: #2563eb66;
-  --radius: 14px;
-  color-scheme: light dark;
-}
+@import "../tokens.css";
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f1115;
-    --card: #181b21;
-    --line: #2a2f38;
-    --text: #e8eaee;
-    --dim: #9aa3b1;
-    --accent: #5b9cff;
-    --accent-text: #0b1220;
-    --good: #4ade80;
-    --good-soft: #13261a;
-    --warn: #f5b950;
-    --warn-soft: #2b2213;
-    --bad: #f87171;
-    --bad-soft: #2d1718;
-    --focus: #5b9cff66;
-  }
+:root {
+  --radius: 14px;
 }
 
 * {
@@ -49,7 +17,14 @@ body {
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
-  font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+  font:
+    16px/1.5 ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
     sans-serif;
   -webkit-text-size-adjust: 100%;
 }
@@ -101,7 +76,7 @@ body {
 }
 
 .card {
-  background: var(--card);
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 22px 20px;
@@ -263,7 +238,7 @@ a:focus-visible {
   padding: 14px 18px;
   border-radius: 10px;
   border: 1px solid var(--line);
-  background: var(--card);
+  background: var(--surface);
   color: var(--text);
   font: inherit;
   font-weight: 600;

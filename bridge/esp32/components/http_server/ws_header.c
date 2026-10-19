@@ -1,5 +1,7 @@
 /*
- * ws_header.c - see ws_header.h.
+ * ws_header.c - encodes the header of a server's WebSocket frame (RFC 6455
+ * section 5.2). See ws_header.h. http_server.c uses it to write a session's
+ * frames in batches (bridge spec 8.2).
  *
  * Portable: no ESP-IDF headers.
  */

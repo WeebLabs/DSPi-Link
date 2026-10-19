@@ -31,6 +31,9 @@ export interface FakeHubConfig {
   /** Answers a FWDATA chunk; return null to answer later (or never). By
    * default every chunk is acknowledged at once. */
   onFwData?: (frame: Extract<LinkFrame, { type: "fwdata" }>) => LinkFrame | null;
+  /** Message types the hub reads but never answers, to simulate a hub that
+   * has gone quiet. May be changed while a test runs. */
+  ignore?: string[];
 }
 
 const soon = (fn: () => void) => setTimeout(fn, 0);
@@ -70,6 +73,7 @@ export class FakeHub {
   handleText(socket: FakeSocket, text: string): void {
     const msg = JSON.parse(text) as Record<string, unknown>;
     this.received.push(msg);
+    if (this.config.ignore?.includes(msg.t as string)) return;
     const id = msg.id as number | undefined;
 
     switch (msg.t) {
@@ -222,6 +226,20 @@ export class FakeSocket implements WebSocketInstance {
   serverClose(code: number, reason = ""): void {
     this.readyState = 3;
     soon(() => this.onclose?.({ code, reason }));
+  }
+}
+
+/**
+ * Waits until `condition` holds, for tests that run real timers.
+ *
+ * @param condition Checked after every macrotask.
+ * @param timeoutMs How long to wait before failing the test.
+ */
+export async function waitFor(condition: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error("waitFor: condition never held");
+    await new Promise((resolve) => setTimeout(resolve, 1));
   }
 }
 

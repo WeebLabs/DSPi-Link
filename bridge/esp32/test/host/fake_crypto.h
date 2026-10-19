@@ -13,12 +13,22 @@
 
 #include "hub_auth.h"
 
-/* Restarts the random sequence, so each test sees the same values. */
+#include <stdbool.h>
+
+/* Restarts the random sequence, so each test sees the same values, and
+ * makes every function work again. */
 void fake_crypto_reset(void);
 
-void fake_random(void *context, uint8_t *out, size_t length);
-void fake_sha256(void *context, const uint8_t *data, size_t length, uint8_t out[32]);
-void fake_pbkdf2(void *context, const char *pin, const uint8_t salt[AUTH_PIN_SALT_BYTES],
-                 uint8_t out[32]);
+/* Makes the random source, SHA-256 or PBKDF2 fail from now on, until the
+ * next fake_crypto_reset(). */
+extern bool fake_random_fails;
+extern bool fake_sha256_fails;
+extern bool fake_pbkdf2_fails;
+
+bool fake_random(void *context, uint8_t *out, size_t length);
+bool fake_sha256(void *context, const uint8_t *data, size_t length,
+                 uint8_t out[HUB_AUTH_HASH_BYTES]);
+bool fake_pbkdf2(void *context, const char *pin, const uint8_t salt[AUTH_PIN_SALT_BYTES],
+                 uint8_t out[HUB_AUTH_HASH_BYTES]);
 
 #endif /* FAKE_CRYPTO_H */

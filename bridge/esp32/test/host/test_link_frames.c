@@ -72,6 +72,14 @@ static void encodes_a_notify(void)
     CHECK(made == length && memcmp(encoded, fixture, length) == 0);
 }
 
+static void encodes_an_empty_notify_without_a_packet(void)
+{
+    /* No packet at all: the encoder must not touch the NULL pointer. */
+    const size_t made = link_encode_notify(encoded, sizeof(encoded), 1, 0, 0, NULL, 0);
+    CHECK(made == LINK_NOTIFY_HEADER_BYTES);
+    CHECK(encoded[0] == LINK_FRAME_NOTIFY);
+}
+
 static void encodes_a_poll(void)
 {
     const size_t length = test_fixture_read("frames/poll_status.bin", fixture, sizeof(fixture));
@@ -103,7 +111,10 @@ static void handles_fwdata_and_resync(void)
 static void encoders_refuse_a_small_buffer(void)
 {
     CHECK(link_encode_cmd_response(encoded, 7, 1, 0, NULL, 0) == 0);
-    CHECK(link_encode_resync(encoded, 5, 0, 0) == 0);
+    CHECK(link_encode_resync(encoded, LINK_RESYNC_BYTES - 1, 0, 0) == 0);
+    CHECK(link_encode_fwdata_ack(encoded, LINK_FWDATA_ACK_BYTES - 1, 0, 0, 0) == 0);
+    const uint8_t packet[1] = {0x02};
+    CHECK(link_encode_notify(encoded, LINK_NOTIFY_HEADER_BYTES, 0, 0, 0, packet, 1) == 0);
 }
 
 void test_link_frames(void)
@@ -113,6 +124,7 @@ void test_link_frames(void)
     RUN(rejects_malformed_requests);
     RUN(encodes_cmd_responses);
     RUN(encodes_a_notify);
+    RUN(encodes_an_empty_notify_without_a_packet);
     RUN(encodes_a_poll);
     RUN(handles_fwdata_and_resync);
     RUN(encoders_refuse_a_small_buffer);

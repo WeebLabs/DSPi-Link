@@ -1,10 +1,14 @@
 /*
- * web_assets.c - looks embedded web files up by path. See web_assets.h.
+ * web_assets.c - looks embedded web files up by path (bridge spec 10.5).
+ * See web_assets.h. The HTTP server and the setup API serve what it finds;
+ * the table itself is generated at build time (web_assets_table.h).
  */
 
 #include "web_assets.h"
 
 #include <string.h>
+
+#include "web_assets_table.h"
 
 const web_asset_t *web_assets_find(const char *path)
 {

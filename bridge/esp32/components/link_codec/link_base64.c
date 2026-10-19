@@ -1,7 +1,10 @@
 /*
- * link_base64.c - see link_base64.h.
+ * link_base64.c - standard base64 encoding (RFC 4648 section 4, with
+ * padding) for the `_b64` fields of the Link control plane (Link spec 7.1).
+ * The hub uses it for device.snapshot, whose bulk blob travels as JSON.
  *
- * Portable: no ESP-IDF headers.
+ * Portable: no ESP-IDF headers. Encoding only: the bridge never receives
+ * base64.
  */
 
 #include "link_base64.h"

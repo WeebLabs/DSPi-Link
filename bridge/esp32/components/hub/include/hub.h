@@ -6,8 +6,8 @@
  * state machine. Something calls one hub function per event (a WebSocket
  * message, a UART reply, a timer tick) and the hub reacts through hub_io_t.
  * On the ESP32 that something is the hub task (hub_task.h), which is the
- * only caller, so nothing here needs locking. The host tests call the same
- * functions directly.
+ * only caller of every function below, so nothing here needs locking. The
+ * host tests call the same functions directly.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -32,13 +32,11 @@
 #define HUB_DEVICE_HANDLE 0
 
 #define HUB_MAX_SESSIONS LINK_MAX_SESSIONS_WITH_PSRAM
-#define HUB_POLL_SLOTS 16      /* Slots 0 to 15 per session (Link spec 7.6) */
-#define HUB_MAX_POLL_GROUPS 32 /* Distinct polls across all sessions */
-#define HUB_ORIGIN_QUEUE 16    /* Recent SETs awaiting a notification (Link spec 8.3) */
+#define HUB_POLL_SLOTS 16 /* Slots 0 to 15 per session (Link spec 7.6) */
 #define HUB_PENDING_CAPACITY DSPI_UART_QUEUE_DEPTH
 
-/* How often hub_tick() must be called. */
-#define HUB_TICK_MS 10
+/* HUB_TICK_MS, HUB_MAX_POLL_GROUPS and HUB_ORIGIN_QUEUE_ENTRIES are tunables
+ * and live in bridge_config.h. */
 
 /* ---------------------------------------------------------------------------
  * State. Treat every type below as opaque; they are public only so a hub
@@ -74,7 +72,7 @@ typedef struct {
     uint16_t id;      /* Link session id, never 0 */
     uint32_t address; /* The client's IPv4 address, for rate limits */
     uint16_t cid;     /* The paired client this session belongs to, or 0 */
-    char client_name[64];
+    char client_name[AUTH_CLIENT_NAME_BYTES];
     link_role_t role;
     uint32_t opened_ms;
     uint32_t last_activity_ms; /* Any frame from the client, pongs included */
@@ -203,6 +201,7 @@ typedef struct {
     hub_pending_t pending[HUB_PENDING_CAPACITY];
     size_t pending_head;
     size_t pending_count;
+    uint32_t pending_head_since_ms; /* When the oldest request became the oldest */
     uint32_t next_tag;
     size_t client_commands_pending;
     bool poll_pending;
@@ -210,7 +209,7 @@ typedef struct {
     uint8_t bulk_set_buffer[LINK_MAX_PAYLOAD_BYTES]; /* The one bulk SET in flight */
     bool bulk_set_busy;
 
-    hub_origin_t origins[HUB_ORIGIN_QUEUE];
+    hub_origin_t origins[HUB_ORIGIN_QUEUE_ENTRIES];
     size_t origin_head;
     size_t origin_count;
 
@@ -230,13 +229,15 @@ typedef struct {
  * Lifecycle and time
  * ------------------------------------------------------------------------- */
 
-/* `auth_io` and `saved_auth` set up the PIN and paired clients (hub_auth.h);
- * `saved_auth` may be NULL for none. */
+/* Starts `hub` with no sessions and no device. `io` and `config` are
+ * copied; `auth_io` and `saved_auth` set up the PIN and paired clients
+ * (hub_auth.h), and `saved_auth` may be NULL for none. Called once, before
+ * any other function. */
 void hub_init(hub_t *hub, const hub_io_t *io, const hub_config_t *config,
               const hub_auth_io_t *auth_io, const hub_auth_store_t *saved_auth);
 
-/* Runs timers: keepalive, hello timeout, lock expiry, offline retention and
- * due polls. Call every HUB_TICK_MS. */
+/* Runs timers: keepalive, hello timeout, lock expiry, offline retention,
+ * lost answers, a stalled update and due polls. Call every HUB_TICK_MS. */
 void hub_tick(hub_t *hub);
 
 /* ---------------------------------------------------------------------------
@@ -251,28 +252,51 @@ bool hub_has_room(const hub_t *hub);
  * (IPv4, network byte order; used for rate limits). */
 void hub_session_opened(hub_t *hub, int slot, uint32_t address);
 
-/* A text (JSON) or binary message arrived. */
+/* A text (JSON) or binary message of `length` bytes arrived on `slot`.
+ * The hub reads it only during the call; the caller keeps ownership. */
 void hub_session_text(hub_t *hub, int slot, const char *text, size_t length);
 void hub_session_binary(hub_t *hub, int slot, const uint8_t *data, size_t length);
 
 /* A pong or other control frame arrived: the client is alive. */
 void hub_session_activity(hub_t *hub, int slot);
 
-/* The socket closed, for whatever reason. */
+/* The socket on `slot` closed, for whatever reason. Once this returns the
+ * slot may be reused. */
 void hub_session_closed(hub_t *hub, int slot);
 
 /* ---------------------------------------------------------------------------
  * Device events, from the uart task
  * ------------------------------------------------------------------------- */
 
+/* The uart task found a DSPi with `identity` (copied) at `baud`: a new
+ * device is announced, the same one coming back is a re-attach (bridge
+ * spec 7.6). */
 void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud);
+
+/* The DSPi stopped answering: it goes offline, and is removed if it does
+ * not return within LINK_OFFLINE_HANDLE_RETAIN_MS. */
 void hub_device_lost(hub_t *hub);
+
+/* A notification packet of `length` bytes from the DSPi, relayed to every
+ * session (Link spec 8.3). Read only during the call. */
 void hub_notification(hub_t *hub, const uint8_t *packet, size_t length);
+
+/* The answer to the request submitted with `tag`. Answers come in the
+ * order requests were submitted; one older than an answer already given
+ * up on is ignored. `reply->payload` is read only during the call. */
 void hub_reply(hub_t *hub, uint32_t tag, const dspi_reply_t *reply);
 
+/* How a change asked of the hub went. */
+typedef enum {
+    HUB_CHANGE_OK,
+    HUB_CHANGE_INVALID, /* The value is not allowed; nothing changed */
+    HUB_CHANGE_FAILED,  /* It could not be saved or applied (logged by the I/O) */
+} hub_change_result_t;
+
 /* Renames the hub, as hub.rename does: saves the name and advertises it.
- * False if the name is not 1 to 63 bytes of UTF-8 (bridge spec 8.11). */
-bool hub_rename(hub_t *hub, const char *name);
+ * HUB_CHANGE_INVALID if the name is not 1 to 63 bytes of UTF-8 (bridge
+ * spec 8.11). */
+hub_change_result_t hub_rename(hub_t *hub, const char *name);
 
 /* Answers a request that the hub handed to its I/O to finish, such as
  * hub.wifi.scan, if the session that asked is still there. Takes ownership
@@ -283,13 +307,17 @@ void hub_reply_later(hub_t *hub, int slot, uint16_t session_id, int request_id, 
  * 9.2). */
 bool hub_pin_enabled(const hub_t *hub);
 
-/* Checks a PIN typed on the setup page, under the same rate limits as
- * pairing (bridge spec 9.3). */
+/* Checks a PIN typed on the setup page at IPv4 `address`, under the same
+ * rate limits as pairing (bridge spec 9.3). Returns what
+ * hub_auth_check_pin() does. */
 hub_auth_result_t hub_check_pin(hub_t *hub, uint32_t address, const char *pin);
 
 /* Sets or clears the PIN from the setup page (bridge spec 9.3): `pin` NULL
- * turns it off. Every paired client is forgotten either way. */
-bool hub_set_pin(hub_t *hub, const char *pin);
+ * turns it off. Every paired client is forgotten either way, and with a
+ * new PIN every session is closed so it pairs again. Returns the result of
+ * hub_auth_set_pin(): HUB_AUTH_OK, HUB_AUTH_INVALID_PIN or
+ * HUB_AUTH_UNAVAILABLE. */
+hub_auth_result_t hub_set_pin(hub_t *hub, const char *pin);
 
 /* Tells every session the hub is going (close code 4003), then restarts
  * through the I/O after erasing what `level` says. The BOOT button uses
@@ -316,7 +344,8 @@ void hub_update_finished(hub_t *hub, bool ok, const char *text);
  * cJSON_free(). NULL if memory ran out. */
 char *hub_info_json(const hub_t *hub);
 
-/* The values the DNS-SD TXT record needs (Link spec 3.1). */
+/* The values the DNS-SD TXT record needs (Link spec 3.1). The strings
+ * point into the hub and stay valid until its next event. */
 typedef struct {
     const char *hub_id;
     const char *name;
@@ -325,6 +354,7 @@ typedef struct {
     const char *serial; /* `d`: the one device's serial, or NULL */
 } hub_advert_t;
 
+/* Fills `advert` with the hub's current DNS-SD values. */
 void hub_advert(const hub_t *hub, hub_advert_t *advert);
 
 /* Poll budget in bytes per second at the current baud rate (bridge spec

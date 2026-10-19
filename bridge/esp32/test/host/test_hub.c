@@ -1078,6 +1078,245 @@ static void a_stalled_or_orphaned_update_is_abandoned(void)
     CHECK(!hello_offers(0, "hub_update"));
 }
 
+/* ---------------------------------------------------------------------------
+ * Fixes from the code review: lost answers, poll limits, snapshot waiters
+ * and failures the I/O reports
+ * ------------------------------------------------------------------------- */
+
+/* Answers the request submitted with `tag`. */
+static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uint16_t length)
+{
+    const dspi_reply_t reply = {
+        .kind = DSPI_REPLY_ANSWERED, .status = status, .payload = payload, .length = length};
+    hub_reply(&hub, tag, &reply);
+}
+
+static void a_lost_answer_times_out_and_a_late_one_is_ignored(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    send_cmd(0, 1, true, 0x7F, 7, NULL);
+    send_cmd(0, 2, true, 0x7F, 7, NULL);
+    const uint32_t first = io_record.submissions[0].tag;
+    const uint32_t second = io_record.submissions[1].tag;
+
+    io_record.now_ms += HUB_REPLY_LOST_AFTER_MS;
+    hub_session_activity(&hub, 0);
+    hub_tick(&hub);
+    const fake_message_t *response = last_frame(0, LINK_FRAME_CMD_RESPONSE);
+    CHECK(response != NULL && response->data[2] == 1 && response->data[4] == LINK_STATUS_TIMEOUT);
+    CHECK(hub.sessions[0].commands_in_flight == 1);
+
+    /* The first answer turns up after all: it must not finish the second. */
+    forget_messages();
+    answer_tag(first, 0, (const uint8_t[]){1, 2, 3}, 3);
+    CHECK(last_frame(0, LINK_FRAME_CMD_RESPONSE) == NULL);
+    CHECK(hub.pending_count == 1);
+
+    answer_tag(second, 0, (const uint8_t[]){4, 5, 6}, 3);
+    response = last_frame(0, LINK_FRAME_CMD_RESPONSE);
+    CHECK(response != NULL && response->data[2] == 2 && response->data[4] == 0);
+    CHECK(hub.pending_count == 0 && hub.client_commands_pending == 0);
+}
+
+static void an_unknown_answer_finishes_only_older_requests(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    send_cmd(0, 1, true, 0x7F, 7, NULL);
+    send_cmd(0, 2, true, 0x7F, 7, NULL);
+    const uint32_t second = io_record.submissions[1].tag;
+
+    /* An answer for a tag before every pending one changes nothing. */
+    answer_tag(io_record.submissions[0].tag - 1, 0, NULL, 0);
+    CHECK(hub.pending_count == 2);
+
+    /* The second's answer means the first's was lost on the way. */
+    answer_tag(second, 0, (const uint8_t[]){9}, 1);
+    CHECK(hub.pending_count == 0);
+    CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+/* Subscribes `count` polls on `slot`, slots `first_slot` up, to distinct
+ * keys starting at index `first_index` (or all to `first_index` when
+ * `same` is set). */
+static void subscribe_polls(int slot, int first_slot, int count, int first_index, bool same)
+{
+    char text[2048];
+    size_t used = (size_t)snprintf(text, sizeof(text),
+                                   "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":[");
+    for (int i = 0; i < count; i++) {
+        used += (size_t)snprintf(text + used, sizeof(text) - used,
+                                 "%s{\"slot\":%d,\"req\":80,\"val\":9,\"idx\":%d,\"len\":41,"
+                                 "\"hz\":1}",
+                                 i > 0 ? "," : "", first_slot + i, first_index + (same ? 0 : i));
+    }
+    snprintf(text + used, sizeof(text) - used, "]}");
+    hub_session_text(&hub, slot, text, strlen(text));
+}
+
+static void a_refused_subscription_changes_nothing(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    open_session(2);
+    attach_device();
+    subscribe_polls(1, 0, 1, 0, false);    /* Shares session 0's first poll below */
+    subscribe_polls(0, 0, 16, 0, false);   /* 16 groups */
+    subscribe_polls(2, 0, 16, 100, false); /* 32: the most there may be */
+    CHECK(hub.poll_group_count == HUB_MAX_POLL_GROUPS);
+
+    forget_messages();
+    subscribe_polls(1, 0, 1, 200, false); /* Would need a 33rd group */
+    cJSON *err = last_json(1, "err");
+    CHECK(strcmp(json_string(err, "code"), "busy") == 0);
+    cJSON_Delete(err);
+    CHECK(hub.sessions[1].polls[0].active && hub.sessions[1].polls[0].key.index == 0);
+    CHECK(hub.poll_group_count == HUB_MAX_POLL_GROUPS);
+}
+
+static void repeated_keys_need_one_group(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    open_session(2);
+    attach_device();
+    subscribe_polls(0, 0, 16, 0, false);
+    subscribe_polls(2, 0, 15, 100, false); /* 31 groups */
+    forget_messages();
+    subscribe_polls(1, 0, 2, 200, true); /* Two slots, one new key: 32 */
+    cJSON *ok = last_json(1, "ok");
+    CHECK(ok != NULL);
+    cJSON_Delete(ok);
+    CHECK(hub.poll_group_count == HUB_MAX_POLL_GROUPS);
+}
+
+static void a_failing_poll_reports_once(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    send_json(0, METER_POLL, 0);
+    unsigned errors = 0;
+    for (int tick = 0; tick < 300; tick++) { /* Past where a byte counter wraps */
+        forget_messages();
+        forget_submissions();
+        hub_session_activity(&hub, 0);
+        hub_tick(&hub);
+        if (io_record.submission_count == 1) {
+            const dspi_reply_t timeout = {.kind = DSPI_REPLY_TIMEOUT};
+            hub_reply(&hub, io_record.submissions[0].tag, &timeout);
+        }
+        cJSON *event = last_json(0, "poll.error");
+        errors += event != NULL ? 1 : 0;
+        cJSON_Delete(event);
+        io_record.now_ms += HUB_POLL_FAILED_PERIOD_MS;
+    }
+    CHECK(errors == 1);
+}
+
+/* How many `ok` replies with `id` were sent to `slot`. */
+static unsigned count_ok(int slot, int id)
+{
+    unsigned count = 0;
+    for (size_t i = 0; i < io_record.message_count; i++) {
+        const fake_message_t *message = &io_record.messages[i];
+        if (message->slot != slot || message->binary) {
+            continue;
+        }
+        cJSON *json = cJSON_ParseWithLength((const char *)message->data, message->length);
+        count += strcmp(json_string(json, "t"), "ok") == 0 && json_number(json, "id") == id;
+        cJSON_Delete(json);
+    }
+    return count;
+}
+
+static void one_session_cannot_fill_the_snapshot_queue(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    notify(1, 1); /* The cache is stale */
+    forget_messages();
+    for (int id = 1; id <= HUB_MAX_SESSIONS + 1; id++) {
+        send_json(0, "{\"t\":\"device.snapshot\",\"id\":%d,\"handle\":0}", id);
+    }
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "busy") == 0); /* Only the first waits */
+    cJSON_Delete(err);
+    send_json(1, "{\"t\":\"device.snapshot\",\"id\":50,\"handle\":0}");
+    CHECK(last_json(1, "err") == NULL);
+    CHECK(hub.snapshot.waiter_count == 2);
+
+    static uint8_t bulk[6136] = {32, 1, 17, 9, 8};
+    answer_last(0, bulk, sizeof(bulk));
+    static const uint8_t status[41] = {1};
+    answer_last(0, status, sizeof(status));
+    CHECK(count_ok(0, 1) == 1);
+    CHECK(count_ok(0, 2) == 0);
+    CHECK(count_ok(1, 50) == 1);
+}
+
+static void failures_the_io_reports_are_errors(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+
+    io_record.refuse_apply = true;
+    forget_messages();
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":21,\"config\":{\"uart\":{\"baud\":921600}}}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    CHECK(last_json(1, "hub.config.changed") == NULL);
+    CHECK(hub.config.settings.uart_baud == 1000000);
+
+    send_json(0, "{\"t\":\"hub.rename\",\"id\":22,\"name\":\"Studio\"}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    CHECK(hub_rename(&hub, "Studio") == HUB_CHANGE_FAILED);
+
+    io_record.refuse_save_name = true;
+    send_json(0, "{\"t\":\"device.rename\",\"id\":23,\"handle\":0,\"name\":\"Kitchen\"}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    CHECK(strcmp(hub.device.name, "Kitchen") != 0);
+
+    io_record.scan_result = HUB_IO_BUSY;
+    send_json(0, "{\"t\":\"hub.wifi.scan\",\"id\":24}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "busy") == 0);
+    cJSON_Delete(err);
+    io_record.scan_result = HUB_IO_FAILED;
+    send_json(0, "{\"t\":\"hub.wifi.scan\",\"id\":25}");
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0 && json_number(err, "id") == 25);
+    cJSON_Delete(err);
+}
+
+static void a_failed_hash_keeps_the_pin_off(void)
+{
+    start();
+    open_session(0);
+    fake_pbkdf2_fails = true;
+    send_json(0, "{\"t\":\"hub.auth.set\",\"id\":5,\"mode\":\"pin\",\"pin\":\"482913\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    CHECK(!hub_pin_enabled(&hub));
+    CHECK(hub_set_pin(&hub, "482913") == HUB_AUTH_UNAVAILABLE);
+    CHECK(io_record.close_code[0] == 0);
+}
+
 void test_hub(void)
 {
     RUN(hello_describes_the_bridge);
@@ -1122,4 +1361,12 @@ void test_hub(void)
     RUN(an_update_is_written_chunk_by_chunk_then_restarts);
     RUN(bad_updates_are_refused_and_keep_the_firmware);
     RUN(a_stalled_or_orphaned_update_is_abandoned);
+    RUN(a_lost_answer_times_out_and_a_late_one_is_ignored);
+    RUN(an_unknown_answer_finishes_only_older_requests);
+    RUN(a_refused_subscription_changes_nothing);
+    RUN(repeated_keys_need_one_group);
+    RUN(a_failing_poll_reports_once);
+    RUN(one_session_cannot_fill_the_snapshot_queue);
+    RUN(failures_the_io_reports_are_errors);
+    RUN(a_failed_hash_keeps_the_pin_off);
 }

@@ -1,6 +1,9 @@
 /*
- * hub_auth.c - see hub_auth.h; implements Link spec 6.2 for a fixed PIN and
- * bridge spec 8.9.
+ * hub_auth.c - the PIN, paired clients' tokens and the pairing rate limits
+ * (see hub_auth.h for the rules). Kept apart from the hub so the security
+ * logic is small enough to review on its own and tested with fake crypto.
+ *
+ * Implements Link spec 6.2 for a fixed PIN and bridge spec 8.9.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -35,14 +38,15 @@ static bool same_hash(const uint8_t *a, const uint8_t *b)
     return difference == 0;
 }
 
-/* 32 bytes as base64url without padding (RFC 4648 section 5). */
-static void encode_token(const uint8_t bytes[32], char out[HUB_AUTH_TOKEN_CHARS + 1])
+/* AUTH_TOKEN_BYTES bytes as base64url without padding (RFC 4648 section
+ * 5). */
+static void encode_token(const uint8_t bytes[AUTH_TOKEN_BYTES], char out[HUB_AUTH_TOKEN_CHARS + 1])
 {
     static const char ALPHABET[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t written = 0;
-    for (size_t i = 0; i < 32; i += 3) {
-        const size_t left = 32 - i;
+    for (size_t i = 0; i < AUTH_TOKEN_BYTES; i += 3) {
+        const size_t left = AUTH_TOKEN_BYTES - i;
         const uint32_t group = ((uint32_t)bytes[i] << 16) |
                                (left > 1 ? (uint32_t)bytes[i + 1] << 8 : 0) |
                                (left > 2 ? (uint32_t)bytes[i + 2] : 0);
@@ -71,13 +75,13 @@ static void save(const hub_auth_t *auth)
  * last failure is oldest, reused. */
 static hub_auth_address_t *address_record(hub_auth_t *auth, uint32_t address)
 {
-    for (size_t i = 0; i < HUB_AUTH_TRACKED_ADDRESSES; i++) {
+    for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
         if (auth->addresses[i].address == address) {
             return &auth->addresses[i];
         }
     }
     hub_auth_address_t *choice = &auth->addresses[0];
-    for (size_t i = 0; i < HUB_AUTH_TRACKED_ADDRESSES; i++) {
+    for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
         hub_auth_address_t *record = &auth->addresses[i];
         if (record->address == 0) {
             choice = record;
@@ -99,7 +103,7 @@ static bool locked_out(hub_auth_t *auth, uint32_t address)
         auth->global_locked = false;
         auth->global_failures = 0;
     }
-    for (size_t i = 0; i < HUB_AUTH_TRACKED_ADDRESSES; i++) {
+    for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
         hub_auth_address_t *record = &auth->addresses[i];
         if (record->address == address && record->locked) {
             if (reached(now, record->locked_until_ms)) {
@@ -173,21 +177,27 @@ bool hub_auth_pin_is_valid(const char *pin)
     return true;
 }
 
-bool hub_auth_set_pin(hub_auth_t *auth, const char *pin)
+hub_auth_result_t hub_auth_set_pin(hub_auth_t *auth, const char *pin)
 {
     if (pin != NULL && !hub_auth_pin_is_valid(pin)) {
-        return false;
+        return HUB_AUTH_INVALID_PIN;
     }
+    /* Made aside first, so a failed random source or hash leaves the old
+     * PIN and every client in place. */
+    uint8_t salt[AUTH_PIN_SALT_BYTES] = {0};
+    uint8_t hash[HUB_AUTH_HASH_BYTES] = {0};
+    if (pin != NULL && (!auth->io.random(auth->io.context, salt, sizeof(salt)) ||
+                        !auth->io.pbkdf2(auth->io.context, pin, salt, hash))) {
+        return HUB_AUTH_UNAVAILABLE;
+    }
+
     hub_auth_store_t *store = &auth->store;
     memset(store->clients, 0, sizeof(store->clients)); /* Every token is revoked */
-    memset(store->pin_hash, 0, sizeof(store->pin_hash));
+    memcpy(store->pin_salt, salt, sizeof(store->pin_salt));
+    memcpy(store->pin_hash, hash, sizeof(store->pin_hash));
     store->pin_enabled = pin != NULL;
-    if (pin != NULL) {
-        auth->io.random(auth->io.context, store->pin_salt, sizeof(store->pin_salt));
-        auth->io.pbkdf2(auth->io.context, pin, store->pin_salt, store->pin_hash);
-    }
     save(auth);
-    return true;
+    return HUB_AUTH_OK;
 }
 
 hub_auth_result_t hub_auth_check_pin(hub_auth_t *auth, uint32_t address, const char *pin)
@@ -197,8 +207,8 @@ hub_auth_result_t hub_auth_check_pin(hub_auth_t *auth, uint32_t address, const c
     }
     uint8_t hash[HUB_AUTH_HASH_BYTES];
     const bool well_formed = hub_auth_pin_is_valid(pin);
-    if (well_formed) {
-        auth->io.pbkdf2(auth->io.context, pin, auth->store.pin_salt, hash);
+    if (well_formed && !auth->io.pbkdf2(auth->io.context, pin, auth->store.pin_salt, hash)) {
+        return HUB_AUTH_UNAVAILABLE; /* Not the client's fault, so not a failure */
     }
     if (!auth->store.pin_enabled || !well_formed || !same_hash(hash, auth->store.pin_hash)) {
         note_failure(auth, address);
@@ -239,16 +249,22 @@ static uint16_t next_cid(hub_auth_t *auth)
 hub_auth_result_t hub_auth_issue(hub_auth_t *auth, const char *name,
                                  char token[HUB_AUTH_TOKEN_CHARS + 1], uint16_t *cid)
 {
-    uint8_t secret[32];
-    auth->io.random(auth->io.context, secret, sizeof(secret));
+    uint8_t secret[AUTH_TOKEN_BYTES];
+    uint8_t token_hash[HUB_AUTH_HASH_BYTES];
+    if (!auth->io.random(auth->io.context, secret, sizeof(secret))) {
+        return HUB_AUTH_UNAVAILABLE;
+    }
     encode_token(secret, token);
+    if (!auth->io.sha256(auth->io.context, (const uint8_t *)token, HUB_AUTH_TOKEN_CHARS,
+                         token_hash)) {
+        return HUB_AUTH_UNAVAILABLE;
+    }
 
     hub_auth_client_t *client = client_entry_for_new(auth);
     const uint32_t now = auth->io.unix_time(auth->io.context);
     *client =
         (hub_auth_client_t){.used = true, .cid = next_cid(auth), .created = now, .last_seen = now};
-    auth->io.sha256(auth->io.context, (const uint8_t *)token, HUB_AUTH_TOKEN_CHARS,
-                    client->token_hash);
+    memcpy(client->token_hash, token_hash, sizeof(client->token_hash));
     snprintf(client->name, sizeof(client->name), "%s", name != NULL ? name : "");
     *cid = client->cid;
     save(auth);
@@ -274,7 +290,10 @@ hub_auth_result_t hub_auth_token(hub_auth_t *auth, uint32_t address, const char 
     }
     if (token != NULL && strlen(token) == HUB_AUTH_TOKEN_CHARS) {
         uint8_t hash[HUB_AUTH_HASH_BYTES];
-        auth->io.sha256(auth->io.context, (const uint8_t *)token, HUB_AUTH_TOKEN_CHARS, hash);
+        if (!auth->io.sha256(auth->io.context, (const uint8_t *)token, HUB_AUTH_TOKEN_CHARS,
+                             hash)) {
+            return HUB_AUTH_UNAVAILABLE;
+        }
         for (size_t i = 0; i < AUTH_MAX_PAIRED_CLIENTS; i++) {
             const hub_auth_client_t *client = &auth->store.clients[i];
             if (client->used && same_hash(client->token_hash, hash)) {

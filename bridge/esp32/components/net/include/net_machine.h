@@ -22,7 +22,7 @@ typedef enum {
     NET_STATE_SETUP,      /* No home network saved: the setup network only */
     NET_STATE_CONNECTING, /* Joining the home network */
     NET_STATE_ONLINE,     /* Joined, with an address */
-    NET_STATE_FALLBACK,   /* The home network has been missing for 3 minutes */
+    NET_STATE_FALLBACK,   /* The home network missing for WIFI_FALLBACK_AFTER_MS */
 } net_state_t;
 
 /* Progress of joining a newly entered network, for the setup page. */

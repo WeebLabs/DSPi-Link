@@ -47,20 +47,30 @@ typedef struct {
     dspi_uart_handlers_t handlers;
 } dspi_uart_config_t;
 
-/* Installs the UART driver and starts the uart task. */
+/* Installs the UART driver and starts the uart task. Called once, from
+ * app_main. Returns ESP_ERR_INVALID_STATE if already started, or the
+ * driver's or FreeRTOS's error, having undone what it set up. */
 esp_err_t dspi_uart_start(const dspi_uart_config_t *config);
 
 /*
  * Queues a request; its answer arrives through `handlers.reply` with `tag`.
  * A SET's payload must stay valid until then. `may_retry` is as for
- * dspi_link_transact(). Returns ESP_ERR_NO_MEM if the queue is full; it
- * never blocks.
+ * dspi_link_transact(). Returns ESP_ERR_NO_MEM if the queue is full and
+ * ESP_ERR_INVALID_STATE before dspi_uart_start(); it never blocks. Any task
+ * may call it, including a handler on the uart task.
  */
 esp_err_t dspi_uart_submit(const dspi_request_t *request, bool may_retry, uint32_t tag);
 
 /* Moves the link to new pins and a new rate, from hub.config.set (bridge
  * spec 8.11). The device is reported lost and then found again on the new
- * link, if it answers there. Queued behind any requests already waiting. */
+ * link, if it answers there. Queued behind any requests already waiting.
+ * If the new pins cannot be set up, the uart task logs it and keeps the old
+ * ones.
+ *
+ * Called by the hub task. It waits up to DSPI_UART_RECONFIGURE_WAIT_MS for
+ * room in the queue and then returns ESP_ERR_TIMEOUT, so it must not be
+ * called from a uart handler, which would wait on its own queue. Returns
+ * ESP_ERR_INVALID_STATE before dspi_uart_start(). */
 esp_err_t dspi_uart_reconfigure(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud, bool detect_baud);
 
 /* What hub.stats reports about the link (bridge spec 8.7). */
@@ -73,13 +83,14 @@ typedef struct {
     dspi_link_counters_t counters;
 } dspi_uart_status_t;
 
-/* A copy of the link's status and counters. The uart task updates them as
- * it runs; each field is a single aligned word, so a copy may mix two
- * moments but never holds a torn value. Good enough for statistics. */
+/* A copy of the link's status and counters, safe from any task. Pins, rate,
+ * presence and identity are copied as one consistent snapshot; the counters
+ * may be a moment apart from each other, which is fine for statistics. */
 void dspi_uart_get_status(dspi_uart_status_t *status);
 
-/* True when the uart task has gone round its loop recently; for the check
- * that confirms a new firmware (bridge spec 14.2). */
+/* True when the uart task has gone round its loop within
+ * DSPI_UART_ALIVE_WITHIN_MS; for the check that confirms a new firmware
+ * (bridge spec 14.2). Safe from any task; false before dspi_uart_start(). */
 bool dspi_uart_is_alive(void);
 
 #endif /* DSPI_UART_H */

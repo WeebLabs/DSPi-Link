@@ -48,21 +48,24 @@ typedef struct {
 
     bridge_settings_t applied; /* The last settings passed to apply_settings */
     unsigned apply_count;
-    int scan_slot; /* The last start_wifi_scan, -1 if none */
+    bool refuse_apply; /* Make apply_settings fail */
+    int scan_slot;     /* The last start_wifi_scan, -1 if none */
     uint16_t scan_session;
     int scan_request;
+    hub_io_result_t scan_result; /* What start_wifi_scan answers */
     char joined_ssid[33];
     bool refuse_join;
     int restart_level; /* -1 until restart is called */
     char saved_device_serial[17];
     char saved_device_name[64];
+    bool refuse_save_name; /* Make save_device_name fail */
     unsigned advertise_count;
 
     /* Firmware updates: what the hub asked for. Writes are only recorded;
      * the test reports them done with hub_update_written(). */
     uint32_t update_capacity; /* 0 turns updates off */
     uint32_t update_size;     /* From update_begin; 0 when none is open */
-    uint8_t update_sha256[32];
+    uint8_t update_sha256[HUB_IO_SHA256_BYTES];
     uint32_t update_bytes_written;
     uint32_t update_last_offset;
     unsigned update_writes;

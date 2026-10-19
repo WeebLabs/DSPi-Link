@@ -11,5 +11,7 @@ finishing. It answers only on the setup network.
 Public API: `setup_api_handle()`, which `http_server` calls for every
 request on port 80 of the setup network.
 
-Tests: checked on a board and against a stand-in for the API (see
-`PLAN.md`, phases 4 and 5).
+Tests: none on the host, as every endpoint needs the HTTP server and
+Wi-Fi. Checked on a board: the page opens by itself on an iPhone and an
+Android phone, lists networks, joins one, refuses a wrong password, and asks
+for the PIN when it is on (bridge spec 3 and 9.3).

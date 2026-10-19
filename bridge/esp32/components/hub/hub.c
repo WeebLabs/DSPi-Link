@@ -2,9 +2,8 @@
  * hub.c - sessions, the message dispatch table, hello and keepalive.
  *
  * Implements Link spec 4 (keepalive), 5 (session lifecycle), 6.1 (`auth:
- * none`), 7.1 (the JSON envelope), 7.2 (hello) and 7.9 (hub management), and
- * bridge spec 8.1 and 8.2. See hub_internal.h for how the other hub files
- * divide the rest.
+ * none`), 7.1 (the JSON envelope) and 7.2 (hello), and bridge spec 8.1 and
+ * 8.2. See hub_internal.h for how the other hub files divide the rest.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -66,7 +65,9 @@ void hub_broadcast_json(hub_t *hub, cJSON *message)
     const size_t length = strlen(text);
     for (size_t slot = 0; slot < hub->config.max_sessions; slot++) {
         if (hub->sessions[slot].state == HUB_SESSION_OPEN) {
-            hub->io.send_text(hub->io.context, (int)slot, text, length);
+            /* A session whose queue is full misses this event; the I/O logs
+             * it, and the next event of its kind carries the whole state. */
+            (void)hub->io.send_text(hub->io.context, (int)slot, text, length);
         }
     }
     cJSON_free(text);
@@ -77,10 +78,32 @@ bool hub_send_binary(hub_t *hub, int slot, const uint8_t *data, size_t length)
     return hub->io.send_binary(hub->io.context, slot, data, length);
 }
 
-/* Starts a reply envelope: {"t": type, "id": id}. */
+bool hub_json_add(cJSON *object, const char *name, cJSON *item)
+{
+    if (!cJSON_AddItemToObject(object, name, item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    return true;
+}
+
+bool hub_json_append(cJSON *array, cJSON *item)
+{
+    if (!cJSON_AddItemToArray(array, item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    return true;
+}
+
+/* Starts a reply envelope: {"t": type, "id": id}, or NULL if memory ran
+ * out. */
 static cJSON *new_reply(const char *type, int id)
 {
     cJSON *reply = cJSON_CreateObject();
+    if (reply == NULL) {
+        return NULL;
+    }
     cJSON_AddStringToObject(reply, "t", type);
     if (id != NO_ID) {
         cJSON_AddNumberToObject(reply, "id", id);
@@ -88,31 +111,53 @@ static cJSON *new_reply(const char *type, int id)
     return reply;
 }
 
+/* Replies and events are sent once: a session whose queue is full misses
+ * one, the I/O logs it, and the client's own timeout covers the request.
+ * So the results of hub_send_json() below are deliberately not acted on. */
+
 void hub_reply_ok(hub_t *hub, int slot, int id, cJSON *body)
 {
     cJSON *reply = new_reply("ok", id);
+    if (reply == NULL) {
+        cJSON_Delete(body);
+        return;
+    }
     if (body != NULL) {
-        /* Move the body's members into the envelope. */
         cJSON *member = body->child;
         while (member != NULL) {
             cJSON *next = member->next;
             cJSON_DetachItemViaPointer(body, member);
-            cJSON_AddItemToObject(reply, member->string, member);
+            /* `string` is the member's own name, freed with it on failure. */
+            if (!cJSON_AddItemToObject(reply, member->string, member)) {
+                cJSON_Delete(member);
+            }
             member = next;
         }
         cJSON_Delete(body);
     }
-    hub_send_json(hub, slot, reply);
+    (void)hub_send_json(hub, slot, reply);
 }
 
-void hub_reply_error(hub_t *hub, int slot, int id, const char *code, const char *msg)
+void hub_reply_error_field(hub_t *hub, int slot, int id, const char *code, const char *msg,
+                           const char *field)
 {
     cJSON *reply = new_reply("err", id);
+    if (reply == NULL) {
+        return;
+    }
     cJSON_AddStringToObject(reply, "code", code);
     if (msg != NULL) {
         cJSON_AddStringToObject(reply, "msg", msg);
     }
-    hub_send_json(hub, slot, reply);
+    if (field != NULL) {
+        cJSON_AddStringToObject(reply, "field", field);
+    }
+    (void)hub_send_json(hub, slot, reply);
+}
+
+void hub_reply_error(hub_t *hub, int slot, int id, const char *code, const char *msg)
+{
+    hub_reply_error_field(hub, slot, id, code, msg, NULL);
 }
 
 bool hub_json_int(const cJSON *object, const char *name, int *value)
@@ -253,6 +298,9 @@ uint32_t hub_poll_budget(const hub_t *hub)
 static cJSON *new_proto_object(void)
 {
     cJSON *proto = cJSON_CreateObject();
+    if (proto == NULL) {
+        return NULL;
+    }
     cJSON_AddNumberToObject(proto, "major", PROTOCOL_MAJOR);
     cJSON_AddNumberToObject(proto, "minor", PROTOCOL_MINOR);
     return proto;
@@ -261,6 +309,9 @@ static cJSON *new_proto_object(void)
 static cJSON *new_hub_object(const hub_t *hub)
 {
     cJSON *object = cJSON_CreateObject();
+    if (object == NULL) {
+        return NULL;
+    }
     cJSON_AddStringToObject(object, "id", hub->config.settings.hub_id);
     cJSON_AddStringToObject(object, "name", hub->config.settings.name);
     cJSON_AddStringToObject(object, "kind", "bridge");
@@ -268,29 +319,29 @@ static cJSON *new_hub_object(const hub_t *hub)
     return object;
 }
 
-/* The capabilities of bridge spec 8.1 implemented so far. `notify` is left
- * out when the DSPi has notifications turned off (bridge spec 5). */
+/* The capabilities of bridge spec 8.1. `notify` is left out when the DSPi
+ * has notifications turned off (bridge spec 5), `hub_update` when the I/O
+ * cannot take an update. */
 static cJSON *new_caps_array(const hub_t *hub)
 {
+    static const char *const ALWAYS[] = {"poll",       "snapshot", "lock",        "web",  "rename",
+                                         "hub_config", "wifi",     "auth_config", "reset"};
     const bool notify_off = hub->device.state != HUB_DEVICE_ABSENT &&
                             hub->device.identity.has_uart_config &&
                             !hub->device.identity.notify_enabled;
     cJSON *caps = cJSON_CreateArray();
-    cJSON_AddItemToArray(caps, cJSON_CreateString("cmd"));
-    if (!notify_off) {
-        cJSON_AddItemToArray(caps, cJSON_CreateString("notify"));
+    if (caps == NULL) {
+        return NULL;
     }
-    cJSON_AddItemToArray(caps, cJSON_CreateString("poll"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("snapshot"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("lock"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("web"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("rename"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("hub_config"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("wifi"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("auth_config"));
-    cJSON_AddItemToArray(caps, cJSON_CreateString("reset"));
+    hub_json_append(caps, cJSON_CreateString("cmd"));
+    if (!notify_off) {
+        hub_json_append(caps, cJSON_CreateString("notify"));
+    }
+    for (size_t i = 0; i < sizeof(ALWAYS) / sizeof(ALWAYS[0]); i++) {
+        hub_json_append(caps, cJSON_CreateString(ALWAYS[i]));
+    }
     if (hub_update_available(hub)) {
-        cJSON_AddItemToArray(caps, cJSON_CreateString("hub_update"));
+        hub_json_append(caps, cJSON_CreateString("hub_update"));
     }
     return caps;
 }
@@ -316,28 +367,32 @@ static void handle_hello(hub_t *hub, int slot, const cJSON *message)
      * the PIN on, it must pair or present a token first. Either way every
      * session ends up admin (Link spec 6.1, bridge spec 8.9). */
     const bool pin = hub_auth_pin_enabled(&hub->auth);
+    cJSON *hello = cJSON_CreateObject();
+    if (hello == NULL) {
+        hub_close_session(hub, slot, CLOSE_INTERNAL_ERROR); /* Out of memory */
+        return;
+    }
     session->id = allocate_session_id(hub);
     session->role = LINK_ROLE_ADMIN;
     session->state = pin ? HUB_SESSION_AUTHENTICATING : HUB_SESSION_OPEN;
 
-    cJSON *limits = cJSON_CreateObject();
+    cJSON_AddStringToObject(hello, "t", "hello");
+    hub_json_add(hello, "proto", new_proto_object());
+    hub_json_add(hello, "hub", new_hub_object(hub));
+    cJSON_AddStringToObject(hello, "auth", hub_auth_mode(hub));
+    if (pin) {
+        cJSON_AddStringToObject(hello, "pin_source", "fixed"); /* Link spec 6.2 */
+    }
+    hub_json_add(hello, "caps", new_caps_array(hub));
+    cJSON *limits = cJSON_AddObjectToObject(hello, "limits");
     cJSON_AddNumberToObject(limits, "max_frame", LINK_MAX_FRAME_BYTES);
     cJSON_AddNumberToObject(limits, "max_payload", LINK_MAX_PAYLOAD_BYTES);
     cJSON_AddNumberToObject(limits, "max_inflight", LINK_MAX_INFLIGHT);
     cJSON_AddNumberToObject(limits, "poll_max_hz", LINK_POLL_MAX_HZ);
     cJSON_AddNumberToObject(limits, "poll_budget_bps", hub_poll_budget(hub));
-
-    cJSON *hello = cJSON_CreateObject();
-    cJSON_AddStringToObject(hello, "t", "hello");
-    cJSON_AddItemToObject(hello, "proto", new_proto_object());
-    cJSON_AddItemToObject(hello, "hub", new_hub_object(hub));
-    cJSON_AddStringToObject(hello, "auth", hub_auth_mode(hub));
-    if (pin) {
-        cJSON_AddStringToObject(hello, "pin_source", "fixed"); /* Link spec 6.2 */
-    }
-    cJSON_AddItemToObject(hello, "caps", new_caps_array(hub));
-    cJSON_AddItemToObject(hello, "limits", limits);
-    hub_send_json(hub, slot, hello);
+    /* A hello lost to a full queue leaves the client to time out and
+     * reconnect, as it would after any lost first message. */
+    (void)hub_send_json(hub, slot, hello);
 }
 
 /* The `ok` that opens a session: its id, role and empty denial list, plus
@@ -347,15 +402,14 @@ static void reply_authenticated(hub_t *hub, int slot, int id, const char *token)
     hub_session_t *session = &hub->sessions[slot];
     session->state = HUB_SESSION_OPEN;
 
-    cJSON *policy = cJSON_CreateObject();
-    cJSON_AddItemToObject(policy, "denied", cJSON_CreateArray()); /* Admin is denied nothing */
     cJSON *body = cJSON_CreateObject();
     cJSON_AddNumberToObject(body, "session", session->id);
     cJSON_AddStringToObject(body, "role", link_policy_role_name(session->role));
     if (token != NULL) {
         cJSON_AddStringToObject(body, "token", token);
     }
-    cJSON_AddItemToObject(body, "policy", policy);
+    cJSON *policy = cJSON_AddObjectToObject(body, "policy");
+    cJSON_AddArrayToObject(policy, "denied"); /* Admin is denied nothing */
     hub_reply_ok(hub, slot, id, body);
 }
 
@@ -363,6 +417,8 @@ static void reply_auth_failure(hub_t *hub, int slot, int id, hub_auth_result_t r
 {
     if (result == HUB_AUTH_RATE_LIMITED) {
         hub_reply_error(hub, slot, id, "rate_limited", "too many failures; try again in a minute");
+    } else if (result == HUB_AUTH_UNAVAILABLE) {
+        hub_reply_error(hub, slot, id, "internal", "the bridge could not check credentials");
     } else {
         hub_reply_error(hub, slot, id, "unauthenticated", NULL);
     }
@@ -419,72 +475,9 @@ static void handle_auth_token(hub_t *hub, int slot, int id, const cJSON *message
     reply_authenticated(hub, slot, id, NULL);
 }
 
-bool hub_pin_enabled(const hub_t *hub)
-{
-    return hub_auth_pin_enabled(&hub->auth);
-}
-
-hub_auth_result_t hub_check_pin(hub_t *hub, uint32_t address, const char *pin)
-{
-    return hub_auth_check_pin(&hub->auth, address, pin);
-}
-
-bool hub_set_pin(hub_t *hub, const char *pin)
-{
-    if (!hub_auth_set_pin(&hub->auth, pin)) {
-        return false;
-    }
-    if (pin != NULL) {
-        /* Every token is gone; whoever is connected pairs again. */
-        hub_close_sessions(hub, CLOSE_TOKEN_REVOKED, -1);
-    }
-    hub->io.advertise(hub->io.context);
-    return true;
-}
-
 /* ---------------------------------------------------------------------------
- * Hub management (Link spec 7.9)
+ * Answers finished elsewhere
  * ------------------------------------------------------------------------- */
-
-static void handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message)
-{
-    (void)message;
-    unsigned open_sessions = 0;
-    for (size_t i = 0; i < hub->config.max_sessions; i++) {
-        open_sessions += hub->sessions[i].state == HUB_SESSION_OPEN ? 1 : 0;
-    }
-
-    cJSON *body = cJSON_CreateObject();
-    cJSON_AddNumberToObject(body, "sessions", open_sessions);
-    cJSON_AddNumberToObject(body, "uptime_s", (hub_now(hub) - hub->started_ms) / 1000);
-
-    cJSON *devices = cJSON_AddArrayToObject(body, "devices");
-    if (hub->device.state != HUB_DEVICE_ABSENT) {
-        cJSON *device = cJSON_CreateObject();
-        cJSON_AddNumberToObject(device, "handle", HUB_DEVICE_HANDLE);
-        cJSON_AddNumberToObject(device, "cmds", hub->device.commands);
-        cJSON_AddNumberToObject(device, "errors", hub->device.errors);
-        cJSON_AddNumberToObject(device, "avg_rtt_ms", hub->device.average_rtt_ms);
-        cJSON_AddNumberToObject(device, "notify_dropped", hub->device.notifications_dropped);
-        cJSON_AddItemToArray(devices, device);
-    }
-
-    if (hub->io.describe_bridge != NULL) {
-        hub->io.describe_bridge(hub->io.context, cJSON_AddObjectToObject(body, "bridge"));
-    }
-    hub_reply_ok(hub, slot, id, body);
-}
-
-bool hub_rename(hub_t *hub, const char *name)
-{
-    if (!settings_name_is_valid(name)) {
-        return false;
-    }
-    bridge_settings_t settings = hub->config.settings;
-    snprintf(settings.name, sizeof(settings.name), "%s", name);
-    hub_apply_settings(hub, &settings);
-    return true;
-}
 
 void hub_reply_later(hub_t *hub, int slot, uint16_t session_id, int request_id, cJSON *body)
 {
@@ -494,16 +487,6 @@ void hub_reply_later(hub_t *hub, int slot, uint16_t session_id, int request_id, 
         return;
     }
     hub_reply_ok(hub, slot, request_id, body);
-}
-
-static void handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message)
-{
-    const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
-    if (!cJSON_IsString(name) || !hub_rename(hub, name->valuestring)) {
-        hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
-        return;
-    }
-    hub_reply_ok(hub, slot, id, NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -538,8 +521,8 @@ static const struct {
     {"poll.unsubscribe", hub_handle_poll_unsubscribe},
     {"lock.acquire", hub_handle_lock_acquire},
     {"lock.release", hub_handle_lock_release},
-    {"hub.stats", handle_hub_stats},
-    {"hub.rename", handle_hub_rename},
+    {"hub.stats", hub_handle_hub_stats},
+    {"hub.rename", hub_handle_hub_rename},
 };
 
 static void dispatch_request(hub_t *hub, int slot, const char *type, int id, const cJSON *message)
@@ -580,7 +563,7 @@ void hub_session_text(hub_t *hub, int slot, const char *text, size_t length)
         hub_reply_error(hub, slot, NO_ID, "bad_request", "not a JSON object with a string t");
     } else {
         int id = NO_ID;
-        hub_json_int(message, "id", &id);
+        (void)hub_json_int(message, "id", &id); /* Optional: NO_ID stands if absent */
         const bool is_auth = strcmp(type->valuestring, "auth.pair") == 0 ||
                              strcmp(type->valuestring, "auth.token") == 0;
         if (strcmp(type->valuestring, "hello") == 0) {
@@ -613,7 +596,7 @@ void hub_session_binary(hub_t *hub, int slot, const uint8_t *data, size_t length
         const size_t frame_length =
             link_encode_cmd_response(hub->frame, sizeof(hub->frame), link_frame_tag(data, length),
                                      LINK_STATUS_UNSUPPORTED, NULL, 0);
-        hub_send_binary(hub, slot, hub->frame, frame_length);
+        (void)hub_send_binary(hub, slot, hub->frame, frame_length); /* Best effort, as any CMD */
     }
     /* Types from 0x80 are hub-to-client; a hub ignores them. */
 }
@@ -658,6 +641,7 @@ static void tick_sessions(hub_t *hub, uint32_t now)
 void hub_tick(hub_t *hub)
 {
     tick_sessions(hub, hub_now(hub));
+    hub_commands_tick(hub);
     hub_device_tick(hub);
     hub_polls_tick(hub);
     hub_update_tick(hub);
@@ -670,8 +654,11 @@ void hub_tick(hub_t *hub)
 char *hub_info_json(const hub_t *hub)
 {
     cJSON *info = cJSON_CreateObject();
-    cJSON_AddItemToObject(info, "proto", new_proto_object());
-    cJSON_AddItemToObject(info, "hub", new_hub_object(hub));
+    if (info == NULL) {
+        return NULL;
+    }
+    hub_json_add(info, "proto", new_proto_object());
+    hub_json_add(info, "hub", new_hub_object(hub));
     cJSON_AddStringToObject(info, "auth", hub_auth_mode(hub));
     cJSON_AddBoolToObject(info, "tls", false);
     cJSON_AddStringToObject(info, "ws", "/dspi/v1");
@@ -681,7 +668,7 @@ char *hub_info_json(const hub_t *hub)
         cJSON *device = cJSON_CreateObject();
         cJSON_AddStringToObject(device, "serial", hub->device.identity.serial);
         cJSON_AddStringToObject(device, "name", hub->device.name);
-        cJSON_AddItemToArray(devices, device);
+        hub_json_append(devices, device);
     }
 
     char *text = cJSON_PrintUnformatted(info);

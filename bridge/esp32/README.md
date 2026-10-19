@@ -6,7 +6,8 @@ control that DSPi over the network. What it does and why is in
 [`spec/esp32_bridge_spec.md`](../../spec/esp32_bridge_spec.md); the build
 order and the state of each part are in [`PLAN.md`](PLAN.md).
 
-**Status:** phase 7 of 8, ready for release testing. The bridge sets itself
+**Status:** phase 8 of 8, release testing: complete on the ESP32-S3, with
+the other three chips still to be tested on boards. The bridge sets itself
 up from a phone, serves DSPi Console and the browser, has an optional PIN,
 a settings page, firmware updates with automatic rollback, and BOOT button
 resets.

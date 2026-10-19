@@ -1,0 +1,47 @@
+/* The colours both pages use, defined once (bridge spec 10.4): light by
+   default, dark when the system asks for it. style.css and setup/setup.css
+   each import this file, so each page's own stylesheet still carries it and
+   the setup page loads nothing it does not need. */
+
+:root {
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --line: #d9dde3;
+  --text: #16181d;
+  --dim: #5d6573;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  /* A solid ring, at least 3:1 against every surface (WCAG 1.4.11). */
+  --focus: #2563eb;
+  --good: #15803d;
+  --good-soft: #e7f6ec;
+  --warn: #a15c07;
+  --warn-soft: #fdf3e2;
+  --bad: #b91c1c;
+  --bad-soft: #fde8e8;
+  /* Text on a --bad background, at least 4.5:1. */
+  --bad-text: #ffffff;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --surface: #181b21;
+    --surface-2: #23272e;
+    --line: #2a2f38;
+    --text: #e8eaee;
+    --dim: #9aa3b1;
+    --accent: #5b9cff;
+    --accent-text: #0b1220;
+    --focus: #5b9cff;
+    --good: #4ade80;
+    --good-soft: #13261a;
+    --warn: #f5b950;
+    --warn-soft: #2b2213;
+    --bad: #f87171;
+    --bad-soft: #2d1718;
+    --bad-text: #1a0b0b;
+  }
+}

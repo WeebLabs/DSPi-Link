@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "board.h"
+#include "bridge_config.h"
 #include "cJSON.h"
 #include "dspi_uart.h"
 #include "esp_app_desc.h"
@@ -28,36 +29,61 @@ static const char *TAG = "setup_api";
 
 #define API_PREFIX "/setup/v1/"
 #define SETUP_PAGE "/setup.html"
-#define MAX_BODY_BYTES 512
-#define MAX_NETWORKS 24
 
 /* ---------------------------------------------------------------------------
  * Replies
  * ------------------------------------------------------------------------- */
 
+/* Sets a reply's status, type and Cache-Control, logging a failure. */
+static esp_err_t prepare_reply(httpd_req_t *request, const char *status, const char *type,
+                               const char *cache_control)
+{
+    esp_err_t err = httpd_resp_set_status(request, status);
+    if (err == ESP_OK && type != NULL) {
+        err = httpd_resp_set_type(request, type);
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_set_hdr(request, "Cache-Control", cache_control);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Could not prepare a reply: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+/* Sends `body` and deletes it; NULL (memory ran out building it) is a 500. */
 static esp_err_t send_json(httpd_req_t *request, const char *status, cJSON *body)
 {
-    char *text = cJSON_PrintUnformatted(body);
+    char *text = body != NULL ? cJSON_PrintUnformatted(body) : NULL;
     cJSON_Delete(body);
     if (text == NULL) {
+        ESP_LOGW(TAG, "No memory for a reply");
         return httpd_resp_send_500(request);
     }
-    httpd_resp_set_status(request, status);
-    httpd_resp_set_type(request, "application/json");
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    const esp_err_t err = httpd_resp_sendstr(request, text);
+    esp_err_t err = prepare_reply(request, status, "application/json", "no-store");
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr(request, text);
+    }
     cJSON_free(text);
     return err;
 }
 
-/* {"error": code, "msg": plain sentence} with a 4xx status (bridge spec 9.3). */
+/* {"error": code, "msg": plain sentence} (bridge spec 9.3). */
 static esp_err_t send_error(httpd_req_t *request, const char *status, const char *code,
                             const char *msg)
 {
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "error", code);
-    cJSON_AddStringToObject(body, "msg", msg);
+    if (cJSON_AddStringToObject(body, "error", code) == NULL ||
+        cJSON_AddStringToObject(body, "msg", msg) == NULL) {
+        cJSON_Delete(body);
+        body = NULL;
+    }
     return send_json(request, status, body);
+}
+
+static esp_err_t send_bad_request(httpd_req_t *request, const char *msg)
+{
+    return send_error(request, "400 Bad Request", "bad_request", msg);
 }
 
 /* Sends the browser to the setup page. This is the answer a phone's
@@ -66,84 +92,120 @@ static esp_err_t redirect_to_setup(httpd_req_t *request)
 {
     char location[40];
     snprintf(location, sizeof(location), "http://%s/", net_setup_address());
-    httpd_resp_set_status(request, "302 Found");
-    httpd_resp_set_hdr(request, "Location", location);
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_send(request, NULL, 0);
+    esp_err_t err = prepare_reply(request, "302 Found", NULL, "no-store");
+    if (err == ESP_OK) {
+        err = httpd_resp_set_hdr(request, "Location", location);
+    }
+    return err == ESP_OK ? httpd_resp_send(request, NULL, 0) : err;
 }
 
 static esp_err_t send_asset(httpd_req_t *request, const web_asset_t *asset)
 {
-    httpd_resp_set_type(request, asset->content_type);
-    httpd_resp_set_hdr(request, "Content-Encoding", "gzip");
-    httpd_resp_set_hdr(request, "Cache-Control", asset->immutable ? "max-age=86400" : "no-store");
-    return httpd_resp_send(request, (const char *)asset->data, (ssize_t)asset->length);
+    esp_err_t err = prepare_reply(request, "200 OK", asset->content_type,
+                                  asset->immutable ? "max-age=86400" : "no-store");
+    if (err == ESP_OK) {
+        err = httpd_resp_set_hdr(request, "Content-Encoding", "gzip");
+    }
+    return err == ESP_OK
+               ? httpd_resp_send(request, (const char *)asset->data, (ssize_t)asset->length)
+               : err;
 }
 
 /* ---------------------------------------------------------------------------
  * The API (bridge spec 9.3)
  * ------------------------------------------------------------------------- */
 
-static esp_err_t get_state(httpd_req_t *request)
+/* Adds `value` as a string, or null when `present` is false. False if
+ * memory ran out. */
+static bool add_string_or_null(cJSON *object, const char *name, const char *value, bool present)
 {
-    char name[64];
-    hub_task_name(name, sizeof(name));
-    net_status_t network;
-    net_get_status(&network);
+    return (present ? cJSON_AddStringToObject(object, name, value)
+                    : cJSON_AddNullToObject(object, name)) != NULL;
+}
+
+static bool add_dspi(cJSON *body)
+{
     dspi_uart_status_t link;
     dspi_uart_get_status(&link);
+    cJSON *dspi = cJSON_AddObjectToObject(body, "dspi");
+    bool ok = cJSON_AddBoolToObject(dspi, "found", link.device_present) != NULL;
+    if (link.device_present) {
+        ok = cJSON_AddStringToObject(dspi, "serial", link.identity.serial) != NULL && ok;
+        ok = cJSON_AddNumberToObject(dspi, "baud", link.baud) != NULL && ok;
+        ok = cJSON_AddBoolToObject(dspi, "notify_enable", link.identity.notify_enabled) != NULL &&
+             ok;
+    }
+    return ok;
+}
+
+static bool add_wifi(cJSON *body)
+{
+    net_status_t network;
+    net_get_status(&network);
+    cJSON *wifi = cJSON_AddObjectToObject(body, "wifi");
+    bool ok =
+        add_string_or_null(wifi, "saved_ssid", network.saved_ssid, network.saved_ssid[0] != '\0');
+    ok = cJSON_AddStringToObject(wifi, "join", net_join_name(network.join)) != NULL && ok;
+    if (network.join == NET_JOIN_FAILED) {
+        ok = cJSON_AddStringToObject(wifi, "failure",
+                                     net_join_failure_name(network.join_failure)) != NULL &&
+             ok;
+    }
+    ok = add_string_or_null(wifi, "ip", network.ip, network.connected) && ok;
+    ok = cJSON_AddStringToObject(wifi, "hostname", network.hostname) != NULL && ok;
+    ok = cJSON_AddStringToObject(wifi, "setup_ssid", network.setup_ssid) != NULL && ok;
+    return ok;
+}
+
+static esp_err_t get_state(httpd_req_t *request)
+{
+    char name[SETTINGS_NAME_MAX_BYTES + 1];
+    hub_task_name(name, sizeof(name));
 
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "name", name);
-    cJSON_AddStringToObject(body, "chip", board_table()->chip_name);
-    cJSON_AddStringToObject(body, "version", esp_app_get_description()->version);
-    cJSON_AddBoolToObject(body, "pin_required", hub_task_pin_enabled());
-
-    cJSON *dspi = cJSON_AddObjectToObject(body, "dspi");
-    cJSON_AddBoolToObject(dspi, "found", link.device_present);
-    if (link.device_present) {
-        cJSON_AddStringToObject(dspi, "serial", link.identity.serial);
-        cJSON_AddNumberToObject(dspi, "baud", link.baud);
-        cJSON_AddBoolToObject(dspi, "notify_enable", link.identity.notify_enabled);
+    bool ok = cJSON_AddStringToObject(body, "name", name) != NULL;
+    ok = cJSON_AddStringToObject(body, "chip", board_table()->chip_name) != NULL && ok;
+    ok = cJSON_AddStringToObject(body, "version", esp_app_get_description()->version) != NULL && ok;
+    ok = cJSON_AddBoolToObject(body, "pin_required", hub_task_pin_enabled()) != NULL && ok;
+    ok = add_dspi(body) && ok;
+    ok = add_wifi(body) && ok;
+    if (!ok) {
+        cJSON_Delete(body);
+        body = NULL;
     }
-
-    cJSON *wifi = cJSON_AddObjectToObject(body, "wifi");
-    if (network.saved_ssid[0] != '\0') {
-        cJSON_AddStringToObject(wifi, "saved_ssid", network.saved_ssid);
-    } else {
-        cJSON_AddNullToObject(wifi, "saved_ssid");
-    }
-    cJSON_AddStringToObject(wifi, "join", net_join_name(network.join));
-    if (network.join == NET_JOIN_FAILED) {
-        cJSON_AddStringToObject(wifi, "failure", net_join_failure_name(network.join_failure));
-    }
-    if (network.connected) {
-        cJSON_AddStringToObject(wifi, "ip", network.ip);
-    } else {
-        cJSON_AddNullToObject(wifi, "ip");
-    }
-    cJSON_AddStringToObject(wifi, "hostname", network.hostname);
-    cJSON_AddStringToObject(wifi, "setup_ssid", network.setup_ssid);
     return send_json(request, "200 OK", body);
+}
+
+/* {"networks": [{"ssid", "rssi", "secure"}, ...]}, or NULL if memory ran
+ * out. */
+static cJSON *networks_document(const net_network_t *networks, size_t count)
+{
+    cJSON *body = cJSON_CreateObject();
+    cJSON *list = cJSON_AddArrayToObject(body, "networks");
+    bool ok = list != NULL;
+    for (size_t i = 0; i < count && ok; i++) {
+        cJSON *entry = cJSON_CreateObject();
+        ok = cJSON_AddItemToArray(list, entry);
+        ok = ok && cJSON_AddStringToObject(entry, "ssid", networks[i].ssid) != NULL;
+        ok = ok && cJSON_AddNumberToObject(entry, "rssi", networks[i].rssi) != NULL;
+        ok = ok && cJSON_AddBoolToObject(entry, "secure", networks[i].secure) != NULL;
+    }
+    if (!ok) {
+        cJSON_Delete(body);
+        return NULL;
+    }
+    return body;
 }
 
 static esp_err_t get_networks(httpd_req_t *request)
 {
-    net_network_t *networks = calloc(MAX_NETWORKS, sizeof(net_network_t));
+    net_network_t *networks = calloc(SETUP_API_MAX_NETWORKS, sizeof(net_network_t));
     if (networks == NULL) {
+        ESP_LOGW(TAG, "No memory to list networks");
         return httpd_resp_send_500(request);
     }
-    const size_t count = net_scan(networks, MAX_NETWORKS);
-
-    cJSON *body = cJSON_CreateObject();
-    cJSON *list = cJSON_AddArrayToObject(body, "networks");
-    for (size_t i = 0; i < count; i++) {
-        cJSON *entry = cJSON_CreateObject();
-        cJSON_AddStringToObject(entry, "ssid", networks[i].ssid);
-        cJSON_AddNumberToObject(entry, "rssi", networks[i].rssi);
-        cJSON_AddBoolToObject(entry, "secure", networks[i].secure);
-        cJSON_AddItemToArray(list, entry);
-    }
+    const size_t count = net_scan(networks, SETUP_API_MAX_NETWORKS);
+    cJSON *body = networks_document(networks, count);
     free(networks);
     return send_json(request, "200 OK", body);
 }
@@ -151,16 +213,16 @@ static esp_err_t get_networks(httpd_req_t *request)
 /* Reads a small JSON body. NULL, with a reply already sent, on failure. */
 static cJSON *read_json_body(httpd_req_t *request)
 {
-    if (request->content_len == 0 || request->content_len > MAX_BODY_BYTES) {
-        send_error(request, "400 Bad Request", "bad_request", "The request needs a JSON body.");
+    if (request->content_len == 0 || request->content_len > SETUP_API_MAX_BODY_BYTES) {
+        send_bad_request(request, "The request needs a JSON body.");
         return NULL;
     }
-    char body[MAX_BODY_BYTES + 1];
+    char body[SETUP_API_MAX_BODY_BYTES + 1];
     size_t received = 0;
     while (received < request->content_len) {
         const int got = httpd_req_recv(request, body + received, request->content_len - received);
         if (got <= 0) {
-            send_error(request, "400 Bad Request", "bad_request", "The body was cut short.");
+            send_bad_request(request, "The body was cut short.");
             return NULL;
         }
         received += (size_t)got;
@@ -169,7 +231,7 @@ static cJSON *read_json_body(httpd_req_t *request)
     cJSON *json = cJSON_Parse(body);
     if (!cJSON_IsObject(json)) {
         cJSON_Delete(json);
-        send_error(request, "400 Bad Request", "bad_request", "The body is not a JSON object.");
+        send_bad_request(request, "The body is not a JSON object.");
         return NULL;
     }
     return json;
@@ -201,10 +263,70 @@ static bool pin_allows(httpd_req_t *request, const cJSON *json, esp_err_t *resul
         *result = send_error(request, "429 Too Many Requests", "rate_limited",
                              "Too many wrong PINs. Wait a minute and try again.");
         return false;
+    case HUB_AUTH_UNAVAILABLE:
+        /* The PIN could not be checked at all; refuse without blaming it. */
+        *result = send_error(request, "503 Service Unavailable", "busy",
+                             "The bridge is busy. Try again in a moment.");
+        return false;
     default:
         *result = send_error(request, "403 Forbidden", "wrong_pin", "That PIN is not right.");
         return false;
     }
+}
+
+/* The choices an apply request makes (bridge spec 9.3). */
+typedef struct {
+    const char *ssid;
+    const char *password;
+    const char *name;  /* NULL keeps the name */
+    bool turn_pin_on;  /* With `pin` */
+    bool turn_pin_off; /* The PIN is on and the page turned it off */
+    const char *pin;
+} apply_choices_t;
+
+/* What is wrong with the choices, as a sentence for the page, or NULL. */
+static const char *apply_problem(const apply_choices_t *choices)
+{
+    if (choices->turn_pin_on && !hub_auth_pin_is_valid(choices->pin)) {
+        return "The PIN must be six digits.";
+    }
+    if (choices->ssid == NULL || choices->password == NULL) {
+        return "Choose a network and enter its password.";
+    }
+    if (choices->name != NULL && !settings_name_is_valid(choices->name)) {
+        return "The name must be 1 to 63 bytes of text.";
+    }
+    switch (net_check_credentials(choices->ssid, choices->password)) {
+    case NET_CREDENTIALS_BAD_SSID:
+        return "The network name must be 1 to 32 bytes.";
+    case NET_CREDENTIALS_BAD_PASSWORD:
+        return "Wi-Fi passwords are 8 to 63 characters, or 64 hexadecimal digits, or empty "
+               "for an open network.";
+    case NET_CREDENTIALS_OK:
+        break;
+    }
+    return NULL;
+}
+
+/* Saves the name and the PIN choice, then starts joining. Everything has
+ * been checked, so a failure here is the bridge's, not the page's. */
+static esp_err_t carry_out_apply(httpd_req_t *request, const apply_choices_t *choices)
+{
+    if (choices->name != NULL && hub_task_rename(choices->name) != ESP_OK) {
+        return send_error(request, "503 Service Unavailable", "busy",
+                          "The bridge could not save its name. Try again.");
+    }
+    if ((choices->turn_pin_on || choices->turn_pin_off) &&
+        hub_task_set_pin(choices->turn_pin_on ? choices->pin : NULL) != ESP_OK) {
+        return send_error(request, "503 Service Unavailable", "busy",
+                          "The bridge could not change its PIN. Try again.");
+    }
+    if (net_join(choices->ssid, choices->password) != ESP_OK) {
+        return send_error(request, "503 Service Unavailable", "busy",
+                          "The bridge could not start joining the network. Try again.");
+    }
+    ESP_LOGI(TAG, "Setup page: joining \"%s\"", choices->ssid);
+    return send_json(request, "202 Accepted", cJSON_CreateObject());
 }
 
 /* {"ssid", "password", "name", "pin_enabled", "pin", "current_pin"}: saves
@@ -221,40 +343,21 @@ static esp_err_t post_apply(httpd_req_t *request)
         cJSON_Delete(json);
         return result;
     }
-    const char *ssid = string_member(json, "ssid");
-    const char *password = string_member(json, "password");
-    const char *name = string_member(json, "name");
+    /* A missing pin_enabled leaves the PIN as it is. */
     const cJSON *pin_enabled = cJSON_GetObjectItemCaseSensitive(json, "pin_enabled");
-    const char *pin = string_member(json, "pin");
-    const bool turn_pin_on = cJSON_IsTrue(pin_enabled);
+    const apply_choices_t choices = {
+        .ssid = string_member(json, "ssid"),
+        .password = string_member(json, "password"),
+        .name = string_member(json, "name"),
+        .turn_pin_on = cJSON_IsTrue(pin_enabled),
+        .turn_pin_off = cJSON_IsFalse(pin_enabled) && hub_task_pin_enabled(),
+        .pin = string_member(json, "pin"),
+    };
 
     /* Check everything before changing anything. */
-    if (turn_pin_on && !hub_auth_pin_is_valid(pin)) {
-        result =
-            send_error(request, "400 Bad Request", "bad_request", "The PIN must be six digits.");
-    } else if (ssid == NULL || password == NULL) {
-        result = send_error(request, "400 Bad Request", "bad_request",
-                            "Choose a network and enter its password.");
-    } else if (name != NULL && !settings_name_is_valid(name)) {
-        result = send_error(request, "400 Bad Request", "bad_request",
-                            "The name must be 1 to 63 characters.");
-    } else if (net_join(ssid, password) != ESP_OK) {
-        result = send_error(request, "400 Bad Request", "bad_request",
-                            "Wi-Fi passwords are 8 to 63 characters, or empty for an open "
-                            "network.");
-    } else {
-        if (name != NULL) {
-            hub_task_rename(name);
-        }
-        /* A missing pin_enabled leaves the PIN as it is. */
-        if (turn_pin_on) {
-            hub_task_set_pin(pin);
-        } else if (cJSON_IsFalse(pin_enabled) && hub_task_pin_enabled()) {
-            hub_task_set_pin(NULL);
-        }
-        ESP_LOGI(TAG, "Setup page: joining \"%s\"", ssid);
-        result = send_json(request, "202 Accepted", cJSON_CreateObject());
-    }
+    const char *problem = apply_problem(&choices);
+    result =
+        problem != NULL ? send_bad_request(request, problem) : carry_out_apply(request, &choices);
     cJSON_Delete(json);
     return result;
 }
@@ -267,8 +370,10 @@ static esp_err_t post_finish(httpd_req_t *request)
         return ESP_OK; /* read_json_body has replied */
     }
     if (pin_allows(request, json, &result)) {
-        net_finish_setup();
-        result = send_json(request, "200 OK", cJSON_CreateObject());
+        result = net_finish_setup() == ESP_OK
+                     ? send_json(request, "200 OK", cJSON_CreateObject())
+                     : send_error(request, "503 Service Unavailable", "busy",
+                                  "The bridge could not finish setting up. Try again.");
     }
     cJSON_Delete(json);
     return result;
@@ -290,15 +395,32 @@ static bool request_path(const httpd_req_t *request, char *path, size_t size)
     return true;
 }
 
-/* True when the browser asked for the bridge by its setup address. Any
- * other host is a phone's connectivity check or a page the phone wanted
- * from the internet. */
-static bool addressed_to_bridge(httpd_req_t *request)
+/* The Host header without its port, or "" when there is none or it is too
+ * long to be the setup address. */
+static void request_host(httpd_req_t *request, char *host, size_t size)
 {
-    char host[64] = "";
-    httpd_req_get_hdr_value_str(request, "Host", host, sizeof(host));
+    if (httpd_req_get_hdr_value_str(request, "Host", host, size) != ESP_OK) {
+        host[0] = '\0';
+    }
     host[strcspn(host, ":")] = '\0';
-    return strcmp(host, net_setup_address()) == 0;
+}
+
+static esp_err_t route_api(httpd_req_t *request, const char *endpoint)
+{
+    const bool is_get = request->method == HTTP_GET;
+    if (is_get && strcmp(endpoint, "state") == 0) {
+        return get_state(request);
+    }
+    if (is_get && strcmp(endpoint, "networks") == 0) {
+        return get_networks(request);
+    }
+    if (!is_get && strcmp(endpoint, "apply") == 0) {
+        return post_apply(request);
+    }
+    if (!is_get && strcmp(endpoint, "finish") == 0) {
+        return post_finish(request);
+    }
+    return send_error(request, "404 Not Found", "not_found", "No such setup request.");
 }
 
 esp_err_t setup_api_handle(httpd_req_t *request)
@@ -309,29 +431,16 @@ esp_err_t setup_api_handle(httpd_req_t *request)
     }
     /* Setup is rare and short, so every request is worth a log line when
      * a phone does not show the page. */
-    char host[64] = "";
-    httpd_req_get_hdr_value_str(request, "Host", host, sizeof(host));
+    char host[64];
+    request_host(request, host, sizeof(host));
     ESP_LOGI(TAG, "%s http://%s%s", request->method == HTTP_GET ? "GET" : "POST", host, path);
 
     if (strncmp(path, API_PREFIX, strlen(API_PREFIX)) == 0) {
-        const char *endpoint = path + strlen(API_PREFIX);
-        const bool is_get = request->method == HTTP_GET;
-        if (is_get && strcmp(endpoint, "state") == 0) {
-            return get_state(request);
-        }
-        if (is_get && strcmp(endpoint, "networks") == 0) {
-            return get_networks(request);
-        }
-        if (!is_get && strcmp(endpoint, "apply") == 0) {
-            return post_apply(request);
-        }
-        if (!is_get && strcmp(endpoint, "finish") == 0) {
-            return post_finish(request);
-        }
-        return send_error(request, "404 Not Found", "not_found", "No such setup request.");
+        return route_api(request, path + strlen(API_PREFIX));
     }
-
-    if (request->method != HTTP_GET || !addressed_to_bridge(request)) {
+    /* Any other host is a phone's connectivity check or a page the phone
+     * wanted from the internet. */
+    if (request->method != HTTP_GET || strcmp(host, net_setup_address()) != 0) {
         return redirect_to_setup(request);
     }
     const web_asset_t *asset = web_assets_find(strcmp(path, "/") == 0 ? SETUP_PAGE : path);

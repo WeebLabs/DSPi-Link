@@ -129,13 +129,31 @@ static void repair_restores_defaults_for_each_bad_key(void)
     settings.led_pin = 21; /* Console UART on the C3 */
     strcpy(settings.hostname, "Bad Name");
 
-    CHECK(settings_model_repair(&settings, &defaults, board) == 3);
+    size_t repaired = 0;
+    CHECK(settings_model_repair(&settings, &defaults, board, &repaired));
+    CHECK(repaired == 3);
     CHECK_NULL(settings_model_find_problem(&settings, board));
     CHECK(settings.uart_tx_pin == defaults.uart_tx_pin);
     CHECK(settings.led_type == SETTINGS_LED_NONE);
     CHECK_STR_EQ(settings.hostname, defaults.hostname);
 
-    CHECK(settings_model_repair(&settings, &defaults, board) == 0);
+    CHECK(settings_model_repair(&settings, &defaults, board, &repaired));
+    CHECK(repaired == 0);
+}
+
+/* Defaults that are themselves invalid (a board table bug) must not pass
+ * as repaired, or settings.c would save them. */
+static void repair_fails_when_the_defaults_are_invalid(void)
+{
+    const board_table_t *board = &BOARD_TABLE_ESP32C3;
+    bridge_settings_t defaults = defaults_for(board);
+    defaults.uart_tx_pin = 17; /* Flash on the C3: never valid */
+
+    bridge_settings_t settings = defaults;
+    size_t repaired = 0;
+    CHECK(!settings_model_repair(&settings, &defaults, board, &repaired));
+    CHECK(repaired > 0);
+    CHECK_STR_EQ(settings_model_find_problem(&settings, board), "uart.tx_pin");
 }
 
 void test_settings_model(void)
@@ -147,4 +165,5 @@ void test_settings_model(void)
     RUN(hostnames_must_be_dns_labels);
     RUN(problems_are_reported_by_key);
     RUN(repair_restores_defaults_for_each_bad_key);
+    RUN(repair_fails_when_the_defaults_are_invalid);
 }

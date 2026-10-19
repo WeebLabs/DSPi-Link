@@ -51,7 +51,8 @@ typedef struct {
     uint32_t now_ms;
     uint32_t device_baud; /* The DSPi's rate */
     uint32_t host_baud;   /* The rate the link set */
-    unsigned restarts;
+    unsigned restarts;    /* Restarts the link asked for, failed ones included */
+    bool restart_fails;   /* Make every restart report failure */
 
     /* Bytes on their way to the link, each with the time it arrives. */
     uint8_t output[FAKE_DSPI_OUTPUT_BYTES];
@@ -100,5 +101,9 @@ void fake_dspi_script(fake_dspi_t *fake, fake_answer_t answer);
 
 /* Sends a notification frame `delay_ms` from now. */
 void fake_dspi_notify(fake_dspi_t *fake, const uint8_t *packet, size_t length, uint32_t delay_ms);
+
+/* Puts raw bytes on the line `delay_ms` from now: noise, or a hand-made
+ * damaged frame. */
+void fake_dspi_send_raw(fake_dspi_t *fake, const uint8_t *bytes, size_t length, uint32_t delay_ms);
 
 #endif /* FAKE_DSPI_H */
