@@ -110,8 +110,10 @@ Download `dspi-bridge-<version>-<chip>-update.bin` from the
 [releases](https://github.com/WeebLabs/DSPi-Link/releases), then in **Bridge
 settings**, under Maintenance, choose **Update firmware** and pick it. The
 page refuses a file for another chip before sending it. The bridge checks
-the file again, restarts into it, and keeps it once it has run properly for
-a minute; if it does not, the bridge goes back to the firmware it had.
+the file again, restarts into it, and keeps it once it runs properly,
+which it checks from a minute after the restart; if the new firmware
+crashes, or is still not running properly after 5 minutes, the bridge goes
+back to the firmware it had.
 Settings, Wi-Fi, the PIN and paired apps are kept.
 
 ## Troubleshooting
