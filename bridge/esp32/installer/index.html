@@ -1,0 +1,383 @@
+<!doctype html>
+<!--
+  The DSPi Link bridge installer (bridge spec 15), served from GitHub Pages
+  next to manifest.json and the full firmware images, which
+  tools/package_release.sh puts beside it. ESP Web Tools flashes the board
+  from Chrome or Edge over USB and picks the image for the chip it finds.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Install the DSPi Link bridge</title>
+    <script
+      type="module"
+      src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"
+    ></script>
+    <style>
+      :root {
+        --bg: #f4f5f7;
+        --card: #ffffff;
+        --line: #dfe2e7;
+        --text: #16181d;
+        --dim: #5d6573;
+        --accent: #2563eb;
+        --accent-text: #ffffff;
+        --warn-soft: #fdf3e2;
+        --warn: #8a4d05;
+        --radius: 14px;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0f1115;
+          --card: #181b21;
+          --line: #2a2f38;
+          --text: #e8eaee;
+          --dim: #9aa3b1;
+          --accent: #5b9cff;
+          --accent-text: #0b1220;
+          --warn-soft: #2b2213;
+          --warn: #f5b950;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+      }
+
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 40px 16px 64px;
+      }
+
+      header h1 {
+        font-size: 30px;
+        line-height: 1.2;
+        margin: 0 0 8px;
+      }
+
+      header p {
+        margin: 0;
+        color: var(--dim);
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 22px 22px 18px;
+        margin-top: 18px;
+      }
+
+      h2 {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        font-size: 19px;
+        margin: 0 0 12px;
+      }
+
+      .number {
+        flex: none;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        background: var(--accent);
+        color: var(--accent-text);
+        display: grid;
+        place-items: center;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      p {
+        margin: 0 0 12px;
+      }
+
+      ul {
+        margin: 0 0 12px;
+        padding-left: 22px;
+      }
+
+      .dim {
+        color: var(--dim);
+      }
+
+      .small {
+        font-size: 14px;
+      }
+
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.92em;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 4px 0 14px;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 13px;
+        color: var(--dim);
+        font-weight: 600;
+      }
+
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 0 0 12px;
+      }
+
+      .chips button {
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 7px 14px;
+        font: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+
+      .chips button[aria-pressed="true"] {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-text);
+      }
+
+      .note {
+        background: var(--warn-soft);
+        color: var(--warn);
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 14px;
+        margin: 0 0 12px;
+      }
+
+      .install {
+        margin: 6px 0 14px;
+      }
+
+      esp-web-install-button button[slot="activate"] {
+        background: var(--accent);
+        color: var(--accent-text);
+        border: 0;
+        border-radius: 10px;
+        padding: 14px 22px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button:focus-visible,
+      a:focus-visible {
+        outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent);
+        outline-offset: 2px;
+      }
+
+      a {
+        color: var(--accent);
+      }
+
+      footer {
+        margin-top: 28px;
+        font-size: 14px;
+        color: var(--dim);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Install the DSPi Link bridge</h1>
+        <p>
+          Turn an ESP32 board into a network bridge for your DSPi, so DSPi Console and your
+          browser can control it over Wi-Fi.
+          <span id="version"></span>
+        </p>
+      </header>
+
+      <section class="card" aria-labelledby="need">
+        <h2 id="need">What you need</h2>
+        <ul>
+          <li>An ESP32, ESP32-S3, ESP32-C3 or ESP32-C6 board with at least 4 MB of flash.</li>
+          <li>Three jumper wires, and a USB cable for the ESP32 board.</li>
+          <li>Chrome or Edge on a computer, to install the firmware.</li>
+          <li>A phone, to join the bridge to your 2.4 GHz Wi-Fi.</li>
+        </ul>
+      </section>
+
+      <section class="card" aria-labelledby="wire">
+        <h2 id="wire"><span class="number">1</span>Wire the board to your DSPi</h2>
+        <p>Choose your board's chip to see its pins:</p>
+        <div class="chips" role="group" aria-label="Chip">
+          <button type="button" data-chip="esp32">ESP32</button>
+          <button type="button" data-chip="esp32s3" aria-pressed="true">ESP32-S3</button>
+          <button type="button" data-chip="esp32c3">ESP32-C3</button>
+          <button type="button" data-chip="esp32c6">ESP32-C6</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">ESP32 board</th>
+              <th scope="col">DSPi</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>GPIO <span id="tx-pin">17</span> (TX)</td>
+              <td>GPIO 17 (UART RX)</td>
+            </tr>
+            <tr>
+              <td>GPIO <span id="rx-pin">18</span> (RX)</td>
+              <td>GPIO 16 (UART TX)</td>
+            </tr>
+            <tr>
+              <td>GND</td>
+              <td>GND</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="small dim">
+          The board's TX goes to the DSPi's RX, and RX to TX. Keep the wires short, under 30 cm.
+          You can choose other pins later in the bridge's settings.
+        </p>
+        <p class="note">
+          Power the ESP32 board from its own USB socket, not from the DSPi's 3.3 V pin: Wi-Fi
+          draws more current than the DSPi can supply. The ground wire is still needed.
+        </p>
+      </section>
+
+      <section class="card" aria-labelledby="console">
+        <h2 id="console"><span class="number">2</span>Turn on your DSPi's UART</h2>
+        <p>
+          With the DSPi plugged into your computer by USB, open DSPi Console and set its UART
+          settings once. The DSPi remembers them.
+        </p>
+        <table>
+          <tbody>
+            <tr>
+              <td>UART control interface</td>
+              <td>On</td>
+            </tr>
+            <tr>
+              <td>TX pin / RX pin</td>
+              <td>GPIO 16 / GPIO 17</td>
+            </tr>
+            <tr>
+              <td>Baud rate</td>
+              <td>1,000,000</td>
+            </tr>
+            <tr>
+              <td>Notifications</td>
+              <td>On</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card" aria-labelledby="install">
+        <h2 id="install"><span class="number">3</span>Install the firmware</h2>
+        <p>
+          Plug the ESP32 board into this computer, press Install, and choose the board's port.
+          Installing erases the board and takes about a minute.
+        </p>
+        <div class="install">
+          <esp-web-install-button manifest="manifest.json">
+            <button slot="activate" type="button">Install</button>
+            <p slot="unsupported" class="note">
+              This browser cannot reach USB devices. Open this page in Chrome or Edge on a
+              computer.
+            </p>
+            <p slot="not-allowed" class="note">
+              Installing needs a secure page. Open this page from its https:// address.
+            </p>
+          </esp-web-install-button>
+        </div>
+        <p class="small dim">
+          If no port appears, try another USB cable (some carry power only), or hold the board's
+          BOOT button while plugging it in.
+        </p>
+      </section>
+
+      <section class="card" aria-labelledby="setup">
+        <h2 id="setup"><span class="number">4</span>Join it to your Wi-Fi</h2>
+        <p>
+          On your phone, join the Wi-Fi network named <strong>DSPi Bridge</strong> followed by
+          four characters. The setup page opens by itself; if it does not, open
+          <code>http://192.168.4.1</code>. Choose your home network, enter its password, give the
+          bridge a name, and choose whether to protect it with a PIN.
+        </p>
+        <p class="small dim">Only 2.4 GHz networks work; ESP32 boards cannot use 5 GHz.</p>
+      </section>
+
+      <section class="card" aria-labelledby="use">
+        <h2 id="use"><span class="number">5</span>Control your DSPi</h2>
+        <p>
+          DSPi Console finds the bridge by itself. In a browser, open the address the setup page
+          showed, such as <code>http://dspi-bridge-1b34.local:11915</code>. The same page has the
+          bridge's settings and firmware updates.
+        </p>
+      </section>
+
+      <footer>
+        <p>
+          Firmware files for flashing by hand, and the source:
+          <a href="https://github.com/WeebLabs/DSPi-Link/releases">releases</a> ·
+          <a href="https://github.com/WeebLabs/DSPi-Link/tree/main/bridge/esp32">the bridge</a>.
+          To start again from scratch, hold BOOT for 15 to 30 seconds and let go.
+        </p>
+      </footer>
+    </main>
+
+    <script>
+      // The default UART pins on each chip (bridge spec 4.4).
+      const PINS = {
+        esp32: { tx: 19, rx: 18 },
+        esp32s3: { tx: 17, rx: 18 },
+        esp32c3: { tx: 5, rx: 4 },
+        esp32c6: { tx: 22, rx: 23 },
+      };
+
+      for (const button of document.querySelectorAll("[data-chip]")) {
+        button.addEventListener("click", () => {
+          for (const other of document.querySelectorAll("[data-chip]")) {
+            other.setAttribute("aria-pressed", String(other === button));
+          }
+          const pins = PINS[button.dataset.chip];
+          document.getElementById("tx-pin").textContent = pins.tx;
+          document.getElementById("rx-pin").textContent = pins.rx;
+        });
+      }
+
+      // The version being installed, from the manifest ESP Web Tools reads.
+      fetch("manifest.json")
+        .then((response) => response.json())
+        .then((manifest) => {
+          document.getElementById("version").textContent = `Version ${manifest.version}.`;
+        })
+        .catch(() => {});
+    </script>
+  </body>
+</html>

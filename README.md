@@ -14,11 +14,17 @@ everything an implementation in any language needs:
 | `fixtures/messages/` | Control-plane JSON samples, one file per message type. |
 | `fixtures/device/` | Real captures from a board (bulk blob, status frame, platform), with a sidecar giving the decoded values, so every client's decoders agree on the same bytes. |
 | `js/` | `dspi-link-js`: the TypeScript client library and the web UI the hub serves. |
-| `bridge/esp32/` | The ESP32 bridge firmware (ESP-IDF), in progress; `PLAN.md` gives the build order and status. |
+| `bridge/esp32/` | The ESP32 bridge firmware (ESP-IDF): a hub for one DSPi, wired to its UART and joined to Wi-Fi. Its `README.md` covers installing, wiring and troubleshooting; `PLAN.md` gives the state of each part. |
 | `conformance/` | Planned, not yet in the repository: reference client and hub for testing implementations against (Python). |
 
 Implementations: DSPi Console for macOS (`WeebLabs/DSPi-Console`, hub and
 client), DSPi Console for Windows (planned), the web UI here, and the ESP32
-bridge (planned). Each vendors a tagged version of this repository.
+bridge here (`bridge/esp32/`), a hub that runs on ESP32, ESP32-S3,
+ESP32-C3 and ESP32-C6 boards. Each other implementation vendors a tagged
+version of this repository.
+
+To turn an ESP32 board into a bridge for your DSPi, use the installer page,
+[weeblabs.github.io/DSPi-Link/installer](https://weeblabs.github.io/DSPi-Link/installer/),
+or see [`bridge/esp32/README.md`](bridge/esp32/README.md).
 
 License: MIT, see `LICENSE`.

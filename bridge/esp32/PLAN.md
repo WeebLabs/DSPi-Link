@@ -230,6 +230,31 @@ On the ESP32-S3:
 ESP32 board to controlling their DSPi from Console using only the
 installer page and the README.
 
+**Status (2026-10-19):** done except the first real release, which is the
+user's to make.
+
+- `tools/package_release.sh` makes, for each chip, a full image to flash at
+  0x0 and an update image, with `SHA256SUMS`, and the installer site with
+  its ESP Web Tools manifest. The full images of a local package booted in
+  QEMU on the ESP32, ESP32-S3 and ESP32-C3; `tools/qemu_smoke.sh` now takes
+  a full image as a second argument.
+- `.github/workflows/esp32-bridge-release.yml` runs on a `bridge-v<version>`
+  tag: it checks the tag against `PROJECT_VER`, builds, packages, boots the
+  full images in QEMU, creates the GitHub release and publishes the
+  installer to GitHub Pages. It has not run yet: it needs a tag, and Pages
+  set to deploy from GitHub Actions.
+- The installer page (`installer/index.html`) was checked from a local
+  server: ESP Web Tools 10.4.0 loads and shows its Install button, and the
+  wiring table follows the chosen chip. Installing from it has not been
+  tried on a board.
+- The bridge `README.md` now covers installing, wiring, the DSPi's UART,
+  first use, the BOOT button and LED, updates, troubleshooting, building,
+  flashing by hand, testing and releasing. Every component has a
+  `README.md`. The repository `README.md` lists the bridge.
+- Left over: the "done when" walk-through itself, from an unopened board
+  with only the installer and the README, belongs with the release testing
+  of phase 8.
+
 ## Phase 8: Release testing
 
 - The bench tests of section 17 on all four chips, with the DSPi and with

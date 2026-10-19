@@ -1006,6 +1006,12 @@ that the margin covers future growth. CI fails a build that exceeds it.
   over USB. Its manifest lists one build per chip family, so the page picks
   the right image by itself. The page is hosted on GitHub Pages from this
   repository.
+- A release is made by pushing a tag `bridge-v<version>`, where `<version>`
+  is the firmware's `PROJECT_VER`. CI checks they match, builds every chip,
+  boots each full image in QEMU (all chips but the ESP32-C6, which QEMU
+  lacks), attaches the files and their SHA-256 sums to the release, and
+  publishes the installer page. `tools/package_release.sh` does the
+  packaging, locally as in CI.
 - Developers build and flash with `idf.py` (section 17 and the README).
 
 ---

@@ -1,0 +1,88 @@
+# Release of the ESP32 bridge (bridge spec 15). Pushing a tag named
+# bridge-v<version>, where <version> is PROJECT_VER in
+# bridge/esp32/CMakeLists.txt, builds every chip, attaches the firmware to a
+# GitHub release, and publishes the installer page to GitHub Pages.
+#
+#   git tag bridge-v1.0.0 && git push origin bridge-v1.0.0
+#
+# GitHub Pages must be set to deploy from GitHub Actions (repository
+# Settings, Pages, Source), once.
+name: ESP32 bridge release
+
+on:
+  push:
+    tags:
+      - "bridge-v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Create the release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the firmware version
+        run: |
+          version=$(sed -n -E 's/^set\(PROJECT_VER "([^"]+)"\)$/\1/p' bridge/esp32/CMakeLists.txt)
+          if [ "${GITHUB_REF_NAME}" != "bridge-v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match PROJECT_VER ${version}" >&2
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the web pages the firmware embeds
+        working-directory: js
+        run: npm ci && npm run build
+
+      - name: Build every chip
+        run: bridge/esp32/tools/build.sh
+
+      - name: Package the release and the installer site
+        run: bridge/esp32/tools/package_release.sh
+
+      - name: Boot each full image in QEMU
+        # QEMU has no ESP32-C6 machine, so that chip is build-only here.
+        run: |
+          cd bridge/esp32
+          for chip in esp32 esp32s3 esp32c3; do
+            tools/qemu_smoke.sh "${chip}" "build/release/dspi-bridge-${VERSION}-${chip}.bin"
+          done
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Firmware for the DSPi Link ESP32 bridge, version ${VERSION}.
+
+          - To install on a new board, use the installer page, or flash
+            \`dspi-bridge-${VERSION}-<chip>.bin\` at address 0x0 with esptool.
+          - To update a bridge that is already running, choose
+            \`dspi-bridge-${VERSION}-<chip>-update.bin\` under Bridge settings,
+            Maintenance, Update firmware.
+
+          \`SHA256SUMS\` lists every file's SHA-256.
+          NOTES
+          gh release create "${GITHUB_REF_NAME}" bridge/esp32/build/release/* \
+            --title "ESP32 bridge ${VERSION}" --notes-file notes.md
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: bridge/esp32/build/site
+
+  installer:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}installer/
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

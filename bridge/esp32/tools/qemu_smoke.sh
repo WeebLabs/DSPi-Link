@@ -9,6 +9,8 @@
 #
 # Usage, after tools/build.sh <chip>:
 #   tools/qemu_smoke.sh esp32s3
+# or, to boot a full image made by tools/package_release.sh instead:
+#   tools/qemu_smoke.sh esp32s3 build/release/dspi-bridge-1.0.0-esp32s3.bin
 #
 # Supported chips: esp32, esp32s3, esp32c3 (QEMU has no ESP32-C6 machine).
 
@@ -17,7 +19,8 @@ set -euo pipefail
 BRIDGE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_DIR="$(cd "$BRIDGE_DIR/../.." && pwd)"
 IDF_VERSION="$(tr -d '[:space:]' < "$BRIDGE_DIR/idf_version.txt")"
-chip="${1:?usage: tools/qemu_smoke.sh <esp32|esp32s3|esp32c3>}"
+chip="${1:?usage: tools/qemu_smoke.sh <esp32|esp32s3|esp32c3> [full image]}"
+image="${2:-}" # Relative to bridge/esp32, which is /repo/bridge/esp32 in the container
 
 case "${chip}" in
     esp32 | esp32s3) qemu=qemu-system-xtensa ;;
@@ -28,14 +31,17 @@ case "${chip}" in
         ;;
 esac
 
-# Inside the container: merge the build into one 4 MB flash image, then boot
-# it twice. sed keeps the bridge's own lines and any crash, and quits at the
+# Inside the container: merge the build into one 4 MB flash image, or pad the
+# full image given to 4 MB, then boot it twice. sed keeps the bridge's own lines and any crash, and quits at the
 # last line of the startup summary, which ends that boot. The original ESP32
 # is slow under emulation, hence the generous timeout.
 boot_twice=$(cat <<SCRIPT
 set -uo pipefail
-cd build/${chip}
-python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin @flash_args > /dev/null
+if [ -n "${image}" ]; then
+    python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin 0x0 "${image}" > /dev/null
+else
+    (cd build/${chip} && python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin @flash_args > /dev/null)
+fi
 for boot in 1 2; do
     echo "BOOT \${boot}"
     timeout 45 ${qemu} -nographic -machine ${chip} \
