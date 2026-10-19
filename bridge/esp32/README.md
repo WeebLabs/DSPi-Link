@@ -1,5 +1,11 @@
 # DSPi Link ESP32 bridge
 
+> [!TIP]
+> **To install: [open the installer](https://weeblabs.github.io/DSPi-Link/installer/)** in Chrome or Edge on a
+> computer, plug in the board and press Install. The page shows the wiring
+> for your chip and the setup steps. Firmware files are on the
+> [releases](https://github.com/WeebLabs/DSPi-Link/releases) page.
+
 Firmware that turns a common ESP32 board into a DSPi Link hub. Wired to a
 DSPi's UART and joined to your Wi-Fi, it lets DSPi Console and a browser
 control that DSPi over the network. What it does and why is in
@@ -17,11 +23,8 @@ of flash.
 
 ## Install
 
-The easiest way is the installer page,
-[weeblabs.github.io/DSPi-Link/installer](https://weeblabs.github.io/DSPi-Link/installer/):
-open it in Chrome or Edge on a computer, plug in the board and press
-Install. The page also shows the wiring for your chip. The rest of this
-section says the same in more detail.
+The easiest way is the [installer page](https://weeblabs.github.io/DSPi-Link/installer/), as above. This section
+says the same in more detail.
 
 ### 1. Wire the board to the DSPi
 

@@ -1,5 +1,10 @@
 # DSPi Link
 
+> [!TIP]
+> **Turn an ESP32 board into a Wi-Fi bridge for your DSPi:
+> [open the installer](https://weeblabs.github.io/DSPi-Link/installer/)** in Chrome or Edge, plug in the board and
+> press Install. The page shows the wiring and the setup steps too.
+
 The local-network protocol through which a hub (DSPi Console in gateway
 mode, or a standalone bridge) shares DSPi devices with clients (another
 Console, a browser, a phone). This repository is the shared home for
@@ -22,9 +27,5 @@ client), DSPi Console for Windows (planned), the web UI here, and the ESP32
 bridge here (`bridge/esp32/`), a hub that runs on ESP32, ESP32-S3,
 ESP32-C3 and ESP32-C6 boards. Each other implementation vendors a tagged
 version of this repository.
-
-To turn an ESP32 board into a bridge for your DSPi, use the installer page,
-[weeblabs.github.io/DSPi-Link/installer](https://weeblabs.github.io/DSPi-Link/installer/),
-or see [`bridge/esp32/README.md`](bridge/esp32/README.md).
 
 License: MIT, see `LICENSE`.
