@@ -230,12 +230,18 @@ cmake -S test/host -B build-host && cmake --build build-host && ctest --test-dir
 ```
 
 A built image can also be booted twice in Espressif's QEMU, which checks the
-boot sequence and flash storage without a board. Each boot stops before
-Wi-Fi, since QEMU has no radio. It runs for the ESP32, ESP32-S3 and ESP32-C3;
-QEMU has no ESP32-C6. A second argument boots a release's full image:
+boot sequence and flash storage without a board. Each boot runs up to the
+"Starting the network" line and stops there, since QEMU cannot start Wi-Fi.
+It runs for the ESP32, ESP32-S3 and ESP32-C3; QEMU has no ESP32-C6. A second
+argument boots a release's full image, and `BUILD_DIR` tests a build in
+another folder:
 
 ```bash
 tools/qemu_smoke.sh esp32s3
+```
+
+```bash
+BUILD_DIR=build/other tools/qemu_smoke.sh esp32s3
 ```
 
 On a board without PSRAM, or in QEMU, ESP-IDF logs two `esp_psram` errors at
@@ -278,11 +284,20 @@ The release workflow (`.github/workflows/esp32-bridge-release.yml`) builds
 every chip, packages each one as a full image for first installation and an
 update image, boots the full images in QEMU, attaches them to a GitHub
 release with their SHA-256 sums, and publishes the installer page to GitHub
-Pages. GitHub Pages must be set once to deploy from GitHub Actions
-(repository Settings, Pages, Source).
+Pages. Before the first release, set two things once in the repository's
+settings:
 
-To package locally after `tools/build.sh`, which writes `build/release/` and
-the installer site in `build/site/`:
+- Under Pages, Source, choose GitHub Actions.
+- Under Environments, `github-pages`, Deployment branches and tags, add a
+  tag rule `bridge-v*`. Without it GitHub refuses to deploy the installer
+  page from a release tag.
+
+To package locally, run this after `tools/build.sh`. It writes
+`build/release/` and the installer site in `build/site/`. Packaging needs
+npm as well as Docker:
+it downloads ESP Web Tools 10.4.0, checks it against a pinned integrity, and
+serves it from the installer's own site, so the page loads no script from
+elsewhere.
 
 ```bash
 tools/package_release.sh

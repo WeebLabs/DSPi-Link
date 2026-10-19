@@ -6,7 +6,7 @@ touches flash storage (NVS).
 | File | What it does | Portable |
 |------|--------------|----------|
 | `include/settings_model.h`, `settings_model.c` | The settings struct, factory defaults, and the validity rules of bridge spec 8.11, with repair of invalid values. | yes |
-| `include/settings.h`, `settings.c` | Initialises NVS and stores the four namespaces: `bridge` (one key per setting, repaired and re-saved on load), `devices` (names by serial), `wifi` (the home network) and `auth` (the PIN and paired clients as one blob). Also the factory reset. | no |
+| `include/settings.h`, `settings.c` | Initialises NVS and stores the four namespaces: `bridge` (one key per setting, repaired and re-saved on load), `devices` (names by serial), `wifi` (the home network, its name and password as one blob so they are always written together) and `auth` (the PIN and paired clients as one blob). Also the factory reset. | no |
 
 Public API:
 

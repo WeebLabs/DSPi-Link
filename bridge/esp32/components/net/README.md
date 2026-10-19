@@ -10,7 +10,7 @@ the setup network's DNS answers, the DNS-SD advertisement and the clock.
 | `include/net.h`, `net.c` | Applies the state machine to the Wi-Fi driver on ESP-IDF's event task, keeps the station retrying until it joins, keeps the home network's credentials, runs mDNS, DNS-SD and SNTP. | no |
 
 Public API: `net_start()`, `net_advertise()`, `net_get_status()`,
-`net_set_hostname()`, `net_scan()`, `net_check_credentials()`, `net_join()`,
+`net_set_hostname()`, `net_scan_networks()`, `net_scan()`, `net_check_credentials()`, `net_join()`,
 `net_finish_setup()`, `net_socket_is_on_setup_network()`,
 `net_setup_address()`; the machine's `net_machine_*()` functions;
 `captive_dns_answer()`.

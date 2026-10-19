@@ -3,7 +3,9 @@
   The DSPi Link bridge installer (bridge spec 15), served from GitHub Pages
   next to manifest.json and the full firmware images, which
   tools/package_release.sh puts beside it. ESP Web Tools flashes the board
-  from Chrome or Edge over USB and picks the image for the chip it finds.
+  from Chrome or Edge over USB and picks the image for the chip it finds;
+  package_release.sh puts a pinned, checked copy of it in esp-web-tools/,
+  so the page loads no script from another site.
 -->
 <html lang="en">
   <head>
@@ -11,10 +13,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>Install the DSPi Link bridge</title>
-    <script
-      type="module"
-      src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"
-    ></script>
+    <script type="module" src="esp-web-tools/install-button.js"></script>
     <style>
       :root {
         --bg: #f4f5f7;

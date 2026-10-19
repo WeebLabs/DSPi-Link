@@ -45,6 +45,7 @@ typedef struct {
     net_state_t state;
     uint32_t state_since_ms;
     bool has_network; /* A home network is saved or being joined */
+    bool has_saved;   /* A home network has worked and is saved */
 
     /* Outputs. */
     bool setup_network_on; /* The setup network should be up */

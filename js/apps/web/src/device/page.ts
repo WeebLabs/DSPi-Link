@@ -13,7 +13,9 @@
 import {
   BULK_HEADER_BYTES,
   BULK_MASTER_VOLUME_OFFSET,
+  BULK_PARAMS_BYTES,
   LinkClient,
+  LinkStatus,
   type DeviceInfo,
   type NotifyFrame,
   type PollFrame,
@@ -31,6 +33,8 @@ import { createMeters } from "./meters.js";
 import { APP_WINDEX, createVolumeControl, readDeviceVolume, readFloat } from "./volume.js";
 
 const REQ_GET_STATUS = 0x50;
+/** REQ_GET_ALL_PARAMS: the bulk blob, whose header gives the channel layout. */
+const REQ_GET_ALL_PARAMS = 0xa0;
 const STATUS_WVALUE_COMBINED = 9;
 const METER_SLOT = 0;
 const METER_RATE_HZ = 10;
@@ -39,8 +43,10 @@ const FLOAT32_BYTES = 4;
 /** When neither the hub nor a snapshot gives the channel count: an RP2350's,
  * the larger platform, so no channel goes unshown. */
 const FALLBACK_CHANNELS = 17;
-/** Inputs to assume when only the total is known. */
+/** Inputs to assume when the device's own layout could not be read. */
 const FALLBACK_INPUTS = 8;
+/** The largest GET a CMD can ask for (wLength is a u16). */
+const MAX_GET_BYTES = 0xffff;
 
 /** What createDevicePage returns. */
 export interface DevicePageHandles {
@@ -79,6 +85,9 @@ export function createDevicePage(
   const handle = device.handle;
   let inputs = device.inputs ?? 0;
   let outputs = device.outputs ?? 0;
+  // A hub may leave `inputs` out (Link spec 7.4), and the status frame starts
+  // with the inputs, so both counts are needed before the meters mean anything.
+  let layoutKnown = device.inputs !== undefined && device.outputs !== undefined;
   let disposed = false;
   // False once a snapshot shows a wire version the bulk offsets were not checked against.
   let bulkOffsetsValid = true;
@@ -93,30 +102,59 @@ export function createDevicePage(
   const volume = createVolumeControl(client, handle, (text) => setStatus(text, true));
   const meters = createMeters();
 
-  /** Reads the channel layout and the volume, from the hub's cache if it has one. */
+  /**
+   * Reads the channel layout and the volume: from the hub's cache if it has
+   * one, else from the device's own bulk blob when the layout is not known,
+   * and the volume with a GET when neither gave it.
+   */
   async function loadState(): Promise<void> {
-    if (await loadFromSnapshot()) return;
-    // No cache on this hub, or one this page cannot read: ask the device itself.
-    const db = await readDeviceVolume(client, handle);
-    if (db !== null) volume.showDeviceVolume(db);
-    if (inputs + outputs === 0) {
+    let volumeShown = false;
+    if (client.hasCap("snapshot")) {
+      const snapshot = await client.snapshot(handle);
+      if (snapshot.bulk) volumeShown = applyBulk(snapshot.bulk);
+    }
+    if (!layoutKnown) {
+      const blob = await readBulk();
+      if (blob) volumeShown = applyBulk(blob);
+    }
+    if (!volumeShown) {
+      const db = await readDeviceVolume(client, handle);
+      if (db !== null) volume.showDeviceVolume(db);
+    }
+    if (!layoutKnown) {
       inputs = FALLBACK_INPUTS;
-      outputs = FALLBACK_CHANNELS - FALLBACK_INPUTS;
+      outputs = outputs || FALLBACK_CHANNELS - FALLBACK_INPUTS;
     }
   }
 
-  /** True when the snapshot gave the layout and the volume. */
-  async function loadFromSnapshot(): Promise<boolean> {
-    if (!client.hasCap("snapshot")) return false;
-    const snapshot = await client.snapshot(handle);
-    if (!snapshot.bulk || snapshot.bulk.length <= BULK_HEADER_BYTES) return false;
-    const header = decodeBulkHeader(snapshot.bulk);
+  /**
+   * Takes the layout from a bulk blob's header, and the volume when the blob's
+   * wire version is one the offsets were checked against.
+   *
+   * @returns True when the volume was shown.
+   */
+  function applyBulk(blob: Uint8Array): boolean {
+    if (blob.length <= BULK_HEADER_BYTES) return false;
+    const header = decodeBulkHeader(blob);
     inputs = header.numInputChannels;
     outputs = header.numOutputChannels;
+    layoutKnown = true;
     bulkOffsetsValid = isSupportedBulkVersion(header);
     if (!bulkOffsetsValid) return false;
-    volume.showDeviceVolume(readMasterVolumeDb(snapshot.bulk));
+    volume.showDeviceVolume(readMasterVolumeDb(blob));
     return true;
+  }
+
+  /** The device's bulk blob (REQ_GET_ALL_PARAMS), or null if it cannot be had. */
+  async function readBulk(): Promise<Uint8Array | null> {
+    const length = Math.min(client.limits?.max_payload ?? BULK_PARAMS_BYTES, MAX_GET_BYTES);
+    try {
+      const response = await client.get(handle, REQ_GET_ALL_PARAMS, length, 0, APP_WINDEX);
+      return response.status === LinkStatus.OK ? response.payload : null;
+    } catch (error) {
+      console.warn("device: could not read the bulk blob:", error);
+      return null;
+    }
   }
 
   /** Asks for the meter feed, again whenever the channel count changes its length. */
@@ -136,8 +174,29 @@ export function createDevicePage(
     ]);
   }
 
+  // One refresh at a time: a RESYNC and a BULK_INVALIDATED often come
+  // together, and a hub answers a second snapshot request `busy` while the
+  // first waits (bridge spec 8.10). One that arrives meanwhile runs after.
+  let refreshing = false;
+  let refreshAgain = false;
+
+  function refresh(): void {
+    if (refreshing) {
+      refreshAgain = true;
+      return;
+    }
+    refreshing = true;
+    void (async () => {
+      do {
+        refreshAgain = false;
+        await refreshOnce();
+      } while (refreshAgain && !disposed);
+      refreshing = false;
+    })();
+  }
+
   /** Reads the state, redraws the meters, and keeps the subscription in step. */
-  async function refresh(): Promise<void> {
+  async function refreshOnce(): Promise<void> {
     try {
       await loadState();
       if (disposed) return;
@@ -173,7 +232,7 @@ export function createDevicePage(
     if (client.session !== null && frame.origin === client.session) return;
     const packet = decodeNotifyPacket(frame.packet);
     if (packet?.kind === "bulk_invalidated") {
-      void refresh();
+      refresh();
       return;
     }
     if (packet?.kind !== "param_changed" || !bulkOffsetsValid) return;
@@ -183,7 +242,7 @@ export function createDevicePage(
   }
 
   function onResync(frame: ResyncFrame): void {
-    if (frame.handle === handle) void refresh();
+    if (frame.handle === handle) refresh();
   }
 
   const stopListening = [
@@ -213,7 +272,7 @@ export function createDevicePage(
   );
 
   meters.build(inputs, outputs);
-  void refresh();
+  refresh();
 
   return {
     handle,

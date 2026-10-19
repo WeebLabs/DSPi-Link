@@ -48,6 +48,8 @@ typedef struct {
 
     bridge_settings_t applied; /* The last settings passed to apply_settings */
     unsigned apply_count;
+    bridge_settings_t attempted; /* The last passed, refused or not */
+    unsigned apply_attempts;
     bool refuse_apply; /* Make apply_settings fail */
     int scan_slot;     /* The last start_wifi_scan, -1 if none */
     uint16_t scan_session;

@@ -7,7 +7,7 @@
 
 import { el } from "../dom.js";
 import { statusLine } from "../status.js";
-import { checkboxField, formatBaud, pinChoices, sameJson, selectField } from "./fields.js";
+import { checkboxField, formatBaud, pinChoices, selectField } from "./fields.js";
 import { readBridgeConfig, type SectionContext, type UartConfig } from "./state.js";
 
 /** Below this the bridge works, but slowly (bridge spec 5). */
@@ -28,10 +28,12 @@ const DSPI_RX_PIN = 17;
 export function drawDspi(context: SectionContext): void {
   const { state } = context;
   if (!state.config || !state.choices) return;
-  const saved = state.config.uart;
-  const draft = (): UartConfig => state.uartDraft ?? saved;
+  const shown = state.config.uart;
+  // The saved values are read afresh each time: another admin may change
+  // them while this user edits (hub.config.changed).
+  const draft = (): UartConfig => ({ ...(state.config?.uart ?? shown), ...state.uartDraft });
   const edit = (change: Partial<UartConfig>): void => {
-    state.uartDraft = { ...draft(), ...change };
+    state.uartDraft = { ...state.uartDraft, ...change };
     refresh();
   };
 
@@ -43,7 +45,7 @@ export function drawDspi(context: SectionContext): void {
     const uart = draft();
     diagram.replaceChildren(wiringDiagram(uart.tx_pin, uart.rx_pin));
     hint.replaceChildren(...uartHints(uart));
-    const changed = state.uartDraft !== null && !sameJson(state.uartDraft, saved);
+    const changed = uartChanges(context) !== null;
     save.disabled = !changed || uart.tx_pin === uart.rx_pin || state.busy.has("dspi");
     undo.hidden = !changed;
   };
@@ -133,9 +135,20 @@ function uartHints(uart: UartConfig): HTMLElement[] {
   return [];
 }
 
+/** The UART keys the user changed from their saved values, or null for none. */
+function uartChanges(context: SectionContext): Partial<UartConfig> | null {
+  const { uartDraft: draft, config } = context.state;
+  if (!draft || !config) return null;
+  const change: Partial<UartConfig> = {};
+  for (const key of Object.keys(draft) as Array<keyof UartConfig>) {
+    if (draft[key] !== config.uart[key]) Object.assign(change, { [key]: draft[key] });
+  }
+  return Object.keys(change).length > 0 ? change : null;
+}
+
 async function saveUart(context: SectionContext): Promise<void> {
   const { client, state } = context;
-  const change = state.uartDraft;
+  const change = uartChanges(context);
   if (!change) return;
   await context.run("dspi", async () => {
     const config = readBridgeConfig(await client.setHubConfig({ uart: change }));

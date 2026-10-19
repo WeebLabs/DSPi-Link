@@ -19,6 +19,7 @@
 #include "bridge_config.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -57,9 +58,9 @@ static struct {
 /* Guards `published`, which the uart task writes and others copy. */
 static portMUX_TYPE status_lock = portMUX_INITIALIZER_UNLOCKED;
 
-/* Holds one received payload, up to a whole bulk blob. Static so the task
+/* Holds one received frame, up to a whole bulk blob. Static so the task
  * stack stays small. */
-static uint8_t receive_buffer[LINK_MAX_PAYLOAD_BYTES];
+static uint8_t receive_buffer[DSPI_PARSER_BUFFER_BYTES(LINK_MAX_PAYLOAD_BYTES)];
 
 /* ---------------------------------------------------------------------------
  * The ESP32 UART as a dspi_port_t
@@ -80,7 +81,12 @@ static esp_err_t install_uart(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud)
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t err = uart_driver_install(UART_PORT, DSPI_UART_DRIVER_RX_BUFFER_BYTES, 0, 0, NULL, 0);
+    /* The interrupt lives in IRAM (CONFIG_UART_ISR_IN_IRAM), so it keeps
+     * emptying the 128-byte hardware FIFO while flash is written, during an
+     * update or a settings save. Otherwise bytes are lost within 1.3 ms at
+     * 1 Mbaud. */
+    esp_err_t err = uart_driver_install(UART_PORT, DSPI_UART_DRIVER_RX_BUFFER_BYTES, 0, 0, NULL,
+                                        ESP_INTR_FLAG_IRAM);
     if (err == ESP_OK) {
         err = uart_param_config(UART_PORT, &settings);
     }
@@ -222,6 +228,11 @@ static void publish_status(void)
 static void relay_notification(void *context, const uint8_t *packet, size_t length)
 {
     (void)context;
+    if (!uart_task_state.device_present) {
+        /* Found but not yet reported, or lost: clients know of no device
+         * yet, and read its state once it is reported found. */
+        return;
+    }
     const dspi_uart_handlers_t *handlers = &uart_task_state.config.handlers;
     if (handlers->notification != NULL) {
         handlers->notification(handlers->context, packet, length);
@@ -403,7 +414,13 @@ static void serve_device(void)
         deliver_reply(&item, &reply);
     } else if (dspi_link_idle_ms(link) >= DSPI_UART_HEARTBEAT_IDLE_MS) {
         /* A missed heartbeat shows up in check_still_present() below. */
-        (void)dspi_link_heartbeat(link);
+        if (dspi_link_heartbeat(link, uart_task_state.identity.serial) ==
+            DSPI_HEARTBEAT_OTHER_DEVICE) {
+            ESP_LOGW(TAG, "Another DSPi has replaced %s", uart_task_state.identity.serial);
+            report_device_lost(); /* The next pass finds the new one */
+            publish_status();
+            return;
+        }
     } else {
         dspi_link_listen(link, DSPI_UART_IDLE_LISTEN_MS);
     }
@@ -518,5 +535,10 @@ bool dspi_uart_is_alive(void)
     if (uart_task_state.queue == NULL) {
         return false; /* Never started */
     }
-    return now_ms() - uart_task_state.last_loop_ms < DSPI_UART_ALIVE_WITHIN_MS;
+    /* The loop time first, then the clock: read the other way round, the
+     * uart task could record a time after the clock was read, and the
+     * difference would wrap to a huge age. Signed, for the same reason. */
+    const uint32_t last_loop_ms = uart_task_state.last_loop_ms;
+    const int32_t age_ms = (int32_t)(now_ms() - last_loop_ms);
+    return age_ms < DSPI_UART_ALIVE_WITHIN_MS;
 }

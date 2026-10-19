@@ -191,9 +191,71 @@ static esp_err_t write_all(nvs_handle_t nvs, const bridge_settings_t *settings)
     return nvs_commit(nvs);
 }
 
+/* True for a key this firmware's `bridge` namespace uses. */
+static bool is_known_key(const char *key)
+{
+    static const char *const KNOWN_KEYS[] = {
+        KEY_SCHEMA,  KEY_HUB_ID,    KEY_NAME,        KEY_HOSTNAME, KEY_UART_TX,
+        KEY_UART_RX, KEY_UART_BAUD, KEY_UART_DETECT, KEY_LED_TYPE, KEY_LED_PIN,
+    };
+    for (size_t i = 0; i < sizeof(KNOWN_KEYS) / sizeof(KNOWN_KEYS[0]); i++) {
+        if (strcmp(key, KNOWN_KEYS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Erases the keys a newer firmware added to the namespace. They are
+ * gathered first and erased afterwards, since NVS's iterator must not see
+ * the namespace change under it. Each pass erases up to
+ * SETTINGS_UNKNOWN_KEYS_PER_PASS; a key left over after the last pass is
+ * harmless, because this firmware never reads it. */
+static esp_err_t erase_unknown_keys(nvs_handle_t nvs)
+{
+    for (size_t pass = 0; pass < SETTINGS_UNKNOWN_KEY_PASSES; pass++) {
+        char unknown[SETTINGS_UNKNOWN_KEYS_PER_PASS][NVS_KEY_NAME_MAX_SIZE];
+        size_t count = 0;
+        nvs_iterator_t iterator = NULL;
+        esp_err_t err = nvs_entry_find_in_handle(nvs, NVS_TYPE_ANY, &iterator);
+        while (err == ESP_OK) {
+            nvs_entry_info_t info;
+            err = nvs_entry_info(iterator, &info);
+            if (err == ESP_OK && !is_known_key(info.key) &&
+                count < SETTINGS_UNKNOWN_KEYS_PER_PASS) {
+                snprintf(unknown[count], sizeof(unknown[count]), "%s", info.key);
+                count++;
+            }
+            if (err == ESP_OK) {
+                err = nvs_entry_next(&iterator);
+            }
+        }
+        nvs_release_iterator(iterator);
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            return err; /* NOT_FOUND is the end of the list */
+        }
+        if (count == 0) {
+            return ESP_OK;
+        }
+        for (size_t i = 0; i < count; i++) {
+            err = nvs_erase_key(nvs, unknown[i]);
+            if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+                return err;
+            }
+        }
+    }
+    return ESP_OK;
+}
+
 /* A newer firmware wrote these settings and this one was installed over it.
  * Bridge spec 11: reset the namespace to defaults, but keep the hub id so
- * paired clients still recognise the bridge. */
+ * paired clients still recognise the bridge.
+ *
+ * Nothing is erased that a power cut could leave missing: the newer
+ * firmware's own keys go first, then every key of this firmware is written
+ * over its old value, and the schema last. Until the schema is written the
+ * next boot finds the newer schema and comes back here, with the hub id
+ * still saved. */
 static esp_err_t reset_after_downgrade(nvs_handle_t nvs, bridge_settings_t *settings,
                                        const bridge_settings_t *defaults, uint8_t found_schema)
 {
@@ -213,7 +275,7 @@ static esp_err_t reset_after_downgrade(nvs_handle_t nvs, bridge_settings_t *sett
         memcpy(settings->hub_id, hub_id, sizeof(settings->hub_id));
     }
 
-    err = nvs_erase_all(nvs);
+    err = erase_unknown_keys(nvs);
     return err == ESP_OK ? write_all(nvs, settings) : err;
 }
 
@@ -405,8 +467,39 @@ esp_err_t settings_save_device_name(const char *serial, const char *name)
  * ------------------------------------------------------------------------- */
 
 #define WIFI_NAMESPACE "wifi"
+#define KEY_WIFI_NETWORK "network"
+/* Earlier firmware kept the name and password as two keys. They are still
+ * read, and erased once the network has been saved the new way. */
 #define KEY_WIFI_SSID "ssid"
 #define KEY_WIFI_PASSWORD "password"
+
+/* The home network as saved: one blob, so the name and its password are
+ * always written together and a power cut cannot pair a new name with an
+ * old password. */
+typedef struct {
+    char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1];
+    char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1];
+} saved_wifi_t;
+
+/* Flash is not trusted to hold terminated strings or a non-empty name. */
+static bool saved_wifi_is_valid(const saved_wifi_t *saved)
+{
+    const size_t ssid_length = strnlen(saved->ssid, sizeof(saved->ssid));
+    return ssid_length > 0 && ssid_length < sizeof(saved->ssid) &&
+           strnlen(saved->password, sizeof(saved->password)) < sizeof(saved->password);
+}
+
+/* The two keys of earlier firmware. NOT_FOUND if either is missing. */
+static esp_err_t read_legacy_wifi(nvs_handle_t nvs, saved_wifi_t *saved)
+{
+    size_t length = sizeof(saved->ssid);
+    esp_err_t err = nvs_get_str(nvs, KEY_WIFI_SSID, saved->ssid, &length);
+    if (err == ESP_OK) {
+        length = sizeof(saved->password);
+        err = nvs_get_str(nvs, KEY_WIFI_PASSWORD, saved->password, &length);
+    }
+    return err;
+}
 
 esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
                              char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1])
@@ -419,14 +512,27 @@ esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
     if (err != ESP_OK) {
         return err;
     }
-    size_t length = SETTINGS_WIFI_SSID_MAX_BYTES + 1;
-    err = nvs_get_str(nvs, KEY_WIFI_SSID, ssid, &length);
-    if (err == ESP_OK) {
-        length = SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1;
-        err = nvs_get_str(nvs, KEY_WIFI_PASSWORD, password, &length);
+    saved_wifi_t saved = {0};
+    size_t length = sizeof(saved);
+    err = nvs_get_blob(nvs, KEY_WIFI_NETWORK, &saved, &length);
+    if (err == ESP_ERR_NVS_INVALID_LENGTH || (err == ESP_OK && length != sizeof(saved))) {
+        err = ESP_ERR_INVALID_SIZE; /* Not a layout this firmware wrote */
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = read_legacy_wifi(nvs, &saved);
     }
     nvs_close(nvs);
-    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : err;
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (err == ESP_OK && !saved_wifi_is_valid(&saved)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    memcpy(ssid, saved.ssid, sizeof(saved.ssid));
+    memcpy(password, saved.password, sizeof(saved.password));
+    return ESP_OK;
 }
 
 esp_err_t settings_save_wifi(const char *ssid, const char *password)
@@ -435,15 +541,28 @@ esp_err_t settings_save_wifi(const char *ssid, const char *password)
         strlen(password) > SETTINGS_WIFI_PASSWORD_MAX_BYTES) {
         return ESP_ERR_INVALID_ARG;
     }
+    saved_wifi_t saved = {0};
+    memcpy(saved.ssid, ssid, strlen(ssid));
+    memcpy(saved.password, password, strlen(password));
+
     nvs_handle_t nvs;
     ESP_RETURN_ON_ERROR(nvs_open(WIFI_NAMESPACE, NVS_READWRITE, &nvs), TAG, "opening %s",
                         WIFI_NAMESPACE);
-    esp_err_t err = nvs_set_str(nvs, KEY_WIFI_SSID, ssid);
-    if (err == ESP_OK) {
-        err = nvs_set_str(nvs, KEY_WIFI_PASSWORD, password);
-    }
+    esp_err_t err = nvs_set_blob(nvs, KEY_WIFI_NETWORK, &saved, sizeof(saved));
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
+    }
+    if (err == ESP_OK) {
+        /* The blob is read first, so the old keys are only clutter now. */
+        static const char *const LEGACY_KEYS[] = {KEY_WIFI_SSID, KEY_WIFI_PASSWORD};
+        for (size_t i = 0; i < sizeof(LEGACY_KEYS) / sizeof(LEGACY_KEYS[0]); i++) {
+            const esp_err_t erased = nvs_erase_key(nvs, LEGACY_KEYS[i]);
+            if (erased != ESP_OK && erased != ESP_ERR_NVS_NOT_FOUND) {
+                ESP_LOGW(TAG, "Could not erase the old Wi-Fi key %s: %s", LEGACY_KEYS[i],
+                         esp_err_to_name(erased));
+            }
+        }
+        (void)nvs_commit(nvs); /* The network is saved whatever this returns */
     }
     nvs_close(nvs);
     return err;
@@ -476,21 +595,26 @@ esp_err_t settings_load_auth(void *blob, size_t size)
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(AUTH_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return ESP_ERR_NOT_FOUND;
+        return ESP_ERR_NOT_FOUND; /* The namespace was never written */
     }
     if (err != ESP_OK) {
         return err;
     }
     size_t length = 0;
     err = nvs_get_blob(nvs, KEY_AUTH_STORE, NULL, &length);
-    if (err == ESP_OK && length != size) {
-        ESP_LOGW(TAG, "Saved PIN data has another layout; starting without a PIN");
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
         err = ESP_ERR_NOT_FOUND;
+    } else if (err == ESP_OK && length != size) {
+        ESP_LOGE(TAG, "Saved PIN data is %u bytes, not %u", (unsigned)length, (unsigned)size);
+        err = ESP_ERR_INVALID_SIZE;
     } else if (err == ESP_OK) {
         err = nvs_get_blob(nvs, KEY_AUTH_STORE, blob, &length);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            err = ESP_FAIL; /* Seen a moment ago: unreadable, not absent */
+        }
     }
     nvs_close(nvs);
-    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_NOT_FOUND : err;
+    return err;
 }
 
 esp_err_t settings_save_auth(const void *blob, size_t size)

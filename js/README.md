@@ -31,12 +31,14 @@ built `dist/`, so the library is compiled first.
 import { LinkClient, decodeStatusFrame, readMasterVolumeDb } from "@dspi/link";
 
 const client = new LinkClient({ reconnect: true });
+client.on("tokenRejected", ({ hubId }) => forgetToken(hubId));
 await client.connect("ws://studio.local:11915/dspi/v1", {
   clientName: "My app",
-  token: storedToken,          // omit to pair with a PIN instead
+  tokenFor: (hubId) => loadToken(hubId), // looked up once the hub's hello names it
 });
 if (client.state === "awaiting_pairing") {
   const token = await client.pair("482913", "My app", "control");
+  if (token) saveToken(client.hubId!, token);
 }
 
 const snap = await client.snapshot(0);
@@ -69,9 +71,15 @@ Each module is usable on its own, and `index.ts` re-exports their public parts:
   event for `hub.config.changed`. Every wait has a timeout: requests,
   commands, the handshake (`handshakeTimeoutMs`) and keepalives, and a socket
   that stops answering keepalives is closed so reconnection starts. Poll
-  subscriptions are sent again after a reconnect and when a device comes back
-  online. A token is dropped only when the hub refuses it, never because the
-  connection fell during auth.
+  subscriptions are sent again after a reconnect, each device on its own, and
+  when a device comes back online; those of a device the hub no longer has are
+  forgotten. A gap in the NOTIFY sequence or in a device's firmware `seq`
+  emits a `resync` event, as the hub's own RESYNC does (Link spec 8.3). A
+  token is chosen by the hub id in the hello (`tokenFor`), never offered to
+  another hub, and dropped only when the hub refuses or revokes it, which the
+  `tokenRejected` event reports; never because the connection fell during
+  auth. On an open-access hub whose courtesy `auth.pair` fails, the session
+  goes on as admin without a session id.
 - `hubUpdate.ts` - the hub firmware upload behind `updateHub` (Link spec
   7.14): FWDATA chunks, two ahead of their acks, then the hub's verdict.
 - `discovery.ts` - finding a hub without DNS-SD (Link spec 3.2 and 3.3):
@@ -108,7 +116,9 @@ every control, and every destructive action red and confirmed.
 
 - **Connect.** Defaults to the origin that served the page, so a hub serving
   this bundle needs no configuration. `GET /dspi/v1/info` fills in the hub's
-  name and kind; another `host:port` can be typed instead. When the hub wants a
+  name and kind; another `host:port` can be typed, though a hub such as the
+  bridge accepts Link sessions only from pages it served itself, so in
+  practice this is the page's own hub. When the hub wants a
   PIN, a pairing panel appears, worded from the hello's `pin_source`: a hub
   with a fixed PIN (a bridge) asks for the PIN the user chose, any other hub
   for the one its pairing window shows. The token it returns is kept in
@@ -117,8 +127,9 @@ every control, and every destructive action red and confirmed.
 - **Device list.** From `device.list`, kept current from `device.added`,
   `device.changed` and `device.removed`.
 - **Device.** Master volume as a slider (-127 to 0 dB, mute at -128), read from
-  the hub's snapshot or a `0xD3` GET and written with `0xD2`, throttled to about
-  20 writes a second. A meter strip from a poll subscription on `0x50` /
+  the hub's snapshot, the device's bulk blob (`0xA0`, when the hub gives no
+  snapshot and no input count) or a `0xD3` GET, and written with `0xD2`,
+  throttled to about 20 writes a second. A meter strip from a poll subscription on `0x50` /
   wValue 9 at 10 Hz, decoded with `decodeStatusFrame`; a clipped channel says
   "Clip" under its bar. A `PARAM_CHANGED` notification for the master volume
   offset moves the slider when another client makes the change; frames whose

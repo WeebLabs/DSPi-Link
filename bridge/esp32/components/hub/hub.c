@@ -8,7 +8,6 @@
  * Portable: no ESP-IDF headers.
  */
 
-#include <stdio.h>
 #include <string.h>
 
 #include "hub_internal.h"
@@ -181,10 +180,13 @@ void hub_init(hub_t *hub, const hub_io_t *io, const hub_config_t *config,
     hub->io = *io;
     hub->config = *config;
     hub_auth_init(&hub->auth, auth_io, saved_auth);
+    if (config->auth_unreadable) {
+        hub_auth_mark_unreadable(&hub->auth); /* Fail safe: see hub_config_t */
+    }
     if (hub->config.max_sessions > HUB_MAX_SESSIONS) {
         hub->config.max_sessions = HUB_MAX_SESSIONS;
     }
-    hub->started_ms = hub_now(hub);
+    hub->uptime_seen_ms = hub_now(hub);
     hub->next_session_id = 1;
     hub->next_tag = 1;
     hub->device.state = HUB_DEVICE_ABSENT;
@@ -201,6 +203,38 @@ bool hub_has_room(const hub_t *hub)
     return false;
 }
 
+static bool not_yet_in(const hub_session_t *session)
+{
+    return session->state == HUB_SESSION_AWAITING_HELLO ||
+           session->state == HUB_SESSION_AUTHENTICATING;
+}
+
+/* With the PIN on, one address may hold only HUB_UNAUTHENTICATED_PER_ADDRESS
+ * sessions that have not authenticated: beyond that its oldest such session
+ * is closed, so a stranger cannot fill every slot with sessions that never
+ * pair. With `auth: none` a session is in as soon as it says hello. */
+static void limit_unauthenticated(hub_t *hub, int slot, uint32_t address)
+{
+    if (!hub_auth_pin_enabled(&hub->auth)) {
+        return;
+    }
+    size_t count = 0;
+    int oldest = -1;
+    for (size_t i = 0; i < hub->config.max_sessions; i++) {
+        const hub_session_t *other = &hub->sessions[i];
+        if ((int)i == slot || !not_yet_in(other) || other->address != address) {
+            continue;
+        }
+        count++;
+        if (oldest < 0 || (int32_t)(other->opened_ms - hub->sessions[oldest].opened_ms) < 0) {
+            oldest = (int)i;
+        }
+    }
+    if (count >= HUB_UNAUTHENTICATED_PER_ADDRESS) {
+        hub_close_session(hub, oldest, CLOSE_AUTH_TIMEOUT);
+    }
+}
+
 void hub_session_opened(hub_t *hub, int slot, uint32_t address)
 {
     if (!valid_slot(hub, slot)) {
@@ -213,6 +247,7 @@ void hub_session_opened(hub_t *hub, int slot, uint32_t address)
     session->opened_ms = hub_now(hub);
     session->last_activity_ms = session->opened_ms;
     session->last_ping_ms = session->opened_ms;
+    limit_unauthenticated(hub, slot, address);
 }
 
 /* Releases everything a session held: its polls, its lock and any snapshot
@@ -239,6 +274,19 @@ void hub_close_sessions(hub_t *hub, uint16_t code, int except_slot)
         const bool live = state == HUB_SESSION_AWAITING_HELLO ||
                           state == HUB_SESSION_AUTHENTICATING || state == HUB_SESSION_OPEN;
         if (live && (int)slot != except_slot) {
+            hub_close_session(hub, (int)slot, code);
+        }
+    }
+}
+
+void hub_close_client_sessions(hub_t *hub, uint16_t cid, uint16_t code, int except_slot)
+{
+    if (cid == 0) {
+        return;
+    }
+    for (size_t slot = 0; slot < hub->config.max_sessions; slot++) {
+        if (hub->sessions[slot].state == HUB_SESSION_OPEN && hub->sessions[slot].cid == cid &&
+            (int)slot != except_slot) {
             hub_close_session(hub, (int)slot, code);
         }
     }
@@ -326,9 +374,7 @@ static cJSON *new_caps_array(const hub_t *hub)
 {
     static const char *const ALWAYS[] = {"poll",       "snapshot", "lock",        "web",  "rename",
                                          "hub_config", "wifi",     "auth_config", "reset"};
-    const bool notify_off = hub->device.state != HUB_DEVICE_ABSENT &&
-                            hub->device.identity.has_uart_config &&
-                            !hub->device.identity.notify_enabled;
+    const bool notify_off = !hub_device_notifies(hub);
     cJSON *caps = cJSON_CreateArray();
     if (caps == NULL) {
         return NULL;
@@ -360,7 +406,7 @@ static void handle_hello(hub_t *hub, int slot, const cJSON *message)
     const cJSON *client = cJSON_GetObjectItemCaseSensitive(message, "client");
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(client, "name");
     if (cJSON_IsString(name)) {
-        snprintf(session->client_name, sizeof(session->client_name), "%s", name->valuestring);
+        hub_auth_copy_name(session->client_name, sizeof(session->client_name), name->valuestring);
     }
 
     /* With `auth: none` the session opens as soon as the hub answers. With
@@ -417,6 +463,10 @@ static void reply_auth_failure(hub_t *hub, int slot, int id, hub_auth_result_t r
 {
     if (result == HUB_AUTH_RATE_LIMITED) {
         hub_reply_error(hub, slot, id, "rate_limited", "too many failures; try again in a minute");
+    } else if (result == HUB_AUTH_UNAVAILABLE && hub_auth_unreadable(&hub->auth)) {
+        hub_reply_error(
+            hub, slot, id, "internal",
+            "the bridge could not read its saved PIN; reset the bridge to set a new one");
     } else if (result == HUB_AUTH_UNAVAILABLE) {
         hub_reply_error(hub, slot, id, "internal", "the bridge could not check credentials");
     } else {
@@ -428,7 +478,7 @@ static void remember_client_name(hub_session_t *session, const cJSON *message)
 {
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
     if (cJSON_IsString(name)) {
-        snprintf(session->client_name, sizeof(session->client_name), "%s", name->valuestring);
+        hub_auth_copy_name(session->client_name, sizeof(session->client_name), name->valuestring);
     }
 }
 
@@ -446,14 +496,19 @@ static void handle_auth_pair(hub_t *hub, int slot, int id, const cJSON *message)
 
     const cJSON *pin = cJSON_GetObjectItemCaseSensitive(message, "pin");
     char token[HUB_AUTH_TOKEN_CHARS + 1];
+    uint16_t replaced = 0;
     const hub_auth_result_t result =
         hub_auth_pair(&hub->auth, session->address, cJSON_IsString(pin) ? pin->valuestring : "",
-                      session->client_name, token, &session->cid);
+                      session->client_name, token, &session->cid, &replaced);
     if (result != HUB_AUTH_OK) {
         reply_auth_failure(hub, slot, id, result);
         return;
     }
+    session->last_touch_ms = hub_now(hub);
     reply_authenticated(hub, slot, id, token);
+    /* A full list forgot the client seen least recently; its token is
+     * gone, so its sessions go too, as if it had been revoked. */
+    hub_close_client_sessions(hub, replaced, CLOSE_TOKEN_REVOKED, slot);
 }
 
 /* auth.token: a client paired before presents its token (Link spec 6.2). */
@@ -472,6 +527,7 @@ static void handle_auth_token(hub_t *hub, int slot, int id, const cJSON *message
         reply_auth_failure(hub, slot, id, result);
         return;
     }
+    session->last_touch_ms = hub_now(hub); /* hub_auth_token() marked it seen */
     reply_authenticated(hub, slot, id, NULL);
 }
 
@@ -613,9 +669,7 @@ static void tick_sessions(hub_t *hub, uint32_t now)
         hub_session_t *session = &hub->sessions[i];
         const int slot = (int)i;
 
-        const bool not_yet_in = session->state == HUB_SESSION_AWAITING_HELLO ||
-                                session->state == HUB_SESSION_AUTHENTICATING;
-        if (not_yet_in && now - session->opened_ms >= LINK_AUTH_TIMEOUT_MS) {
+        if (not_yet_in(session) && now - session->opened_ms >= LINK_AUTH_TIMEOUT_MS) {
             hub_close_session(hub, slot, CLOSE_AUTH_TIMEOUT);
             continue;
         }
@@ -630,6 +684,12 @@ static void tick_sessions(hub_t *hub, uint32_t now)
             hub->io.ping(hub->io.context, slot);
             session->last_ping_ms = now;
         }
+        /* A paired client stays "seen" while it is connected, so a client
+         * that never disconnects is not the one a full list forgets. */
+        if (session->cid != 0 && now - session->last_touch_ms >= HUB_AUTH_TOUCH_INTERVAL_MS) {
+            hub_auth_touch(&hub->auth, session->cid);
+            session->last_touch_ms = now;
+        }
         if (session->resync_owed) {
             const size_t length = link_encode_resync(hub->frame, sizeof(hub->frame),
                                                      HUB_DEVICE_HANDLE, LINK_RESYNC_DROPPED);
@@ -638,8 +698,18 @@ static void tick_sessions(hub_t *hub, uint32_t now)
     }
 }
 
+uint64_t hub_uptime_ms(hub_t *hub)
+{
+    const uint32_t now = hub_now(hub);
+    hub->uptime_ms += now - hub->uptime_seen_ms;
+    hub->uptime_seen_ms = now;
+    return hub->uptime_ms;
+}
+
 void hub_tick(hub_t *hub)
 {
+    (void)hub_uptime_ms(hub); /* Often enough that the clock never wraps unseen */
+    hub_auth_tick(&hub->auth);
     tick_sessions(hub, hub_now(hub));
     hub_commands_tick(hub);
     hub_device_tick(hub);

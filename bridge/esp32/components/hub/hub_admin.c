@@ -34,6 +34,9 @@ bool hub_require_admin(hub_t *hub, int slot, int id)
 void hub_handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message)
 {
     (void)message;
+    if (!hub_require_admin(hub, slot, id)) {
+        return;
+    }
     unsigned open_sessions = 0;
     for (size_t i = 0; i < hub->config.max_sessions; i++) {
         open_sessions += hub->sessions[i].state == HUB_SESSION_OPEN ? 1 : 0;
@@ -41,7 +44,7 @@ void hub_handle_hub_stats(hub_t *hub, int slot, int id, const cJSON *message)
 
     cJSON *body = cJSON_CreateObject();
     cJSON_AddNumberToObject(body, "sessions", open_sessions);
-    cJSON_AddNumberToObject(body, "uptime_s", (hub_now(hub) - hub->started_ms) / 1000);
+    cJSON_AddNumberToObject(body, "uptime_s", (double)(hub_uptime_ms(hub) / 1000));
 
     cJSON *devices = cJSON_AddArrayToObject(body, "devices");
     if (hub->device.state != HUB_DEVICE_ABSENT) {
@@ -77,6 +80,9 @@ hub_change_result_t hub_rename(hub_t *hub, const char *name)
 
 void hub_handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message)
 {
+    if (!hub_require_admin(hub, slot, id)) {
+        return;
+    }
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
     const hub_change_result_t result =
         cJSON_IsString(name) ? hub_rename(hub, name->valuestring) : HUB_CHANGE_INVALID;
@@ -96,6 +102,11 @@ void hub_handle_hub_rename(hub_t *hub, int slot, int id, const cJSON *message)
 bool hub_apply_settings(hub_t *hub, const bridge_settings_t *settings)
 {
     if (!hub->io.apply_settings(hub->io.context, settings)) {
+        /* The I/O may have saved them, or put some into effect, before it
+         * failed (hub_io.h). Putting the old ones back, saved and running,
+         * keeps the promise that a failed change leaves everything as it
+         * was (bridge spec 8.10); if even that fails, the I/O logs it. */
+        (void)hub->io.apply_settings(hub->io.context, &hub->config.settings);
         return false;
     }
     hub->config.settings = *settings;
@@ -277,11 +288,7 @@ void hub_handle_auth_revoke(hub_t *hub, int slot, int id, const cJSON *message)
     }
     hub_reply_ok(hub, slot, id, NULL);
     /* The revoked client's live sessions close at once (Link spec 6.2). */
-    for (size_t other = 0; other < hub->config.max_sessions; other++) {
-        if (hub->sessions[other].state == HUB_SESSION_OPEN && hub->sessions[other].cid == cid) {
-            hub_close_session(hub, (int)other, CLOSE_TOKEN_REVOKED);
-        }
-    }
+    hub_close_client_sessions(hub, (uint16_t)cid, CLOSE_TOKEN_REVOKED, -1);
 }
 
 void hub_handle_auth_set_role(hub_t *hub, int slot, int id, const cJSON *message)
@@ -372,10 +379,12 @@ void hub_handle_hub_auth_set(hub_t *hub, int slot, int id, const cJSON *message)
     }
     hub_session_t *session = &hub->sessions[slot];
     char token[HUB_AUTH_TOKEN_CHARS + 1];
-    if (hub_auth_issue(&hub->auth, session->client_name, token, &session->cid) != HUB_AUTH_OK) {
+    if (hub_auth_issue(&hub->auth, session->client_name, token, &session->cid, NULL) !=
+        HUB_AUTH_OK) {
         hub_reply_error(hub, slot, id, "internal", "the PIN is set, but pair again to get a token");
         return;
     }
+    session->last_touch_ms = hub_now(hub);
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "token", token);
     hub_reply_ok(hub, slot, id, body);

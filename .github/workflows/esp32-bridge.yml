@@ -1,5 +1,7 @@
 # CI for the ESP32 bridge (bridge spec 17): formatting, host tests, and a
 # firmware build for every supported chip with the image-size budget.
+# Actions are pinned by commit, with the release in a comment; update both
+# together.
 name: ESP32 bridge
 
 on:
@@ -25,7 +27,11 @@ jobs:
       run:
         working-directory: bridge/esp32
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Later steps run third-party code (npm packages, PyPI, the
+          # ESP-IDF image); none of them needs the token in .git/config.
+          persist-credentials: false
       - name: Check formatting
         # pipx is on every GitHub runner and keeps the pinned clang-format
         # out of the system Python, which Ubuntu 24.04 protects (PEP 668).
@@ -41,7 +47,9 @@ jobs:
       run:
         working-directory: bridge/esp32
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Build and run host tests
         run: |
           cmake -S test/host -B build-host
@@ -55,8 +63,10 @@ jobs:
       matrix:
         chip: [esp32, esp32s3, esp32c3, esp32c6]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - name: Build the web pages the firmware embeds
@@ -68,7 +78,7 @@ jobs:
         # QEMU has no ESP32-C6 machine, so that chip is build-only here.
         if: matrix.chip != 'esp32c6'
         run: bridge/esp32/tools/qemu_smoke.sh ${{ matrix.chip }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dspi-bridge-${{ matrix.chip }}
           path: |

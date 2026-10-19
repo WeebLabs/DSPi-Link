@@ -4,12 +4,14 @@
  * Implements bridge spec 6.5. Each step starts one component; the
  * components hold all behaviour. The few small functions above app_main()
  * connect components that do not know each other: the button to the hub,
- * and the network and DSPi state to the LED.
+ * the network and DSPi state to the LED, and every task to the checks that
+ * keep a new firmware and restart a stuck bridge (bridge spec 12.3, 14.2).
  */
 
 #include <inttypes.h>
 
 #include "board.h"
+#include "bridge_config.h"
 #include "button.h"
 #include "dspi_uart.h"
 #include "esp_app_desc.h"
@@ -17,6 +19,9 @@
 #include "esp_flash.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "http_server.h"
 #include "hub_task.h"
 #include "net.h"
@@ -26,6 +31,45 @@
 #include "status_led.h"
 
 static const char *TAG = "bridge";
+
+/* Why the chip last started, in words, for the startup summary (bridge
+ * spec 12.3). */
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:
+        return "power on";
+    case ESP_RST_EXT:
+        return "reset pin";
+    case ESP_RST_SW:
+        return "restart by the firmware";
+    case ESP_RST_PANIC:
+        return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+        return "watchdog";
+    case ESP_RST_BROWNOUT:
+        return "brownout (power supply too weak)";
+    case ESP_RST_DEEPSLEEP:
+        return "deep sleep";
+    case ESP_RST_SDIO:
+        return "SDIO";
+    case ESP_RST_USB:
+        return "USB";
+    case ESP_RST_JTAG:
+        return "JTAG";
+    case ESP_RST_EFUSE:
+        return "eFuse error";
+    case ESP_RST_PWR_GLITCH:
+        return "power glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "CPU lockup";
+    case ESP_RST_UNKNOWN:
+        break;
+    }
+    return "unknown";
+}
 
 /* One block of log lines that says what this bridge is and how it is set
  * up, so a serial log from a user answers the first support questions. */
@@ -46,6 +90,7 @@ static void log_startup_summary(const bridge_settings_t *settings)
              board_has_psram() ? "PSRAM" : "no PSRAM");
     ESP_LOGI(TAG, "Hub \"%s\" (%s), hostname %s.local, up to %u sessions", settings->name,
              settings->hub_id, settings->hostname, (unsigned)board_max_sessions());
+    ESP_LOGI(TAG, "Started by: %s", reset_reason_name(esp_reset_reason()));
     ESP_LOGI(TAG, "DSPi UART: TX GPIO %u, RX GPIO %u, %" PRIu32 " baud%s", settings->uart_tx_pin,
              settings->uart_rx_pin, settings->uart_baud,
              settings->uart_detect_baud ? " (automatic detection on)" : "");
@@ -97,48 +142,128 @@ static void on_button_action(void *context, button_action_t action)
     if (erased != ESP_OK) {
         ESP_LOGE(TAG, "Could not erase before restarting: %s", esp_err_to_name(erased));
     }
+    /* A restart the user asked for is no sign of a bad firmware. */
+    ota_confirm_now_if_healthy();
     esp_restart();
 }
 
-/* A new firmware is kept if, after a minute, the hub task and the uart task
- * are both still running (bridge spec 14.2). Wi-Fi started in step 4, or
- * the boot would not have got this far. */
-static bool running_properly(void)
+/* True while the hub task and the uart task both go round their loops. */
+static bool tasks_running(void)
 {
     return hub_task_is_alive() && dspi_uart_is_alive();
 }
 
+/* A new firmware is kept once it runs properly (bridge spec 14.2): every
+ * task going round its loop, the bridge reachable, on its home network
+ * with an address or on its setup network, and the Link server running,
+ * which it is once step 7 has run, or the boot would have stopped there. */
+static bool running_properly(void)
+{
+    net_status_t network;
+    net_get_status(&network);
+    const bool reachable = (network.connected && network.ip[0] != '\0') || network.setup_network_on;
+    return tasks_running() && reachable;
+}
+
+/* Restarts the bridge when the hub task or the uart task has stopped going
+ * round its loop for SUPERVISOR_RESTART_AFTER_MS (bridge spec 12.3). Runs
+ * on ESP-IDF's timer task every SUPERVISOR_CHECK_MS. */
+static void supervise(void *argument)
+{
+    (void)argument;
+    static int64_t stuck_since_ms = -1;
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    if (tasks_running()) {
+        stuck_since_ms = -1;
+        return;
+    }
+    if (stuck_since_ms < 0) {
+        stuck_since_ms = now_ms;
+        ESP_LOGW(TAG, "The %s task has stopped; restarting in %d s unless it recovers",
+                 hub_task_is_alive() ? "uart" : "hub", SUPERVISOR_RESTART_AFTER_MS / 1000);
+        return;
+    }
+    if (now_ms - stuck_since_ms >= SUPERVISOR_RESTART_AFTER_MS) {
+        ESP_LOGE(TAG, "The %s task is stuck; restarting the bridge",
+                 hub_task_is_alive() ? "uart" : "hub");
+        esp_restart();
+    }
+}
+
+static esp_err_t start_supervisor(void)
+{
+    static esp_timer_handle_t timer;
+    const esp_timer_create_args_t args = {.callback = supervise, .name = "supervisor"};
+    esp_err_t err = esp_timer_create(&args, &timer);
+    if (err == ESP_OK) {
+        err = esp_timer_start_periodic(timer, (uint64_t)SUPERVISOR_CHECK_MS * 1000);
+    }
+    return err;
+}
+
+/* A boot step failed, so the bridge cannot work. Restarting at once would
+ * loop faster than anyone could hold BOOT, so wait with the button watched,
+ * then restart; a firmware on trial then returns to the previous one. */
+static void boot_failed(const char *step, esp_err_t err)
+{
+    ESP_LOGE(TAG,
+             "Could not %s: %s. Restarting in %d s; hold BOOT for 15 to 30 s for a "
+             "factory reset",
+             step, esp_err_to_name(err), BOOT_FAILURE_RESTART_MS / 1000);
+    vTaskDelay(pdMS_TO_TICKS(BOOT_FAILURE_RESTART_MS));
+    esp_restart();
+}
+
+/* Runs one boot step and stops the boot if it fails. */
+static void must(esp_err_t err, const char *step)
+{
+    if (err != ESP_OK) {
+        boot_failed(step, err);
+    }
+}
+
 void app_main(void)
 {
-    /* 1. Make flash storage usable; everything saved lives there. */
-    ESP_ERROR_CHECK(settings_init());
+    /* 1. Watch the BOOT button first, so a factory reset works even when a
+     *    later step fails (bridge spec 12.1). */
+    const button_handlers_t button = {.stage_changed = on_button_stage, .action = on_button_action};
+    must(button_start(board_table()->boot_button_pin, &button), "watch the BOOT button");
 
-    /* 2. Load the settings. First boot creates the hub id and names. */
+    /* 2. Make flash storage usable; everything saved lives there. */
+    must(settings_init(), "open the flash storage");
+
+    /* 3. Load the settings. First boot creates the hub id and names. */
     bridge_settings_t settings;
-    ESP_ERROR_CHECK(settings_load(&settings));
+    must(settings_load(&settings), "load the settings");
     log_startup_summary(&settings);
 
-    /* 3. Start the status LED and the button watcher. */
-    ESP_ERROR_CHECK(status_led_start(settings.led_type, settings.led_pin, read_led_inputs));
-    const button_handlers_t button = {.stage_changed = on_button_stage, .action = on_button_action};
-    ESP_ERROR_CHECK(button_start(board_table()->boot_button_pin, &button));
+    /* 4. Start the status LED. */
+    must(status_led_start(settings.led_type, settings.led_pin, read_led_inputs),
+         "start the status LED");
 
-    /* 4. Join Wi-Fi and start mDNS, so the hub has somewhere to advertise. */
-    ESP_ERROR_CHECK(net_start(settings.hostname));
+    /* 5. Join Wi-Fi and start mDNS, so the hub has somewhere to advertise.
+     *    tools/qemu_smoke.sh stops at this log line, since QEMU has no
+     *    radio to start. */
+    ESP_LOGI(TAG, "Starting the network");
+    must(net_start(settings.hostname), "start Wi-Fi");
 
-    /* 5. Start the hub task, which starts the uart task that feeds it. */
-    ESP_ERROR_CHECK(hub_task_start(&settings));
+    /* 6. Start the hub task, which starts the uart task that feeds it. */
+    must(hub_task_start(&settings), "start the hub");
 
-    /* 6. Start the HTTP servers: Link sessions go to the hub task, and the
+    /* 7. Start the HTTP servers: Link sessions go to the hub task, and the
      *    setup network's requests to the setup API. */
     const http_server_config_t http = {
         .max_sessions = board_max_sessions(),
         .handlers = hub_task_http_handlers(),
         .setup_request = setup_api_handle,
     };
-    ESP_ERROR_CHECK(http_server_start(&http));
+    must(http_server_start(&http), "start the HTTP servers");
 
-    /* 7. If this firmware has just been installed, keep it only if it runs
-     *    properly for a minute. */
+    /* 8. Restart the bridge if the hub task or the uart task gets stuck. */
+    must(start_supervisor(), "start the supervisor");
+    ESP_LOGI(TAG, "Bridge started");
+
+    /* 9. If this firmware has just been installed, keep it only once it
+     *    runs properly. */
     ota_confirm_after_healthy_start(running_properly);
 }

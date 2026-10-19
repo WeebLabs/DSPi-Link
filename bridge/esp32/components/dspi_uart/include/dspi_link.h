@@ -78,6 +78,8 @@ typedef struct {
     dspi_parser_t parser;
     uint32_t baud;
     uint32_t last_reply_ms;      /* When the last response ended, for the idle gap */
+    uint32_t last_byte_ms;       /* When bytes last arrived, to spot a frame that stopped */
+    bool probing;                /* Looking for the device: no UART restarts */
     bool quarantined;            /* A timeout happened; drain before sending */
     uint8_t unanswered_in_a_row; /* Attempts with no valid answer, towards a UART restart */
     uint8_t failures_in_a_row;   /* Towards declaring the device lost */
@@ -89,8 +91,8 @@ typedef struct {
  *
  * port:     the UART and clock; copied, so it may be a local.
  * baud:     the rate the port is already running at.
- * buffer:   holds one received payload; LINK_MAX_PAYLOAD_BYTES fits a bulk
- *           read. Must outlive the link.
+ * buffer:   holds one received frame; DSPI_PARSER_BUFFER_BYTES(
+ *           LINK_MAX_PAYLOAD_BYTES) fits a bulk read. Must outlive the link.
  * capacity: the size of `buffer`; longer frames are discarded.
  * handler:  receives notifications; may be NULL to discard them.
  */
@@ -108,7 +110,8 @@ uint32_t dspi_link_baud(const dspi_link_t *link);
 typedef enum {
     DSPI_REPLY_ANSWERED,  /* The DSPi answered; see `status` */
     DSPI_REPLY_TIMEOUT,   /* No answer in time: Link status 0x82 TIMEOUT */
-    DSPI_REPLY_CORRUPT,   /* The answer failed its CRC: Link status 0x05 CRC_ERROR */
+    DSPI_REPLY_CORRUPT,   /* The answer failed its CRC. It may have run, so Link status 0x82 TIMEOUT
+                           */
     DSPI_REPLY_NO_DEVICE, /* Never sent: no DSPi is present. Set by the uart task (dspi_uart.h) */
 } dspi_reply_kind_t;
 
@@ -136,9 +139,16 @@ dspi_reply_t dspi_link_transact(dspi_link_t *link, const dspi_request_t *request
 /* Reads and relays notifications for `duration_ms`. Called while idle. */
 void dspi_link_listen(dspi_link_t *link, uint32_t duration_ms);
 
-/* Asks for the interface status, the cheapest read there is, to check the
- * device is still there (bridge spec 7.6). Returns true if it answered. */
-bool dspi_link_heartbeat(dspi_link_t *link);
+/* How a heartbeat ended. */
+typedef enum {
+    DSPI_HEARTBEAT_SAME_DEVICE,  /* It answered, with the expected serial or an error status */
+    DSPI_HEARTBEAT_NO_ANSWER,    /* No valid answer, even after the retry */
+    DSPI_HEARTBEAT_OTHER_DEVICE, /* A DSPi with another serial answered: it was swapped */
+} dspi_heartbeat_t;
+
+/* Reads the serial number to check the device is still there, and is still
+ * the one whose serial is `serial` (bridge spec 7.6). */
+dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial);
 
 /* Requests in a row that got no valid answer. The caller declares the
  * device lost at DSPI_UART_FAILURES_BEFORE_LOST (bridge spec 7.6). */

@@ -177,28 +177,32 @@ async function probe(hostField: HTMLInputElement): Promise<void> {
   }
 }
 
-async function connect(nameField: HTMLInputElement): Promise<void> {
+/** Counts connection attempts, so one the user stopped reports nothing. */
+let connectAttempt = 0;
+
+async function connect(hostField: HTMLInputElement, nameField: HTMLInputElement): Promise<void> {
   clientName = nameField.value.trim() || defaultClientName();
   saveClientName(clientName);
+  // Connect goes where the address field says, finding the hub there first
+  // when the address is not the one last found.
+  const typed = hostField.value.trim() || defaultHost();
+  if (typed !== host) await probe(hostField);
+  const attempt = ++connectAttempt;
   connectError = null;
   notice = null;
   busy = true;
   render();
-  const hubId = info?.hub.id;
-  const token = hubId ? (loadToken(hubId) ?? undefined) : undefined;
   try {
+    // The token is chosen once the hub's hello says which hub answered, so
+    // a token is never offered to a hub it was not issued by (Link spec 6.2).
     await client.connect(webSocketUrl(host, info ?? undefined, pageIsSecure), {
       clientName,
-      token,
+      tokenFor: loadToken,
       app: "DSPi Web",
       version: __APP_VERSION__,
     });
-    // The client drops a token only when the hub refused it.
-    if (token && hubId && client.state === "awaiting_pairing" && client.token === null) {
-      forgetToken(hubId);
-    }
   } catch (error) {
-    connectError = describeProblem(error);
+    if (attempt === connectAttempt) connectError = describeProblem(error);
   } finally {
     busy = false;
     render();
@@ -213,6 +217,8 @@ function connectField(id: string, value: string, helpId?: string): HTMLInputElem
     class: "grow",
     value,
     autocapitalize: "off",
+    autocorrect: "off",
+    spellcheck: false,
     "aria-describedby": helpId ?? null,
   }) as HTMLInputElement;
 }
@@ -260,7 +266,7 @@ function connectPanel(): HTMLElement {
         class: "primary",
         text: "Connect",
         disabled: busy,
-        onClick: () => void connect(nameField),
+        onClick: () => void connect(hostField, nameField),
       });
   return el(
     "div",
@@ -512,6 +518,7 @@ function closeSettingsPage(): void {
 }
 
 function disconnect(): void {
+  connectAttempt++; // Stopping on purpose is not a problem to report.
   closeDevicePage();
   closeSettingsPage();
   settingsOpen = false;
@@ -537,8 +544,8 @@ client.on("devices", () => {
   if (selectedHandle !== null && !client.device(selectedHandle)) selectedHandle = null;
   if (selectedHandle === null) render();
 });
+client.on("tokenRejected", ({ hubId }) => forgetToken(hubId));
 client.on("close", (close) => {
-  if (close.reason === "revoked" && client.hubId) forgetToken(client.hubId);
   const problem = closeProblem(close);
   if (problem) connectError = problem;
 });

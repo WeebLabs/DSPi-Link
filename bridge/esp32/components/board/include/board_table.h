@@ -4,8 +4,8 @@
  * Implements bridge spec 4.4. One table per chip lists, for each job a pin
  * can do, every pin the bridge offers for it. Anything not listed is never
  * offered: flash and PSRAM pins, USB pins, the boot console UART, strapping
- * pins, input-only pins for outputs, and pins that some common modules do
- * not break out.
+ * pins, input-only pins (they have no pull-up, which an RX line needs), and
+ * pins that some common modules do not break out.
  *
  * The lists are explicit arrays rather than bitmasks so a reader can check
  * them against a datasheet line by line. They are sorted ascending, which is
@@ -39,7 +39,7 @@ typedef struct {
     uint8_t default_uart_rx_pin; /* Wired to the DSPi's UART TX */
     uint8_t boot_button_pin;     /* The BOOT button on every common board */
     board_pin_list_t uart_tx_pins;
-    board_pin_list_t uart_rx_pins; /* May include input-only pins */
+    board_pin_list_t uart_rx_pins; /* Pins with a pull-up, so an unwired RX idles high */
     board_pin_list_t led_pins;     /* Outputs, including on-board LED pins */
 } board_table_t;
 

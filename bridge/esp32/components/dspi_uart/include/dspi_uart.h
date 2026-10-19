@@ -6,10 +6,12 @@
  * notifications, sends a heartbeat when the link is idle, and reports the
  * device found or lost.
  *
- * Every handler runs on the uart task. A handler must return quickly and
- * copy anything it keeps: pointers it receives are valid only during the
- * call. Call dspi_uart_start() once; dspi_uart_submit() may then be called
- * from any task, including from a handler.
+ * Every handler runs on the uart task. A handler must copy anything it
+ * keeps (pointers it receives are valid only during the call) and must not
+ * block: `notification` is called while an answer is awaited, and while it
+ * runs nothing reads the UART, whose receive ring holds about 40 ms at
+ * 1 Mbaud. A handler that cannot pass its event on at once drops it. Call dspi_uart_start() once;
+ * dspi_uart_submit() may then be called from any task, including from a handler.
  */
 
 #ifndef DSPI_UART_H
@@ -32,7 +34,7 @@ typedef struct {
      * DSPI_REPLY_NO_DEVICE until it is found again. */
     void (*device_lost)(void *context);
 
-    /* One notification packet, verbatim. */
+    /* One notification packet, verbatim. Only while a device is present. */
     void (*notification)(void *context, const uint8_t *packet, size_t length);
 
     /* The answer to a submitted request, with the caller's tag. */

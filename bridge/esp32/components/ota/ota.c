@@ -66,8 +66,12 @@ static struct {
     atomic_uint generation;     /* Bumped by every begin and abort */
     atomic_uint chunks_waiting; /* Chunks in the queue, for ota_write's limit */
     update_t update;
+    /* An image on trial (ota_confirm_after_healthy_start). `healthy` is
+     * NULL when there is none. */
     esp_timer_handle_t confirm_timer;
-    bool (*healthy)(void);
+    int64_t trial_started_ms;
+    _Atomic(bool (*)(void)) healthy;
+    atomic_bool confirmed;
 } ota_state;
 
 /* ---------------------------------------------------------------------------
@@ -356,24 +360,56 @@ void ota_abort(void)
  * Confirming a new image
  * ------------------------------------------------------------------------- */
 
-static void confirm(void *argument)
+_Static_assert(OTA_CONFIRM_GIVE_UP_MS > WIFI_FALLBACK_AFTER_MS + OTA_CONFIRM_RETRY_MS,
+               "a home network that is down must give way to the setup network first");
+
+/* Writes the confirmation, once. True when the image is confirmed. Called
+ * from the timer task and, through ota_confirm_now_if_healthy(), from
+ * whichever task restarts the bridge. */
+static bool confirm_image(const char *why)
+{
+    if (atomic_load(&ota_state.confirmed)) {
+        return true;
+    }
+    const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not confirm this firmware: %s", esp_err_to_name(err));
+        return false;
+    }
+    atomic_store(&ota_state.confirmed, true);
+    ESP_LOGI(TAG, "This firmware is confirmed: %s", why);
+    return true;
+}
+
+static void check_trial(void *argument)
 {
     (void)argument;
-    if (ota_state.healthy()) {
-        const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Could not confirm this firmware (%s); the next restart rolls back",
-                     esp_err_to_name(err));
-            return;
-        }
-        ESP_LOGI(TAG, "This firmware ran %d s with every task up and is now confirmed",
-                 OTA_CONFIRM_AFTER_MS / 1000);
+    if (atomic_load(&ota_state.confirmed)) {
         return;
     }
-    ESP_LOGE(TAG, "This firmware is not running properly; returning to the previous one");
-    /* Returns only if it could not restart. */
-    const esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
-    ESP_LOGE(TAG, "Could not return to the previous firmware: %s", esp_err_to_name(err));
+    const int64_t running_ms = esp_timer_get_time() / 1000 - ota_state.trial_started_ms;
+    const bool healthy = atomic_load(&ota_state.healthy)();
+    if (healthy && confirm_image("it is running properly")) {
+        return;
+    }
+    if (!healthy && running_ms >= OTA_CONFIRM_GIVE_UP_MS) {
+        ESP_LOGE(TAG, "This firmware is not running properly; returning to the previous one");
+        /* Returns only if it could not restart. */
+        const esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "Could not return to the previous firmware: %s", esp_err_to_name(err));
+        return;
+    }
+    if (!healthy) {
+        ESP_LOGW(TAG, "This firmware is not running properly yet; checking again in %d s",
+                 OTA_CONFIRM_RETRY_MS / 1000);
+    }
+    /* Unhealthy so far, or healthy but the confirmation was not written. */
+    const esp_err_t err =
+        esp_timer_start_once(ota_state.confirm_timer, (uint64_t)OTA_CONFIRM_RETRY_MS * 1000);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not check this firmware again (%s); the next restart rolls back",
+                 esp_err_to_name(err));
+    }
 }
 
 void ota_confirm_after_healthy_start(bool (*healthy)(void))
@@ -385,19 +421,28 @@ void ota_confirm_after_healthy_start(bool (*healthy)(void))
         return; /* Confirmed already, or flashed by cable */
     }
 
-    ESP_LOGI(TAG, "New firmware: it is confirmed if it runs properly for %d s",
+    ESP_LOGI(TAG, "New firmware: it is confirmed once it runs properly, from %d s on",
              OTA_CONFIRM_AFTER_MS / 1000);
-    ota_state.healthy = healthy;
-    const esp_timer_create_args_t timer = {.callback = confirm, .name = "ota_confirm"};
+    ota_state.trial_started_ms = esp_timer_get_time() / 1000;
+    atomic_store(&ota_state.healthy, healthy);
+    const esp_timer_create_args_t timer = {.callback = check_trial, .name = "ota_confirm"};
     if (esp_timer_create(&timer, &ota_state.confirm_timer) != ESP_OK ||
         esp_timer_start_once(ota_state.confirm_timer, (uint64_t)OTA_CONFIRM_AFTER_MS * 1000) !=
             ESP_OK) {
         /* Without the timer the image would never be confirmed and the next
          * restart would roll back; confirm now rather than lose it. */
         ESP_LOGW(TAG, "Could not start the confirmation timer; confirming now");
-        const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Could not confirm this firmware: %s", esp_err_to_name(err));
-        }
+        (void)confirm_image("its checks could not be scheduled");
+    }
+}
+
+void ota_confirm_now_if_healthy(void)
+{
+    bool (*healthy)(void) = atomic_load(&ota_state.healthy);
+    if (healthy == NULL || atomic_load(&ota_state.confirmed)) {
+        return; /* No image on trial */
+    }
+    if (healthy()) {
+        (void)confirm_image("it was running properly when a restart was asked for");
     }
 }

@@ -65,7 +65,7 @@ static void fail_join(net_machine_t *machine, net_join_failure_t failure, uint32
 
 void net_machine_init(net_machine_t *machine, bool has_saved_network, uint32_t now_ms)
 {
-    *machine = (net_machine_t){.has_network = has_saved_network};
+    *machine = (net_machine_t){.has_network = has_saved_network, .has_saved = has_saved_network};
     enter(machine, has_saved_network ? NET_STATE_CONNECTING : NET_STATE_SETUP, now_ms);
 }
 
@@ -74,6 +74,7 @@ void net_machine_connected(net_machine_t *machine, uint32_t now_ms)
     if (machine->join == NET_JOIN_CONNECTING) {
         machine->join = NET_JOIN_CONNECTED;
     }
+    machine->has_saved = true; /* net.c saves the network that worked */
     enter(machine, NET_STATE_ONLINE, now_ms);
     if (machine->setup_network_on) {
         schedule_off(machine, now_ms + SETUP_NETWORK_AUTO_OFF_MS);
@@ -100,7 +101,10 @@ void net_machine_join(net_machine_t *machine, uint32_t now_ms)
     machine->join = NET_JOIN_CONNECTING;
     machine->join_failure = NET_JOIN_FAILURE_NONE;
     machine->join_started_ms = now_ms;
-    machine->join_had_saved = machine->has_network;
+    /* Only a network that has worked can be returned to. has_network is
+     * not enough: a second join started before the first had finished
+     * would otherwise "return" to the first, which never worked. */
+    machine->join_had_saved = machine->has_saved;
     machine->join_saw_not_found = false;
     machine->has_network = true;
     machine->restore_saved = false;
@@ -123,6 +127,7 @@ void net_machine_finish(net_machine_t *machine, uint32_t now_ms)
 void net_machine_forget(net_machine_t *machine, uint32_t now_ms)
 {
     machine->has_network = false;
+    machine->has_saved = false;
     machine->join = NET_JOIN_IDLE;
     machine->restore_saved = false;
     enter(machine, NET_STATE_SETUP, now_ms);
@@ -153,6 +158,10 @@ void net_machine_tick(net_machine_t *machine, uint32_t now_ms)
         if (finished || unused) {
             machine->setup_network_on = false;
             machine->off_scheduled = false;
+            /* Nobody can be on a network that is off. The driver cannot be
+             * asked once it is off, so the count is cleared here, or the
+             * phone that pressed Finish would count for ever after. */
+            machine->setup_clients = 0;
         }
     }
 }

@@ -56,3 +56,17 @@ CONFIG_CJSON_NESTING_LIMIT=8
 # slice are real (bridge spec 7.2). The default 10 ms tick would round them
 # away.
 CONFIG_FREERTOS_HZ=1000
+
+# A watchdog timeout restarts the bridge rather than only logging (bridge
+# spec 12.3): a task that keeps a CPU busy for the watchdog's 5 s starves
+# that CPU's idle task, and the task watchdog then panics, which restarts.
+# A task that stops without busying a CPU is caught by app_main's
+# supervisor instead.
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# The DSPi UART's interrupt runs from IRAM (bridge spec 7.2), so it keeps
+# emptying the 128-byte hardware FIFO while flash is written by an update
+# or a settings save. Without it the interrupt waits out each flash erase
+# and received bytes are lost within 1.3 ms at 1 Mbaud. dspi_uart.c asks for
+# ESP_INTR_FLAG_IRAM to match.
+CONFIG_UART_ISR_IN_IRAM=y

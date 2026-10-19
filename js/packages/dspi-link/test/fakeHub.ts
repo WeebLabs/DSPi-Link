@@ -34,6 +34,11 @@ export interface FakeHubConfig {
   /** Message types the hub reads but never answers, to simulate a hub that
    * has gone quiet. May be changed while a test runs. */
   ignore?: string[];
+  /** The hub id in hello; may be changed while a test runs, as when another
+   * hub takes over an address. */
+  hubId?: string;
+  /** Handles whose poll.subscribe is answered no_device. */
+  noDevice?: number[];
 }
 
 const soon = (fn: () => void) => setTimeout(fn, 0);
@@ -81,7 +86,12 @@ export class FakeHub {
         socket.deliverText({
           t: "hello",
           proto: { major: 1, minor: 0 },
-          hub: { id: "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b", name: "Test Hub", kind: "console", version: "1.1.7" },
+          hub: {
+            id: this.config.hubId ?? "6f1a2b3c-4d5e-4f60-8a9b-0c1d2e3f4a5b",
+            name: "Test Hub",
+            kind: "console",
+            version: "1.1.7",
+          },
           auth: this.config.auth,
           ...(this.config.pinSource ? { pin_source: this.config.pinSource } : {}),
           caps: this.config.caps ?? ["cmd", "notify", "poll", "snapshot", "lock", "rename"],
@@ -126,6 +136,10 @@ export class FakeHub {
         socket.deliverText({ t: "ok", id, handle: msg.handle, ...(this.config.snapshot ?? {}) });
         return;
       case "poll.subscribe": {
+        if (this.config.noDevice?.includes(msg.handle as number)) {
+          socket.deliverText({ t: "err", id, code: "no_device", msg: "no such device" });
+          return;
+        }
         const polls = (msg.polls ?? []) as Array<{ slot: number; hz: number }>;
         socket.deliverText({ t: "ok", id, granted: polls.map((p) => ({ slot: p.slot, hz: p.hz })) });
         return;

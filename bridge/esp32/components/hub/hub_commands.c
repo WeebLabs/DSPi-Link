@@ -41,27 +41,42 @@ static hub_pending_t *reserve_pending(hub_t *hub)
     hub_pending_t *entry = &hub->pending[back];
     memset(entry, 0, sizeof(*entry));
     entry->tag = hub->next_tag++;
+    if (entry->tag == 0) {
+        entry->tag = hub->next_tag++; /* 0 means "no request" (hub_submit_own()) */
+    }
     entry->submitted_ms = hub_now(hub);
     return entry;
 }
 
+static void origin_taken_up(hub_t *hub, uint32_t tag);
+
+/* The oldest request has just become the one the uart task works on: its
+ * wait starts now, and so does a write's origin window. */
+static void head_changed(hub_t *hub)
+{
+    hub->pending_head_since_ms = hub_now(hub);
+    if (hub->pending_count > 0) {
+        origin_taken_up(hub, hub->pending[hub->pending_head].tag);
+    }
+}
+
 static void commit_pending(hub_t *hub)
 {
-    if (hub->pending_count == 0) {
-        hub->pending_head_since_ms = hub_now(hub);
-    }
     hub->pending_count++;
+    if (hub->pending_count == 1) {
+        head_changed(hub);
+    }
 }
 
 /* Takes the oldest entry off the queue, copying it out so the caller may
- * queue new work while handling it. The next entry's wait starts now: the
- * uart task works on one request at a time. */
+ * queue new work while handling it. The uart task works on one request at
+ * a time, so the next one starts now. */
 static void pop_pending(hub_t *hub, hub_pending_t *out)
 {
     *out = hub->pending[hub->pending_head];
     hub->pending_head = (hub->pending_head + 1) % HUB_PENDING_CAPACITY;
     hub->pending_count--;
-    hub->pending_head_since_ms = hub_now(hub);
+    head_changed(hub);
 }
 
 /* True when tag `a` was issued before tag `b`. Tags count up and wrap, so
@@ -71,38 +86,75 @@ static bool tag_before(uint32_t a, uint32_t b)
     return (int32_t)(a - b) < 0;
 }
 
-bool hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request, bool may_retry,
-                    const hub_poll_key_t *poll)
+uint32_t hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request,
+                        bool may_retry, const hub_poll_key_t *poll)
 {
     hub_pending_t *entry = reserve_pending(hub);
     if (entry == NULL) {
-        return false;
+        return 0;
     }
     entry->kind = kind;
     if (poll != NULL) {
         entry->poll = *poll;
     }
-    if (!hub->io.submit(hub->io.context, request, may_retry, entry->tag)) {
-        return false;
+    const uint32_t tag = entry->tag;
+    if (!hub->io.submit(hub->io.context, request, may_retry, tag)) {
+        return 0;
     }
     commit_pending(hub);
-    return true;
+    return tag;
 }
 
 /* ---------------------------------------------------------------------------
  * Origin attribution (Link spec 8.3)
  * ------------------------------------------------------------------------- */
 
-static void remember_write(hub_t *hub, uint16_t session_id)
+/* The origin queue holds the writes in dispatch order. A write is entered
+ * when it is queued, its window restarts when the uart task takes it up
+ * (a long queue would otherwise use the window up before the DSPi even
+ * sees the write), and it leaves if the DSPi refuses it, since a refused
+ * write changes nothing and must not claim someone else's notification. */
+
+static hub_origin_t *origin_at(hub_t *hub, size_t position)
+{
+    return &hub->origins[(hub->origin_head + position) % HUB_ORIGIN_QUEUE_ENTRIES];
+}
+
+static void remember_write(hub_t *hub, uint16_t session_id, uint32_t tag)
 {
     if (hub->origin_count == HUB_ORIGIN_QUEUE_ENTRIES) {
         /* Full: forget the oldest write, which is the least likely to match. */
         hub->origin_head = (hub->origin_head + 1) % HUB_ORIGIN_QUEUE_ENTRIES;
         hub->origin_count--;
     }
-    const size_t back = (hub->origin_head + hub->origin_count) % HUB_ORIGIN_QUEUE_ENTRIES;
-    hub->origins[back] = (hub_origin_t){.session_id = session_id, .sent_ms = hub_now(hub)};
+    *origin_at(hub, hub->origin_count) =
+        (hub_origin_t){.session_id = session_id, .tag = tag, .sent_ms = hub_now(hub)};
     hub->origin_count++;
+}
+
+static void origin_taken_up(hub_t *hub, uint32_t tag)
+{
+    for (size_t i = 0; i < hub->origin_count; i++) {
+        hub_origin_t *origin = origin_at(hub, i);
+        if (origin->tag == tag) {
+            origin->sent_ms = hub_now(hub);
+            return;
+        }
+    }
+}
+
+static void forget_write(hub_t *hub, uint32_t tag)
+{
+    for (size_t i = 0; i < hub->origin_count; i++) {
+        if (origin_at(hub, i)->tag != tag) {
+            continue;
+        }
+        for (size_t later = i + 1; later < hub->origin_count; later++) {
+            *origin_at(hub, later - 1) = *origin_at(hub, later);
+        }
+        hub->origin_count--;
+        return;
+    }
 }
 
 uint16_t hub_take_origin(hub_t *hub, uint8_t source)
@@ -186,7 +238,8 @@ static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
     entry->slot = slot;
     entry->session_id = session->id;
     entry->client_tag = command->tag;
-    entry->is_set = !command->is_get;
+    /* A write-as-read GET changes the device too (Link spec 6.3). */
+    entry->writes = !command->is_get || class_ != LINK_CLASS_READ;
     entry->is_bulk_set = is_bulk_set;
 
     /* Where the SET payload lives until the uart task has sent it. */
@@ -208,13 +261,13 @@ static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
         return LINK_STATUS_RATE_LIMITED;
     }
 
+    if (entry->writes) {
+        remember_write(hub, session->id, entry->tag); /* Before it can become the head */
+    }
     commit_pending(hub);
     session->commands_in_flight++;
     hub->client_commands_pending++;
     hub->bulk_set_busy = hub->bulk_set_busy || is_bulk_set;
-    if (entry->is_set) {
-        remember_write(hub, session->id);
-    }
     return DSPI_STATUS_OK;
 }
 
@@ -247,9 +300,11 @@ static uint8_t link_status_for(const dspi_reply_t *reply)
     case DSPI_REPLY_ANSWERED:
         return reply->status; /* The DSPi's own status, unchanged */
     case DSPI_REPLY_TIMEOUT:
-        return LINK_STATUS_TIMEOUT;
     case DSPI_REPLY_CORRUPT:
-        return DSPI_STATUS_CRC_ERROR;
+        /* A damaged answer is no answer: the command may or may not have
+         * run. Clients retry on CRC_ERROR, so that status is passed on only
+         * when the DSPi itself says it did not run the frame (above). */
+        return LINK_STATUS_TIMEOUT;
     case DSPI_REPLY_NO_DEVICE:
         return LINK_STATUS_NO_DEVICE;
     }
@@ -266,8 +321,10 @@ static void finish_client_command(hub_t *hub, const hub_pending_t *work, const d
     hub->device.average_rtt_ms =
         (hub->device.average_rtt_ms * (HUB_RTT_AVERAGE_WEIGHT - 1) + round_trip_ms) /
         HUB_RTT_AVERAGE_WEIGHT;
-    if (work->is_set && status == DSPI_STATUS_OK) {
+    if (work->writes && status == DSPI_STATUS_OK) {
         hub_snapshot_mark_stale(hub);
+    } else if (work->writes) {
+        forget_write(hub, work->tag);
     }
 
     /* The session may have closed, and its slot been reused, meanwhile. */

@@ -76,6 +76,7 @@ typedef struct {
     link_role_t role;
     uint32_t opened_ms;
     uint32_t last_activity_ms; /* Any frame from the client, pongs included */
+    uint32_t last_touch_ms;    /* When the paired client was last marked seen */
     uint32_t last_ping_ms;
     uint8_t commands_in_flight;
     uint16_t notify_sequence;
@@ -100,7 +101,8 @@ typedef struct {
     int slot;            /* Client command: who sent it */
     uint16_t session_id; /* Client command: detects a slot reused meanwhile */
     uint16_t client_tag; /* Client command: the CMD frame's tag */
-    bool is_set;         /* Client command: a SET, for origin attribution */
+    bool writes;         /* Client command: a SET, or a GET that changes the device
+                            (classed other than read), for origins and the cache */
     bool is_bulk_set;    /* Client command: its payload is in bulk_set_buffer */
     hub_poll_key_t poll; /* Poll: which one */
     uint32_t submitted_ms;
@@ -144,6 +146,7 @@ typedef struct {
     int slot;
     uint16_t session_id;
     int request_id;
+    bool covered; /* A status read was asked for after this request */
 } hub_snapshot_waiter_t;
 
 typedef struct {
@@ -151,17 +154,18 @@ typedef struct {
     uint16_t bulk_length;
     uint8_t status[DSPI_UART_MAX_GET_REPLY_BYTES];
     uint16_t status_length;
-    bool valid;      /* bulk and status hold a complete read */
-    bool stale;      /* Something may have changed since */
-    bool refreshing; /* A read is in progress */
-    uint32_t read_ms;
+    bool valid;        /* bulk and status hold a complete read */
+    bool stale;        /* The blob may have changed since it was read */
+    uint32_t read_tag; /* The read in flight (hub_pending_t tag), or 0 */
+    uint32_t read_ms;  /* When the blob was read */
     hub_snapshot_waiter_t waiters[HUB_MAX_SESSIONS];
     size_t waiter_count;
 } hub_snapshot_t;
 
 typedef struct {
     uint16_t session_id;
-    uint32_t sent_ms;
+    uint32_t tag;     /* The write's hub_pending_t tag */
+    uint32_t sent_ms; /* Queued, then when the uart task took it up */
 } hub_origin_t;
 
 typedef enum {
@@ -189,13 +193,23 @@ typedef struct {
     const board_table_t *board; /* For the choices hub.config offers */
     const char *version;        /* The bridge firmware's version */
     size_t max_sessions;        /* At most HUB_MAX_SESSIONS */
+
+    /* The saved PIN and paired clients exist but could not be read. The
+     * hub then fails safe rather than open: the PIN counts as on (hello
+     * says `auth: pin`, `pin_source: fixed`), yet every auth.pair and
+     * auth.token is answered `internal` and hub_check_pin() returns
+     * HUB_AUTH_UNAVAILABLE, because no PIN or token can be checked.
+     * hub_set_pin() works as usual and ends this, so the setup page after
+     * a factory reset, or a factory reset itself, recovers the bridge. */
+    bool auth_unreadable;
 } hub_config_t;
 
 typedef struct {
     hub_io_t io;
     hub_config_t config;
     hub_auth_t auth;
-    uint32_t started_ms;
+    uint64_t uptime_ms;      /* Since hub_init(), for hub.stats; never wraps */
+    uint32_t uptime_seen_ms; /* The clock when uptime_ms was last brought up to date */
 
     hub_session_t sessions[HUB_MAX_SESSIONS];
     uint16_t next_session_id;

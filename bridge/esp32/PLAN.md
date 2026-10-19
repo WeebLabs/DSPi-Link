@@ -323,8 +323,52 @@ the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
   `tools/build.sh` now regenerates a chip's sdkconfig when the defaults
   change: the earlier bench runs had used a stale configuration (16
   sockets). The bench was rerun on a clean build and passes.
+- The audit's medium and low findings are fixed too, again by six parallel
+  agents, one per subsystem. Among them:
+  - UART: a frame that fails its CRC or stalls is searched again, so noise
+    cannot swallow the next frame; answers that arrived before a deadline
+    still count; the UART interrupt runs from IRAM; the heartbeat reads the
+    serial, so a swapped DSPi is noticed; a damaged answer is reported as
+    TIMEOUT, never CRC_ERROR.
+  - Hub: one poll budget for the whole link; fresh status for every
+    snapshot; write-as-read commands count as writes; client names are
+    valid UTF-8; unreadable PIN data fails closed; a client forgotten to
+    make room is disconnected.
+  - Glue: the uart task never waits on the hub; each session has a share
+    of the hub's queue and a byte cap on its send queue; refused frames are
+    drained so the close code reaches the client.
+  - Network and setup: the Wi-Fi name and password are saved as one blob;
+    a downgrade keeps the hub id without erasing everything; the setup API
+    checks Host, Content-Type and the subnet.
+  - Updates and boot: a new image is judged on being reachable and every
+    task running, from 60 s up to 5 min; a supervisor restarts a stuck
+    bridge; BOOT works from the first boot step; a failed boot step waits
+    60 s before restarting; the installer serves a pinned, checked ESP Web
+    Tools; workflow actions are pinned by commit.
+  - Web app and library: NOTIFY seq gaps trigger a resync; polls are
+    restored per device; a rejected token is reported.
+
+  `tools/build.sh` now also drops the CMake cache when it regenerates a
+  sdkconfig, since idf.py stops if the sdkconfig its cache names is
+  missing.
+
+  186 host tests pass, also under ASan and UBSan, and so do 167 JS tests.
+  All four chips build without warnings (the ESP32 keeps 31 KB of IRAM
+  free with the UART interrupt in IRAM), and QEMU passes on three. On the
+  ESP32-S3, installed over the air:
+  - `link_smoke.mjs`, `link_conformance.mjs --offline` and the burst test
+    pass;
+  - the four audit attacks are still refused;
+  - a fragmented or oversized frame now gets close 4000, not a reset;
+  - a client sending 2000 messages at once is held back and served in
+    full;
+  - the new image confirmed itself, and an update during a trial is
+    refused.
+- Release note: the ESP32 no longer offers GPIO 34 to 39 for the UART. A
+  bridge with one of them saved as its RX pin returns both UART pins to the
+  defaults after the update.
 - Open from the audit: whether to sign firmware updates (it needs a
-  release key held in CI), and its medium and low findings.
+  release key held in CI).
 - Left: the same bench run on the ESP32, ESP32-C3 and ESP32-C6, the
   setup journey on an Android phone, DSPi Console against the PIN, and
   marking the specs implemented once every chip passes.

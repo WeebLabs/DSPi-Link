@@ -38,12 +38,14 @@ for target in "${targets[@]}"; do
     # ESP-IDF fills a chip's sdkconfig from sdkconfig.defaults only for keys
     # it does not have yet, so a changed default would be ignored by an
     # existing build. Start that chip's sdkconfig again whenever a defaults
-    # file is newer than it.
+    # file is newer than it. The CMake cache goes too: idf.py reads the
+    # sdkconfig it names before configuring, and stops if that file is
+    # missing. Compiled objects are kept, so the rebuild stays incremental.
     sdkconfig="${BRIDGE_DIR}/build/${target}/sdkconfig"
     if [[ -f "${sdkconfig}" ]] &&
         [[ -n "$(find "${BRIDGE_DIR}" -maxdepth 1 -name 'sdkconfig.defaults*' -newer "${sdkconfig}")" ]]; then
         echo "=== ${target}: sdkconfig.defaults changed; regenerating the configuration"
-        rm "${sdkconfig}"
+        rm -f "${sdkconfig}" "${BRIDGE_DIR}/build/${target}/CMakeCache.txt"
     fi
 
     # The whole repository is mounted because later components read

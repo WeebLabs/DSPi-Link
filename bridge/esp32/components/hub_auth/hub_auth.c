@@ -10,7 +10,6 @@
 
 #include "hub_auth.h"
 
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -22,9 +21,12 @@ static uint32_t now_ms(const hub_auth_t *auth)
     return auth->io.now_ms(auth->io.context);
 }
 
-static bool reached(uint32_t now, uint32_t when)
+/* True once `duration` ms have passed since `since`. Exact as long as no
+ * more than 49 days pass between the two, which expire() guarantees by
+ * ending everything timed long before that. */
+static bool elapsed(uint32_t now, uint32_t since, uint32_t duration)
 {
-    return (int32_t)(now - when) >= 0;
+    return now - since >= duration;
 }
 
 /* Compares two hashes in time that does not depend on where they differ,
@@ -71,51 +73,89 @@ static void save(const hub_auth_t *auth)
  * Rate limits (Link spec 6.2)
  * ------------------------------------------------------------------------- */
 
-/* The record for `address`: its own, else an empty one, else the one whose
- * last failure is oldest, reused. */
-static hub_auth_address_t *address_record(hub_auth_t *auth, uint32_t address)
+/* Ends the lockouts, failure windows and hourly save limits whose time has
+ * passed, and frees the records of addresses with nothing left against
+ * them. Run on every check and every tick, so every time kept here is
+ * recent when it is compared. */
+static void expire(hub_auth_t *auth, uint32_t now)
 {
     for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
-        if (auth->addresses[i].address == address) {
+        hub_auth_address_t *record = &auth->addresses[i];
+        if (!record->used) {
+            continue;
+        }
+        if (record->locked && elapsed(now, record->locked_since_ms, AUTH_LOCKOUT_MS)) {
+            record->locked = false;
+            record->failures = 0;
+        }
+        if (!record->locked && record->failures > 0 &&
+            elapsed(now, record->window_start_ms, AUTH_FAILURE_WINDOW_MS)) {
+            record->failures = 0;
+        }
+        if (!record->locked && record->failures == 0) {
+            record->used = false;
+        }
+    }
+
+    if (auth->global_locked && elapsed(now, auth->global_locked_since_ms, AUTH_LOCKOUT_MS)) {
+        auth->global_locked = false;
+        auth->global_failures = 0;
+    }
+    if (!auth->global_locked && auth->global_failures > 0 &&
+        elapsed(now, auth->global_window_start_ms, AUTH_FAILURE_WINDOW_MS)) {
+        auth->global_failures = 0;
+    }
+
+    for (size_t i = 0; i < AUTH_MAX_PAIRED_CLIENTS; i++) {
+        if (auth->saved_recently[i] &&
+            elapsed(now, auth->saved_ms[i], AUTH_LAST_SEEN_SAVE_INTERVAL_MS)) {
+            auth->saved_recently[i] = false;
+        }
+    }
+}
+
+/* The record for `address`: its own, else a free one, else the unlocked one
+ * whose last failure is oldest, reused. NULL when every record holds a
+ * lockout: a lockout is never given up to make room, or cycling through
+ * more addresses than are tracked would lift it. The global limit still
+ * counts such an address's failures. */
+static hub_auth_address_t *address_record(hub_auth_t *auth, uint32_t address, uint32_t now)
+{
+    for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
+        if (auth->addresses[i].used && auth->addresses[i].address == address) {
             return &auth->addresses[i];
         }
     }
-    hub_auth_address_t *choice = &auth->addresses[0];
+    hub_auth_address_t *choice = NULL;
     for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
         hub_auth_address_t *record = &auth->addresses[i];
-        if (record->address == 0) {
+        if (!record->used) {
             choice = record;
             break;
         }
-        if ((int32_t)(record->last_failure_ms - choice->last_failure_ms) < 0) {
+        if (!record->locked &&
+            (choice == NULL || now - record->last_failure_ms > now - choice->last_failure_ms)) {
             choice = record;
         }
     }
-    *choice = (hub_auth_address_t){.address = address};
+    if (choice != NULL) {
+        *choice = (hub_auth_address_t){.used = true, .address = address};
+    }
     return choice;
 }
 
 /* True while `address` is locked out, or, when `include_global`, while
- * everyone is. Expired locks lift. The global lock guards the PIN alone: a
- * paired client's token is 32 random bytes nobody can guess, so refusing
- * tokens too would only let a stranger guessing PINs lock every paired app
- * out (Link spec 6.2). */
+ * everyone is. The global lock guards the PIN alone: a paired client's
+ * token is 32 random bytes nobody can guess, so refusing tokens too would
+ * only let a stranger guessing PINs lock every paired app out (Link spec
+ * 6.2). */
 static bool locked_out(hub_auth_t *auth, uint32_t address, bool include_global)
 {
-    const uint32_t now = now_ms(auth);
-    if (auth->global_locked && reached(now, auth->global_locked_until_ms)) {
-        auth->global_locked = false;
-        auth->global_failures = 0;
-    }
+    expire(auth, now_ms(auth));
     for (size_t i = 0; i < AUTH_TRACKED_ADDRESSES; i++) {
-        hub_auth_address_t *record = &auth->addresses[i];
-        if (record->address == address && record->locked) {
-            if (reached(now, record->locked_until_ms)) {
-                record->locked = false;
-                record->failures = 0;
-            } else {
-                return true;
-            }
+        const hub_auth_address_t *record = &auth->addresses[i];
+        if (record->used && record->address == address && record->locked) {
+            return true;
         }
     }
     return include_global && auth->global_locked;
@@ -125,26 +165,98 @@ static bool locked_out(hub_auth_t *auth, uint32_t address, bool include_global)
 static void note_failure(hub_auth_t *auth, uint32_t address)
 {
     const uint32_t now = now_ms(auth);
-    hub_auth_address_t *record = address_record(auth, address);
-    if (record->failures == 0 || reached(now, record->window_start_ms + AUTH_FAILURE_WINDOW_MS)) {
-        record->window_start_ms = now;
-        record->failures = 0;
-    }
-    record->last_failure_ms = now;
-    if (++record->failures >= AUTH_MAX_FAILURES_PER_ADDRESS) {
-        record->locked = true;
-        record->locked_until_ms = now + AUTH_LOCKOUT_MS;
+    expire(auth, now);
+    hub_auth_address_t *record = address_record(auth, address, now);
+    if (record != NULL) {
+        if (record->failures == 0) {
+            record->window_start_ms = now;
+        }
+        record->last_failure_ms = now;
+        if (++record->failures >= AUTH_MAX_FAILURES_PER_ADDRESS) {
+            record->locked = true;
+            record->locked_since_ms = now;
+        }
     }
 
-    if (auth->global_failures == 0 ||
-        reached(now, auth->global_window_start_ms + AUTH_FAILURE_WINDOW_MS)) {
+    if (auth->global_failures == 0) {
         auth->global_window_start_ms = now;
-        auth->global_failures = 0;
     }
     if (++auth->global_failures >= AUTH_MAX_FAILURES_ALL_ADDRESSES) {
         auth->global_locked = true;
-        auth->global_locked_until_ms = now + AUTH_LOCKOUT_MS;
+        auth->global_locked_since_ms = now;
     }
+}
+
+void hub_auth_tick(hub_auth_t *auth)
+{
+    expire(auth, now_ms(auth));
+}
+
+/* ---------------------------------------------------------------------------
+ * Client names
+ * ------------------------------------------------------------------------- */
+
+/* The length of the well-formed UTF-8 character at `text` (RFC 3629: no
+ * overlong forms, surrogates or values above U+10FFFF), or 0 if it is not
+ * one. Reads no further than the first byte that fails. */
+static size_t utf8_character_length(const unsigned char *text)
+{
+    const unsigned char lead = text[0];
+    if (lead < 0x80) {
+        return 1;
+    }
+    size_t length = 0;
+    unsigned char low = 0x80;
+    unsigned char high = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        length = 2;
+    } else if (lead >= 0xE0 && lead <= 0xEF) {
+        length = 3;
+        low = lead == 0xE0 ? 0xA0 : low;
+        high = lead == 0xED ? 0x9F : high;
+    } else if (lead >= 0xF0 && lead <= 0xF4) {
+        length = 4;
+        low = lead == 0xF0 ? 0x90 : low;
+        high = lead == 0xF4 ? 0x8F : high;
+    } else {
+        return 0;
+    }
+    if (text[1] < low || text[1] > high) {
+        return 0;
+    }
+    for (size_t k = 2; k < length; k++) {
+        if ((text[k] & 0xC0) != 0x80) {
+            return 0;
+        }
+    }
+    return length;
+}
+
+void hub_auth_copy_name(char *out, size_t size, const char *name)
+{
+    if (size == 0) {
+        return;
+    }
+    size_t written = 0;
+    const unsigned char *text = (const unsigned char *)(name != NULL ? name : "");
+    while (*text != '\0') {
+        size_t length = utf8_character_length(text);
+        const bool control = length == 1 && (*text < 0x20 || *text == 0x7F);
+        const unsigned char *piece = text;
+        size_t piece_length = length;
+        if (length == 0 || control) {
+            piece = (const unsigned char *)"?";
+            piece_length = 1;
+            length = 1;
+        }
+        if (written + piece_length >= size) {
+            break; /* Cut between characters, never inside one */
+        }
+        memcpy(&out[written], piece, piece_length);
+        written += piece_length;
+        text += length;
+    }
+    out[written] = '\0';
 }
 
 /* ---------------------------------------------------------------------------
@@ -161,11 +273,30 @@ void hub_auth_init(hub_auth_t *auth, const hub_auth_io_t *io, const hub_auth_sto
     if (auth->store.next_cid == 0) {
         auth->store.next_cid = 1;
     }
+    /* A name saved by older firmware may be cut inside a character, which
+     * would break every auth.list reply that carries it. */
+    for (size_t i = 0; i < AUTH_MAX_PAIRED_CLIENTS; i++) {
+        hub_auth_client_t *client = &auth->store.clients[i];
+        char name[AUTH_CLIENT_NAME_BYTES];
+        client->name[sizeof(client->name) - 1] = '\0';
+        hub_auth_copy_name(name, sizeof(name), client->name);
+        memcpy(client->name, name, sizeof(client->name));
+    }
+}
+
+void hub_auth_mark_unreadable(hub_auth_t *auth)
+{
+    auth->unreadable = true;
+}
+
+bool hub_auth_unreadable(const hub_auth_t *auth)
+{
+    return auth->unreadable;
 }
 
 bool hub_auth_pin_enabled(const hub_auth_t *auth)
 {
-    return auth->store.pin_enabled;
+    return auth->store.pin_enabled || auth->unreadable;
 }
 
 bool hub_auth_pin_is_valid(const char *pin)
@@ -197,15 +328,20 @@ hub_auth_result_t hub_auth_set_pin(hub_auth_t *auth, const char *pin)
 
     hub_auth_store_t *store = &auth->store;
     memset(store->clients, 0, sizeof(store->clients)); /* Every token is revoked */
+    memset(auth->saved_recently, 0, sizeof(auth->saved_recently));
     memcpy(store->pin_salt, salt, sizeof(store->pin_salt));
     memcpy(store->pin_hash, hash, sizeof(store->pin_hash));
     store->pin_enabled = pin != NULL;
+    auth->unreadable = false; /* Replaced by what was just chosen */
     save(auth);
     return HUB_AUTH_OK;
 }
 
 hub_auth_result_t hub_auth_check_pin(hub_auth_t *auth, uint32_t address, const char *pin)
 {
+    if (auth->unreadable) {
+        return HUB_AUTH_UNAVAILABLE; /* No PIN can be right; not the client's fault */
+    }
     if (locked_out(auth, address, true)) {
         return HUB_AUTH_RATE_LIMITED;
     }
@@ -251,8 +387,12 @@ static uint16_t next_cid(hub_auth_t *auth)
 }
 
 hub_auth_result_t hub_auth_issue(hub_auth_t *auth, const char *name,
-                                 char token[HUB_AUTH_TOKEN_CHARS + 1], uint16_t *cid)
+                                 char token[HUB_AUTH_TOKEN_CHARS + 1], uint16_t *cid,
+                                 uint16_t *replaced_cid)
 {
+    if (auth->unreadable) {
+        return HUB_AUTH_UNAVAILABLE;
+    }
     uint8_t secret[AUTH_TOKEN_BYTES];
     uint8_t token_hash[HUB_AUTH_HASH_BYTES];
     if (!auth->io.random(auth->io.context, secret, sizeof(secret))) {
@@ -265,30 +405,41 @@ hub_auth_result_t hub_auth_issue(hub_auth_t *auth, const char *name,
     }
 
     hub_auth_client_t *client = client_entry_for_new(auth);
+    if (replaced_cid != NULL) {
+        *replaced_cid = client->used ? client->cid : 0;
+    }
     const uint32_t now = auth->io.unix_time(auth->io.context);
     *client =
         (hub_auth_client_t){.used = true, .cid = next_cid(auth), .created = now, .last_seen = now};
     memcpy(client->token_hash, token_hash, sizeof(client->token_hash));
-    snprintf(client->name, sizeof(client->name), "%s", name != NULL ? name : "");
+    hub_auth_copy_name(client->name, sizeof(client->name), name);
     *cid = client->cid;
+
+    /* Saved just now, with its last_seen. */
+    const size_t index = (size_t)(client - auth->store.clients);
+    auth->saved_recently[index] = true;
+    auth->saved_ms[index] = now_ms(auth);
     save(auth);
     return HUB_AUTH_OK;
 }
 
 hub_auth_result_t hub_auth_pair(hub_auth_t *auth, uint32_t address, const char *pin,
                                 const char *name, char token[HUB_AUTH_TOKEN_CHARS + 1],
-                                uint16_t *cid)
+                                uint16_t *cid, uint16_t *replaced_cid)
 {
     const hub_auth_result_t checked = hub_auth_check_pin(auth, address, pin);
     if (checked != HUB_AUTH_OK) {
         return checked;
     }
-    return hub_auth_issue(auth, name, token, cid);
+    return hub_auth_issue(auth, name, token, cid, replaced_cid);
 }
 
 hub_auth_result_t hub_auth_token(hub_auth_t *auth, uint32_t address, const char *token,
                                  uint16_t *cid)
 {
+    if (auth->unreadable) {
+        return HUB_AUTH_UNAVAILABLE; /* Every token went with the unreadable store */
+    }
     if (locked_out(auth, address, false)) {
         return HUB_AUTH_RATE_LIMITED;
     }
@@ -313,6 +464,8 @@ hub_auth_result_t hub_auth_token(hub_auth_t *auth, uint32_t address, const char 
 
 void hub_auth_touch(hub_auth_t *auth, uint16_t cid)
 {
+    const uint32_t now = now_ms(auth);
+    expire(auth, now);
     for (size_t i = 0; i < AUTH_MAX_PAIRED_CLIENTS; i++) {
         hub_auth_client_t *client = &auth->store.clients[i];
         if (!client->used || client->cid != cid) {
@@ -322,9 +475,9 @@ void hub_auth_touch(hub_auth_t *auth, uint16_t cid)
         if (unix_now != 0) {
             client->last_seen = unix_now;
         }
-        const uint32_t now = now_ms(auth);
-        if (reached(now, auth->last_saved_ms[i] + AUTH_LAST_SEEN_SAVE_INTERVAL_MS)) {
-            auth->last_saved_ms[i] = now;
+        if (!auth->saved_recently[i]) {
+            auth->saved_recently[i] = true;
+            auth->saved_ms[i] = now;
             save(auth);
         }
         return;
@@ -337,6 +490,7 @@ bool hub_auth_revoke(hub_auth_t *auth, uint16_t cid)
         hub_auth_client_t *client = &auth->store.clients[i];
         if (client->used && client->cid == cid) {
             memset(client, 0, sizeof(*client));
+            auth->saved_recently[i] = false;
             save(auth);
             return true;
         }

@@ -10,12 +10,13 @@
 #include "check.h"
 #include "dspi_link.h"
 #include "fake_dspi.h"
+#include "test_frames.h"
 
 #define BAUD 1000000
 
 static fake_dspi_t fake;
 static dspi_link_t link;
-static uint8_t buffer[LINK_MAX_PAYLOAD_BYTES];
+static uint8_t buffer[DSPI_PARSER_BUFFER_BYTES(LINK_MAX_PAYLOAD_BYTES)];
 
 /* The last notification the link relayed. */
 static uint8_t notified[64];
@@ -285,19 +286,172 @@ static void a_failed_restart_is_tried_again(void)
     CHECK(fake.restarts == 3);
 }
 
-static void the_heartbeat_reads_the_interface_status(void)
+static const char SERIAL[] = "E46058388B1A2E2C"; /* The fake's */
+
+static void the_heartbeat_reads_the_serial(void)
 {
     start(BAUD, BAUD);
-    CHECK(dspi_link_heartbeat(&link));
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_SAME_DEVICE);
     CHECK(fake.record_count == 1);
-    CHECK(fake.records[0].is_get && fake.records[0].request == 0xF9);
-    CHECK(fake.records[0].length == 8);
+    CHECK(fake.records[0].is_get && fake.records[0].request == 0x7E);
+    CHECK(fake.records[0].length == 16);
 
     /* Silence twice: a heartbeat is a safe read, so it gets its retry. */
     fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
     fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
-    CHECK(!dspi_link_heartbeat(&link));
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_NO_ANSWER);
     CHECK(fake.record_count == 3);
+
+    /* A busy DSPi is still there, and nothing says it changed. */
+    fake_dspi_script(&fake,
+                     (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = DSPI_STATUS_BUSY});
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_SAME_DEVICE);
+}
+
+/* A DSPi swapped between two heartbeats never goes silent long enough to be
+ * lost; its serial gives it away. */
+static void the_heartbeat_spots_a_swapped_device(void)
+{
+    start(BAUD, BAUD);
+    const uint8_t other[16] = "F00D58388B1A2E2C";
+    fake_dspi_can(&fake, 0x7E, other, sizeof(other));
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_OTHER_DEVICE);
+
+    /* A shorter serial that matches the start of the old one differs too. */
+    const uint8_t prefix[16] = "E460";
+    fake_dspi_can(&fake, 0x7E, prefix, sizeof(prefix));
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_OTHER_DEVICE);
+}
+
+static const uint8_t ONE[] = {0x01};
+static const dspi_request_t SET_ONE = {
+    .is_get = false, .request = 0xD4, .length = 1, .payload = ONE};
+
+/* Noise that looks like the start of a frame claiming 64 bytes arrives
+ * while idle. It must not swallow the next answer (audit UART-1). */
+static void a_false_start_while_idle_does_not_swallow_the_answer(void)
+{
+    const uint8_t types[] = {DSPI_FRAME_TYPE_SET_RESPONSE, DSPI_FRAME_TYPE_GET_RESPONSE,
+                             DSPI_FRAME_TYPE_NOTIFICATION};
+    for (size_t i = 0; i < sizeof(types); i++) {
+        start(BAUD, BAUD);
+        const uint8_t glitch[] = {0xA5, types[i], 0x00, 0x40, 0x00};
+        fake_dspi_send_raw(&fake, glitch, sizeof(glitch), 0);
+        dspi_link_listen(&link, 10);
+
+        const dspi_reply_t reply = dspi_link_transact(&link, &SET_ONE, false);
+        CHECK(reply.kind == DSPI_REPLY_ANSWERED);
+        CHECK(reply.attempts == 1);
+        CHECK(fake.record_count == 1);
+    }
+
+    /* Hours later, too: the stale partial frame is dropped at once. */
+    start(BAUD, BAUD);
+    const uint8_t glitch[] = {0xA5, 0x40, 0x00, 0x40, 0x00};
+    fake_dspi_send_raw(&fake, glitch, sizeof(glitch), 0);
+    dspi_link_listen(&link, 10);
+    fake.now_ms += 3600u * 1000u;
+    const uint32_t started = fake.now_ms;
+    CHECK(dspi_link_transact(&link, &SET_ONE, false).kind == DSPI_REPLY_ANSWERED);
+    CHECK(fake.now_ms - started < 10);
+}
+
+/* A notification that lost a byte on the way takes the next frame's sync
+ * byte as its CRC. The answer right behind it must still be found. */
+static void a_notification_missing_a_byte_does_not_swallow_the_answer(void)
+{
+    start(BAUD, BAUD);
+    const uint8_t packet[] = {0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
+    uint8_t frame[32];
+    size_t length =
+        test_build_device_frame(DSPI_FRAME_TYPE_NOTIFICATION, 0, packet, sizeof(packet), frame);
+    memmove(&frame[7], &frame[8], length - 8); /* One payload byte lost */
+    length--;
+    fake_dspi_send_raw(&fake, frame, length, 2);
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_LATE, .delay_ms = 1});
+
+    const dspi_reply_t reply = dspi_link_transact(&link, &SET_ONE, false);
+    CHECK(reply.kind == DSPI_REPLY_ANSWERED);
+    CHECK(reply.status == DSPI_STATUS_OK);
+    CHECK(notified_count == 0);
+    CHECK(dspi_link_counters(&link)->crc_errors >= 1);
+}
+
+/* A whole notification and the answer hidden inside a false frame's
+ * payload are both found once the false frame fails its CRC. */
+static void frames_inside_a_false_frame_are_found(void)
+{
+    start(BAUD, BAUD);
+    uint8_t wire[64] = {0xA5, 0x40, 0x00, 0x14, 0x00}; /* Claims 20 bytes */
+    size_t length = 5;
+    const uint8_t packet[] = {0x02, 0x00, 0x00, 0x07};
+    length += test_build_device_frame(DSPI_FRAME_TYPE_NOTIFICATION, 0, packet, sizeof(packet),
+                                      &wire[length]);
+    fake_dspi_send_raw(&fake, wire, length, 2);
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_LATE, .delay_ms = 3});
+
+    const dspi_reply_t reply = dspi_link_transact(&link, &GET_PLATFORM, false);
+    CHECK(reply.kind == DSPI_REPLY_ANSWERED);
+    CHECK(reply.length == 7);
+    CHECK(reply.payload[0] == 0x01 && reply.payload[5] == 0x07);
+    CHECK(notified_count == 1);
+    CHECK(notified_length == sizeof(packet) && notified[3] == 0x07);
+}
+
+static unsigned slow_handler_calls;
+
+/* A notification handler that holds the uart task for a second, as a hub
+ * whose queue is full can (audit UART-2). */
+static void slow_notification_handler(void *context, const uint8_t *packet, size_t length)
+{
+    (void)context;
+    (void)packet;
+    (void)length;
+    slow_handler_calls++;
+    fake.now_ms += 1000;
+}
+
+/* An answer that arrived in time but waited in the driver while a handler
+ * held the uart task is still the answer. */
+static void an_answer_held_up_by_a_slow_handler_still_counts(void)
+{
+    fake_dspi_init(&fake, BAUD);
+    const dspi_port_t port = fake_dspi_port(&fake);
+    dspi_link_init(&link, &port, BAUD, buffer, sizeof(buffer), slow_notification_handler, NULL);
+    slow_handler_calls = 0;
+    const uint8_t packet[] = {0x02, 0x00, 0x00, 0x01};
+    fake_dspi_notify(&fake, packet, sizeof(packet), 3);
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_LATE, .delay_ms = 3});
+
+    const dspi_reply_t reply = dspi_link_transact(&link, &SET_ONE, false);
+    CHECK(slow_handler_calls == 1);
+    CHECK(reply.kind == DSPI_REPLY_ANSWERED);
+    CHECK(dspi_link_counters(&link)->timeouts == 0);
+}
+
+/* Probing for a missing DSPi changes the rate every attempt, which flushes
+ * the receiver, so it never reinstalls the driver (audit UART-4). */
+static void looking_for_a_missing_device_never_restarts_the_uart(void)
+{
+    start(BAUD, BAUD);
+    fake.device_baud = 9600; /* Not a candidate: nothing will answer */
+    const uint32_t candidates[] = DSPI_UART_BAUD_CANDIDATES;
+    for (int pass = 0; pass < 4; pass++) {
+        CHECK(!dspi_link_find_baud(&link, BAUD, candidates,
+                                   sizeof(candidates) / sizeof(candidates[0])));
+        CHECK(!dspi_link_find_baud(&link, BAUD, candidates, 0));
+    }
+    CHECK(fake.restarts == 0);
+    CHECK(dspi_link_counters(&link)->restarts == 0);
+
+    /* Once found, unanswered requests restart it as before. */
+    fake.device_baud = BAUD;
+    CHECK(dspi_link_find_baud(&link, BAUD, candidates, 0));
+    for (int i = 0; i < DSPI_UART_UNANSWERED_BEFORE_REINSTALL; i++) {
+        fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
+        CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
+    }
+    CHECK(fake.restarts == 1);
 }
 
 static void the_baud_rate_is_found(void)
@@ -363,7 +517,13 @@ void test_dspi_link(void)
     RUN(noise_counts_towards_the_restart);
     RUN(a_damaged_notification_is_not_taken_for_the_answer);
     RUN(a_failed_restart_is_tried_again);
-    RUN(the_heartbeat_reads_the_interface_status);
+    RUN(the_heartbeat_reads_the_serial);
+    RUN(the_heartbeat_spots_a_swapped_device);
+    RUN(a_false_start_while_idle_does_not_swallow_the_answer);
+    RUN(a_notification_missing_a_byte_does_not_swallow_the_answer);
+    RUN(frames_inside_a_false_frame_are_found);
+    RUN(an_answer_held_up_by_a_slow_handler_still_counts);
+    RUN(looking_for_a_missing_device_never_restarts_the_uart);
     RUN(the_baud_rate_is_found);
     RUN(a_missing_device_leaves_the_first_rate);
     RUN(the_identity_is_read);

@@ -68,6 +68,16 @@ const POLL_FAILURES_ALLOWED = 8;
  * for the setup network's own drop-outs before the page gives up. */
 const JOIN_DEADLINE_MS = 45000;
 
+/** After the bridge stops answering mid-join, how long and how often the page
+ * keeps checking whether the join worked: the setup network stays up for 2
+ * minutes after a join (bridge spec 9.1). */
+const WATCH_AFTER_DROP_MS = 120000;
+const WATCH_INTERVAL_MS = 3000;
+
+/** How many times, and how far apart, the page first asks the bridge for its state. */
+const START_ATTEMPTS = 3;
+const START_RETRY_MS = 2000;
+
 /** The longest name the bridge stores (bridge spec 8.11). */
 const BRIDGE_NAME_MAX_LENGTH = 63;
 
@@ -83,9 +93,14 @@ const flow = {
   typingName: false, // The user chose to type a network name
   ssid: "",
   secure: true,
+  /** False for a name typed by hand: the page cannot tell if it has a password. */
+  securityKnown: true,
   password: "",
   showPassword: false,
   name: "",
+  /** Set once the user edits the name or the PIN switch, so a late /state keeps their choice. */
+  nameEdited: false,
+  pinSwitchTouched: false,
   // The PIN (bridge spec 10.2). `currentPin` is asked for only when the
   // bridge already has one, as after "Forget Wi-Fi".
   pinEnabled: false,
@@ -175,14 +190,17 @@ function linkButton(label: string, onClick: () => void): HTMLButtonElement {
 
 function welcome(): HTMLElement[] {
   const dspi = flow.state?.dspi;
-  const found = dspi?.found
-    ? statusLine("good", "DSPi found", dspi.serial ? `Serial ${dspi.serial}` : undefined)
-    : statusLine(
-        "warn",
-        "DSPi not found yet",
-        "Check the three wires, and that the UART control interface is on in DSPi Console. " +
-          "You can carry on and fix this later.",
-      );
+  // Until the bridge has answered, there is nothing to say about the DSPi.
+  const found = !dspi
+    ? null
+    : dspi.found
+      ? statusLine("good", "DSPi found", dspi.serial ? `Serial ${dspi.serial}` : undefined)
+      : statusLine(
+          "warn",
+          "DSPi not found yet",
+          "Check the three wires, and that the UART control interface is on in DSPi Console. " +
+            "You can carry on and fix this later.",
+        );
   const notifications =
     dspi?.found && dspi.notify_enable === false
       ? statusLine(
@@ -273,6 +291,7 @@ function networkStep(): HTMLElement[] {
       value: flow.ssid,
       autocomplete: "off",
       autocapitalize: "off",
+      autocorrect: "off",
       spellcheck: false,
       maxLength: SSID_MAX_BYTES,
       oninput: (event: Event) => {
@@ -280,7 +299,7 @@ function networkStep(): HTMLElement[] {
         continueButton.disabled = flow.ssid.trim() === "";
       },
     });
-    const continueButton = button("Continue", () => chooseNetwork(flow.ssid.trim(), true), {
+    const continueButton = button("Continue", () => chooseNetwork(flow.ssid.trim(), true, false), {
       primary: true,
       disabled: flow.ssid.trim() === "",
     });
@@ -325,11 +344,12 @@ function passwordStep(): HTMLElement[] {
     value: flow.password,
     autocomplete: "current-password",
     autocapitalize: "off",
+    autocorrect: "off",
     spellcheck: false,
     maxLength: WIFI_PASSWORD_MAX_LENGTH,
     oninput: (event: Event) => {
       flow.password = (event.target as HTMLInputElement).value;
-      continueButton.disabled = !passwordFits(flow.password, flow.secure);
+      continueButton.disabled = !passwordOk();
     },
   }) as HTMLInputElement;
   const toggle = button(
@@ -342,9 +362,9 @@ function passwordStep(): HTMLElement[] {
     { small: true },
   );
   toggle.setAttribute("aria-controls", "password");
-  const continueButton = button("Continue", () => goTo("name"), {
+  const continueButton = button("Continue", () => void goToName(), {
     primary: true,
-    disabled: !passwordFits(flow.password, flow.secure),
+    disabled: !passwordOk(),
   });
 
   return present(
@@ -356,12 +376,30 @@ function passwordStep(): HTMLElement[] {
       el("label", { for: "password", text: "Wi-Fi password" }),
       el("div", { class: "input-row" }, field, toggle),
     ),
-    flow.secure
-      ? null
-      : el("p", { class: "dim small", text: "This network is open; leave the password empty." }),
+    passwordHint(),
     continueButton,
     button("Choose another network", () => goToNetworks()),
   );
+}
+
+/** Whether the typed password can go to the bridge. A network named by hand
+ * may be open or secured, so either an empty password or a real one will do. */
+function passwordOk(): boolean {
+  if (!flow.securityKnown) return flow.password === "" || passwordFits(flow.password, true);
+  return passwordFits(flow.password, flow.secure);
+}
+
+function passwordHint(): HTMLElement | null {
+  if (!flow.securityKnown) {
+    return el("p", {
+      class: "dim small",
+      text: "Leave this empty if the network has no password.",
+    });
+  }
+  if (!flow.secure) {
+    return el("p", { class: "dim small", text: "This network is open; leave the password empty." });
+  }
+  return null;
 }
 
 /** A 6-digit PIN field. `onInput` runs after each change to `value`. */
@@ -404,6 +442,7 @@ function pinSwitch(): HTMLElement {
     "aria-describedby": "pin-switch-help",
     onchange: (event: Event) => {
       flow.pinEnabled = (event.target as HTMLInputElement).checked;
+      flow.pinSwitchTouched = true;
       render();
       document.getElementById("pin-switch")?.focus();
     },
@@ -504,9 +543,11 @@ function nameStep(): HTMLElement[] {
     type: "text",
     id: "name",
     value: flow.name,
+    autocorrect: "off",
     maxLength: BRIDGE_NAME_MAX_LENGTH,
     oninput: (event: Event) => {
       flow.name = (event.target as HTMLInputElement).value;
+      flow.nameEdited = true;
       update();
     },
   });
@@ -621,15 +662,81 @@ function goTo(step: Step, error: string | null = null): void {
 // ---------------------------------------------------------------------------
 // Actions
 
+/**
+ * Reads the bridge's state again, keeping what the user chose on this page.
+ * The page cannot trust a reading taken earlier: an apply whose answer was
+ * lost may have set a PIN or started a join.
+ *
+ * @returns False when the bridge did not answer; the old state stays.
+ */
+async function refreshState(): Promise<boolean> {
+  try {
+    adoptState(await getState());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function adoptState(state: SetupState): void {
+  flow.state = state;
+  if (!flow.nameEdited) flow.name = state.name;
+  if (!flow.pinSwitchTouched) flow.pinEnabled = state.pin_required;
+}
+
+/**
+ * Shows Done when the bridge has joined a network after all, as when the
+ * phone lost the setup network during the join, or an apply's answer was lost.
+ *
+ * @returns True when it did.
+ */
+function showDoneIfJoined(): boolean {
+  const wifi = flow.state?.wifi;
+  if (wifi?.join !== "connected" || !wifi.saved_ssid) return false;
+  flow.ssid = wifi.saved_ssid;
+  goTo("done");
+  return true;
+}
+
 function goToNetworks(): void {
   goTo("network");
   if (flow.networks === null) {
     void scan();
   }
+  void refreshState().then((answered) => {
+    if (answered && flow.step === "network") showDoneIfJoined();
+  });
+}
+
+/** Shows the name step, then checks the bridge's name and PIN are still as shown. */
+async function goToName(): Promise<void> {
+  const shown = (): string => JSON.stringify([bridgeHasPin(), flow.pinEnabled, flow.name]);
+  const before = shown();
+  goTo("name");
+  if (!(await refreshState()) || flow.step !== "name" || showDoneIfJoined()) return;
+  if (shown() !== before) render();
+}
+
+/**
+ * After the bridge stopped answering during a join, keeps asking quietly for
+ * a while, since the phone usually rejoins the setup network by itself and
+ * the join may well have worked. Stops at the first answer, or once the user
+ * has moved on to entering a name.
+ */
+async function watchForJoin(): Promise<void> {
+  const deadline = Date.now() + WATCH_AFTER_DROP_MS;
+  while (Date.now() < deadline && (flow.step === "network" || flow.step === "password")) {
+    await delay(WATCH_INTERVAL_MS);
+    if (await refreshState()) {
+      if (flow.step === "network" || flow.step === "password") showDoneIfJoined();
+      return;
+    }
+  }
 }
 
 async function scan(): Promise<void> {
   flow.scanning = true;
+  flow.error = null;
   render();
   try {
     flow.networks = namedNetworks(await getNetworks());
@@ -642,12 +749,20 @@ async function scan(): Promise<void> {
   }
 }
 
-function chooseNetwork(ssid: string, secure: boolean): void {
+/**
+ * @param ssid The network.
+ * @param secure Whether it asks for a password.
+ * @param securityKnown False for a name typed by hand, whose security the
+ *   page cannot see.
+ */
+function chooseNetwork(ssid: string, secure: boolean, securityKnown = true): void {
   flow.ssid = ssid;
   flow.secure = secure;
+  flow.securityKnown = securityKnown;
   flow.typingName = false;
   flow.password = "";
-  goTo(secure ? "password" : "name");
+  if (secure) goTo("password");
+  else void goToName();
 }
 
 /** What the name step asks `apply` to do to the PIN. */
@@ -683,11 +798,17 @@ async function connect(): Promise<void> {
     flow.pinAfterApply = pinOnceApplied();
   } catch (error) {
     flow.error = (error as Error).message;
-    return;
-  } finally {
     flow.applying = false;
     render();
+    // The refusal may come from a reading taken too early (a PIN set since,
+    // which the step must now ask for), or the request may have worked with
+    // its answer lost on the way.
+    if (!(await refreshState())) return;
+    if (flow.state?.wifi.join === "connected") flow.pinAfterApply = pinOnceApplied();
+    if (!showDoneIfJoined() && flow.step === "name") render();
+    return;
   }
+  flow.applying = false;
   goTo("connecting");
   void waitForJoin();
 }
@@ -716,10 +837,11 @@ async function waitForJoin(): Promise<void> {
   let failures = 0;
   for (;;) {
     if (Date.now() > deadline) {
+      if ((await refreshState()) && showDoneIfJoined()) return;
       goTo("network", "The bridge took too long to join. Check the network and try again.");
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    await delay(POLL_INTERVAL_MS);
     let state: SetupState;
     try {
       state = await getState();
@@ -727,11 +849,12 @@ async function waitForJoin(): Promise<void> {
     } catch {
       if (++failures > POLL_FAILURES_ALLOWED) {
         goTo("network", "The bridge stopped answering. Rejoin its setup network and try again.");
+        void watchForJoin();
         return;
       }
       continue;
     }
-    flow.state = state;
+    adoptState(state);
     if (state.wifi.join === "connected") {
       goTo("done");
       return;
@@ -760,20 +883,27 @@ async function done(): Promise<void> {
 // Start
 
 async function start(): Promise<void> {
+  flow.name = "DSPi Bridge";
   render();
-  try {
-    flow.state = await getState();
-  } catch (error) {
-    flow.error = error instanceof SetupError ? error.message : "The bridge isn't answering.";
+  // A phone that has just joined the setup network may open this page before
+  // it can reach the bridge, so the first reading is tried a few times.
+  for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+    try {
+      adoptState(await getState());
+      flow.error = null;
+      break;
+    } catch (error) {
+      flow.error = error instanceof SetupError ? error.message : "The bridge isn't answering.";
+      render();
+      if (attempt < START_ATTEMPTS) await delay(START_RETRY_MS);
+    }
   }
-  flow.name = flow.state?.name ?? "DSPi Bridge";
-  flow.pinEnabled = flow.state?.pin_required ?? false;
-  if (flow.state?.wifi.join === "connected" && flow.state.wifi.saved_ssid) {
-    // The page was reopened after a join that worked.
-    flow.ssid = flow.state.wifi.saved_ssid;
-    flow.step = "done";
-  }
-  render();
+  // The page was reopened after a join that worked.
+  if (!showDoneIfJoined()) render();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 void start();

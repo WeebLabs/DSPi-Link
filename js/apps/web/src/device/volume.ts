@@ -97,7 +97,12 @@ export function createVolumeControl(
   });
   slider.addEventListener("change", () => {
     dragging = false;
-    writer.queue(muted ? MASTER_VOLUME_MUTE_DB : levelDb);
+    // Where the user let go, not levelDb: another client's change can land
+    // during the drag, and must not be what this one sends last.
+    levelDb = Number(slider.value);
+    muted = false;
+    render();
+    writer.queue(levelDb);
   });
   muteButton.addEventListener("click", () => {
     muted = !muted;

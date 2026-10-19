@@ -60,7 +60,11 @@ esp_err_t settings_save_device_name(const char *serial, const char *name);
 #define SETTINGS_WIFI_SSID_MAX_BYTES 32
 #define SETTINGS_WIFI_PASSWORD_MAX_BYTES 64
 
-/* ESP_ERR_NOT_FOUND when no network is saved. */
+/* Loads the saved network. ESP_ERR_NOT_FOUND when none is saved; another
+ * error when one is saved but cannot be read or is not valid (an empty or
+ * unterminated name), in which case `ssid` and `password` are untouched.
+ * The name and password are saved together, as one value, so they always
+ * belong to each other. */
 esp_err_t settings_load_wifi(char ssid[SETTINGS_WIFI_SSID_MAX_BYTES + 1],
                              char password[SETTINGS_WIFI_PASSWORD_MAX_BYTES + 1]);
 
@@ -74,9 +78,14 @@ esp_err_t settings_forget_wifi(void);
 
 /*
  * The PIN and paired clients, in the `auth` namespace (bridge spec 11), as
- * one opaque blob that hub_task.c lays out. ESP_ERR_NOT_FOUND when nothing
- * is saved or the saved blob has a different size, which happens only after
- * a firmware changes its layout; the bridge then starts with no PIN.
+ * one opaque blob that hub_task.c lays out.
+ *
+ * Returns ESP_OK with `size` bytes in `blob`; ESP_ERR_NOT_FOUND only when
+ * nothing has ever been saved, so the bridge may start with no PIN; or, when
+ * PIN data exists but cannot be used, any other error: ESP_ERR_INVALID_SIZE
+ * for a blob of another size (another firmware's layout), or the NVS error
+ * that stopped the read. Those mean a PIN may be set and could not be read,
+ * so the caller must not start open.
  */
 esp_err_t settings_load_auth(void *blob, size_t size);
 

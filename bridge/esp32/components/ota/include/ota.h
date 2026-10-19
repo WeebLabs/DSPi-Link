@@ -60,11 +60,19 @@ void ota_abort(void);
 
 /*
  * Step 7 of the boot sequence (bridge spec 6.5). If this image is new and
- * not yet confirmed, checks `healthy` after OTA_CONFIRM_AFTER_MS: true
- * confirms the image, false returns to the previous one at once. A crash or
- * restart before then also returns to the previous image, because the
- * bootloader sees the image still unconfirmed.
+ * not yet confirmed, asks `healthy` OTA_CONFIRM_AFTER_MS after the start
+ * and then every OTA_CONFIRM_RETRY_MS: the first true confirms the image
+ * (a confirmation that cannot be written is tried again). Still false
+ * OTA_CONFIRM_GIVE_UP_MS after the start, the previous image is restored
+ * at once. A crash or restart before confirmation also returns to the
+ * previous image, because the bootloader sees it still unconfirmed.
+ * `healthy` runs on ESP-IDF's timer task. Called once, by app_main.
  */
 void ota_confirm_after_healthy_start(bool (*healthy)(void));
+
+/* Confirms an image on trial at once if `healthy` says so; does nothing
+ * otherwise, or when no image is on trial. For a restart the user asked
+ * for, which would otherwise return to the previous firmware. Any task. */
+void ota_confirm_now_if_healthy(void);
 
 #endif /* OTA_H */

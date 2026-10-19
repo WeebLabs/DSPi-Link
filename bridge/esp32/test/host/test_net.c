@@ -150,6 +150,71 @@ static void forgetting_returns_to_setup(void)
     CHECK(!machine.station_wanted && !machine.has_network);
 }
 
+static void a_second_join_does_not_invent_a_saved_network(void)
+{
+    /* The setup page's Apply tapped twice on a new bridge: the first join
+     * never worked, so there is nothing to return to when the second fails. */
+    now = 1000;
+    net_machine_init(&machine, false, now);
+    net_machine_join(&machine, now);
+    net_machine_join(&machine, now + 500);
+    net_machine_tick(&machine, now + 500 + WIFI_JOIN_TIMEOUT_MS);
+    CHECK(machine.join == NET_JOIN_FAILED);
+    CHECK(!machine.restore_saved && !machine.has_network);
+    CHECK(machine.state == NET_STATE_SETUP && !machine.station_wanted);
+}
+
+static void a_second_join_still_returns_to_the_saved_network(void)
+{
+    now = 1000;
+    net_machine_init(&machine, true, now);
+    net_machine_connected(&machine, now);
+    net_machine_join(&machine, now);
+    net_machine_join(&machine, now + 500);
+    net_machine_tick(&machine, now + 500 + WIFI_JOIN_TIMEOUT_MS);
+    CHECK(machine.restore_saved && machine.state == NET_STATE_CONNECTING);
+}
+
+static void a_network_that_worked_is_returned_to(void)
+{
+    /* Set up from scratch, then moved on with hub.wifi.join: the first
+     * network has worked, so a failed second one returns to it. */
+    now = 1000;
+    net_machine_init(&machine, false, now);
+    net_machine_join(&machine, now);
+    net_machine_connected(&machine, now + 3000);
+    net_machine_join(&machine, now + 10000);
+    net_machine_tick(&machine, now + 10000 + WIFI_JOIN_TIMEOUT_MS);
+    CHECK(machine.restore_saved && machine.state == NET_STATE_CONNECTING);
+}
+
+static void the_setup_network_forgets_its_phones_when_it_goes_off(void)
+{
+    /* The phone that pressed Finish is still on the setup network when it
+     * goes off. The next time it comes back, nobody is on it, and the 60 s
+     * rule must apply again. */
+    now = 1000;
+    net_machine_init(&machine, true, now);
+    net_machine_tick(&machine, now + WIFI_FALLBACK_AFTER_MS);
+    CHECK(machine.state == NET_STATE_FALLBACK);
+    now += WIFI_FALLBACK_AFTER_MS + 1000;
+    net_machine_setup_clients(&machine, 1, now);
+    net_machine_connected(&machine, now);
+    net_machine_finish(&machine, now);
+    now += SETUP_NETWORK_FINISH_DELAY_MS;
+    net_machine_tick(&machine, now);
+    CHECK(!machine.setup_network_on && machine.setup_clients == 0);
+
+    net_machine_disconnected(&machine, now, false, false);
+    now += WIFI_FALLBACK_AFTER_MS;
+    net_machine_tick(&machine, now);
+    CHECK(machine.state == NET_STATE_FALLBACK && machine.setup_network_on);
+    now += 1000;
+    net_machine_connected(&machine, now);
+    net_machine_tick(&machine, now + SETUP_NETWORK_IDLE_OFF_MS);
+    CHECK(!machine.setup_network_on);
+}
+
 /* ---------------------------------------------------------------------------
  * DNS answers
  * ------------------------------------------------------------------------- */
@@ -219,6 +284,10 @@ void test_net(void)
     RUN(a_lost_network_brings_back_the_setup_network);
     RUN(a_phone_on_the_setup_network_keeps_it_up);
     RUN(forgetting_returns_to_setup);
+    RUN(a_second_join_does_not_invent_a_saved_network);
+    RUN(a_second_join_still_returns_to_the_saved_network);
+    RUN(a_network_that_worked_is_returned_to);
+    RUN(the_setup_network_forgets_its_phones_when_it_goes_off);
     RUN(every_name_points_at_the_bridge);
     RUN(other_types_get_an_empty_answer);
     RUN(malformed_queries_are_ignored);

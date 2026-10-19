@@ -3,14 +3,18 @@
 # Boots a built image twice in Espressif's QEMU, from the same flash, and
 # checks that the first boot creates the settings, the second keeps the same
 # hub id, and neither crashes on the way. This stands in for a real board
-# where none is attached. QEMU has no Wi-Fi radio, so each boot is stopped
-# once the startup summary is logged, before Wi-Fi starts: the test proves
-# the boot sequence and flash storage only.
+# where none is attached. QEMU cannot start Wi-Fi (the ESP32-S3 hangs in
+# radio calibration and the ESP32 fails an assertion), so each boot is
+# stopped where app_main is about to start the network: the test proves the
+# boot sequence up to that step (bridge spec 6.5: the BOOT button, flash
+# storage, settings and LED) and flash storage across a restart.
 #
 # Usage, after tools/build.sh <chip>:
 #   tools/qemu_smoke.sh esp32s3
 # or, to boot a full image made by tools/package_release.sh instead:
 #   tools/qemu_smoke.sh esp32s3 build/release/dspi-bridge-1.0.0-esp32s3.bin
+# or a build in another folder under bridge/esp32:
+#   BUILD_DIR=build/mine tools/qemu_smoke.sh esp32s3
 #
 # Supported chips: esp32, esp32s3, esp32c3 (QEMU has no ESP32-C6 machine).
 
@@ -21,6 +25,7 @@ REPO_DIR="$(cd "$BRIDGE_DIR/../.." && pwd)"
 IDF_VERSION="$(tr -d '[:space:]' < "$BRIDGE_DIR/idf_version.txt")"
 chip="${1:?usage: tools/qemu_smoke.sh <esp32|esp32s3|esp32c3> [full image]}"
 image="${2:-}" # Relative to bridge/esp32, which is /repo/bridge/esp32 in the container
+build_dir="${BUILD_DIR:-build/${chip}}" # Likewise
 
 case "${chip}" in
     esp32 | esp32s3) qemu=qemu-system-xtensa ;;
@@ -33,23 +38,24 @@ esac
 
 # Inside the container: merge the build into one 4 MB flash image, or pad
 # the full image given to 4 MB, then boot it twice. sed keeps the bridge's
-# own lines and any crash, and quits at the last line of the startup
-# summary, which ends that boot; QEMU then exits non-zero, which is expected,
-# so only a failure to make the flash image fails the container. The
-# original ESP32 is slow under emulation, hence the generous timeout.
+# own lines and any crash, and quits at the line app_main logs before it
+# starts the network, which ends that boot. QEMU then exits non-zero, which
+# is expected, so only a failure to make the flash image fails the
+# container. The original ESP32 is slow under emulation, hence the
+# generous timeout.
 boot_twice=$(cat <<SCRIPT
 set -euo pipefail
 command -v ${qemu} > /dev/null || { echo "${qemu} is not in this image" >&2; exit 1; }
 if [ -n "${image}" ]; then
     python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin 0x0 "${image}" > /dev/null
 else
-    (cd build/${chip} && python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin @flash_args > /dev/null)
+    (cd ${build_dir} && python -m esptool --chip ${chip} merge-bin --fill-flash-size 4MB -o /tmp/flash.bin @flash_args > /dev/null)
 fi
 for boot in 1 2; do
     echo "BOOT \${boot}"
     timeout 45 ${qemu} -nographic -machine ${chip} \
         -drive file=/tmp/flash.bin,if=mtd,format=raw 2>&1 |
-        sed -n -E '/I \([0-9]+\) (settings|bridge):|Guru Meditation|abort\(\)|assert failed/p; /bridge: DSPi UART/q' ||
+        sed -n -E '/I \([0-9]+\) (settings|bridge):|E \([0-9]+\) bridge:|Guru Meditation|abort\(\)|assert failed/p; /bridge: Starting the network/q' ||
         true
 done
 SCRIPT
@@ -81,6 +87,9 @@ fail() {
 }
 grep -qE "Guru Meditation|abort\(\)|assert failed" <<< "${log}" && fail "the firmware crashed"
 grep -q "First boot: saving factory settings" <<< "${first_boot}" || fail "first boot did not create settings"
+for boot in "${first_boot}" "${second_boot}"; do
+    grep -q "bridge: Starting the network" <<< "${boot}" || fail "a boot stopped before the network step"
+done
 grep -q "First boot" <<< "${second_boot}" && fail "second boot created settings again"
 [[ -n "${first_id}" ]] || fail "first boot did not log a hub id"
 [[ "${first_id}" == "${second_id}" ]] || fail "hub id changed between boots"

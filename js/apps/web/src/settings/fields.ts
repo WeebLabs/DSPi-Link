@@ -111,6 +111,7 @@ export function textField(
       value,
       maxLength,
       autocapitalize: "off",
+      autocorrect: "off",
       spellcheck: false,
       onInput: (event: Event) => onInput((event.target as HTMLInputElement).value),
     }),
@@ -226,17 +227,6 @@ export function explain(error: unknown): string {
     }
   }
   return describeProblem(error, "bridge");
-}
-
-/**
- * Whether two plain values hold the same data.
- *
- * @param first One value.
- * @param second The other.
- * @returns True when their JSON is the same.
- */
-export function sameJson(first: unknown, second: unknown): boolean {
-  return JSON.stringify(first) === JSON.stringify(second);
 }
 
 /**

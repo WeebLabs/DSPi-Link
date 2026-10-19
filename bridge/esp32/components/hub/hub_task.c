@@ -45,6 +45,7 @@
 #include "freertos/task.h"
 #include "http_server.h"
 #include "hub.h"
+#include "hub_internal.h"
 #include "net.h"
 #include "ota.h"
 #include "psa/crypto.h"
@@ -64,15 +65,16 @@ typedef enum {
     EVENT_SESSION_MESSAGE,
     EVENT_SESSION_ACTIVITY,
     EVENT_SESSION_CLOSED, /* Lifecycle */
-    EVENT_DEVICE_FOUND,   /* Lifecycle; the identity is in task_state.found_identity */
+    EVENT_DEVICE_FOUND,   /* Lifecycle; the identity and rate are in task_state.device */
     EVENT_DEVICE_LOST,    /* Lifecycle */
     EVENT_NOTIFICATION,
     EVENT_REPLY,
-    EVENT_REPLY_LATER,    /* A Wi-Fi scan's result, for hub_reply_later() */
+    EVENT_REPLY_LATER,    /* A Wi-Fi scan's result, for hub_reply_later(); no body: it failed */
     EVENT_CALL,           /* Run `call` on the hub task (hub_task_*() functions) */
     EVENT_UPDATE_WRITTEN, /* Lifecycle: the ota task wrote a chunk */
     EVENT_UPDATE_DONE,    /* Lifecycle: the ota task checked the image; `data` is its text */
     EVENT_RESTART,        /* Lifecycle: hub_task_restart(), for the BOOT button */
+    NO_DEVICE_CHANGE,     /* Never posted: task_state.device has nothing waiting */
 } event_type_t;
 
 /* A function to run on the hub task for another task, and its result. */
@@ -91,9 +93,8 @@ typedef struct {
     uint8_t *data;   /* Heap: a session's message, or an update's text */
     uint8_t *buffer; /* From the pool: an answer's or a notification's bytes */
     size_t length;
-    uint32_t tag;
-    dspi_reply_t reply; /* EVENT_REPLY; its payload is `buffer` */
-    uint32_t baud;
+    uint32_t tag;              /* EVENT_REPLY's request; a device change's number */
+    dspi_reply_t reply;        /* EVENT_REPLY; its payload is `buffer` */
     uint32_t address;          /* EVENT_SESSION_OPENED */
     uint16_t session_id;       /* EVENT_REPLY_LATER */
     int request_id;            /* EVENT_REPLY_LATER */
@@ -114,10 +115,31 @@ static struct {
     QueueHandle_t free_small;
     QueueHandle_t free_large;
 
-    /* The latest identity the uart task reported, for EVENT_DEVICE_FOUND;
-     * kept here rather than allocated per event. */
-    dspi_identity_t found_identity;
-    portMUX_TYPE found_identity_lock;
+    /* The device as the uart task last reported it: the identity and rate
+     * for EVENT_DEVICE_FOUND, kept here rather than allocated per event,
+     * and a change whose event found no place in the queue, which the hub
+     * task then picks up on its next tick. Each change is numbered (the
+     * event's `tag`), so one picked up late is never applied after a newer
+     * one, nor an older event after it. */
+    struct {
+        dspi_identity_t identity;
+        uint32_t baud;
+        uint32_t reported;     /* The last change's number; the uart task's */
+        event_type_t unposted; /* EVENT_DEVICE_FOUND or _LOST, or NO_DEVICE_CHANGE */
+        uint32_t unposted_number;
+        uint32_t applied; /* The last change the hub took; the hub task's */
+        portMUX_TYPE lock;
+    } device;
+
+    /* What was dropped or not sent since the counts were last logged
+     * (HUB_DROP_LOG_INTERVAL_MS); any task adds, the hub task logs. */
+    struct {
+        atomic_uint events;        /* Ordinary events that found the queue full */
+        atomic_uint notifications; /* Notifications with no buffer free */
+        atomic_uint answers;       /* Answers with no buffer, delivered as timeouts */
+        atomic_uint device;        /* Device changes left for the next tick */
+        atomic_uint messages;      /* JSON messages a session's queue would not take */
+    } dropped;
 
     /* The /dspi/v1/info document and the hub's name, refreshed on the hub
      * task whenever the hub advertises, and copied by other tasks. */
@@ -129,14 +151,15 @@ static struct {
     esp_timer_handle_t restart_timer;
     _Atomic hub_restart_level_t restart_level; /* Written by the hub task, read by the timer */
     _Atomic uint32_t last_loop_ms;             /* For hub_task_is_alive(), from any task */
-} task_state = {.found_identity_lock = portMUX_INITIALIZER_UNLOCKED};
+} task_state = {.device = {.unposted = NO_DEVICE_CHANGE, .lock = portMUX_INITIALIZER_UNLOCKED}};
 
 static uint8_t small_buffers[HUB_EVENT_SMALL_BUFFERS][HUB_EVENT_SMALL_BUFFER_BYTES];
 static uint8_t large_buffers[HUB_EVENT_LARGE_BUFFERS][HUB_EVENT_LARGE_BUFFER_BYTES];
 
 /* The PIN and paired clients as saved: a layout number, then the store. A
- * firmware that changes hub_auth_store_t changes the size, and the old blob
- * is then ignored (settings_load_auth). */
+ * firmware that changes hub_auth_store_t changes the size, and
+ * settings_load_auth() then refuses the old blob; either way the hub keeps
+ * the PIN on rather than start open (start_hub()). */
 typedef struct {
     uint32_t layout;
     hub_auth_store_t store;
@@ -209,7 +232,12 @@ static void pool_give(uint8_t *buffer)
 
 static void release_event(hub_event_t *event)
 {
-    free(event->data);
+    if (event->type == EVENT_SESSION_MESSAGE || event->type == EVENT_SESSION_ACTIVITY) {
+        /* Gives the session back its share (http_server.h). */
+        http_server_message_done(event->slot, event->data, event->length);
+    } else {
+        free(event->data);
+    }
     pool_give(event->buffer);
     cJSON_Delete(event->body);
 }
@@ -233,13 +261,21 @@ static bool post_ordinary(const hub_event_t *event, uint32_t timeout_ms)
     }
 }
 
-/* Posts an ordinary event, or drops it, releasing what it carries. */
+/* Posts an ordinary event, waiting up to `timeout_ms`, or drops it,
+ * releasing what it carries and counting it. */
+static bool post_within(hub_event_t *event, uint32_t timeout_ms)
+{
+    if (post_ordinary(event, timeout_ms)) {
+        return true;
+    }
+    atomic_fetch_add(&task_state.dropped.events, 1);
+    release_event(event);
+    return false;
+}
+
 static void post(hub_event_t *event)
 {
-    if (!post_ordinary(event, HUB_EVENT_POST_TIMEOUT_MS)) {
-        ESP_LOGE(TAG, "Hub queue full; dropped event %d", (int)event->type);
-        release_event(event);
-    }
+    (void)post_within(event, HUB_EVENT_POST_TIMEOUT_MS);
 }
 
 /* Posts a lifecycle event, which may use the reserve. */
@@ -321,31 +357,56 @@ static void on_update_finished(void *context, uint32_t generation, bool ok, cons
  * Producers: the uart task's handlers (on its task)
  * ------------------------------------------------------------------------- */
 
+/* Reports the device coming (EVENT_DEVICE_FOUND) or going (_LOST). The
+ * event may use the reserve but waits only briefly; if it still finds no
+ * place, the change is left in task_state.device for the hub task's next
+ * tick. Uart task only. */
+static void report_device_change(event_type_t type)
+{
+    const uint32_t number = task_state.device.reported + 1;
+    task_state.device.reported = number;
+
+    const hub_event_t event = {.type = type, .tag = number};
+    if (xQueueSend(task_state.events, &event, pdMS_TO_TICKS(HUB_UART_LIFECYCLE_POST_WAIT_MS)) ==
+        pdTRUE) {
+        return;
+    }
+    taskENTER_CRITICAL(&task_state.device.lock);
+    task_state.device.unposted = type;
+    task_state.device.unposted_number = number;
+    taskEXIT_CRITICAL(&task_state.device.lock);
+    atomic_fetch_add(&task_state.dropped.device, 1);
+}
+
 static void on_device_found(void *context, const dspi_identity_t *identity, uint32_t baud)
 {
     (void)context;
-    taskENTER_CRITICAL(&task_state.found_identity_lock);
-    task_state.found_identity = *identity;
-    taskEXIT_CRITICAL(&task_state.found_identity_lock);
-    post_lifecycle(&(hub_event_t){.type = EVENT_DEVICE_FOUND, .baud = baud});
+    taskENTER_CRITICAL(&task_state.device.lock);
+    task_state.device.identity = *identity;
+    task_state.device.baud = baud;
+    taskEXIT_CRITICAL(&task_state.device.lock);
+    report_device_change(EVENT_DEVICE_FOUND);
 }
 
 static void on_device_lost(void *context)
 {
     (void)context;
-    post_lifecycle(&(hub_event_t){.type = EVENT_DEVICE_LOST});
+    report_device_change(EVENT_DEVICE_LOST);
 }
 
+/* Answers and notifications are posted without waiting: the uart task must
+ * get back to the wire (HUB_UART_LIFECYCLE_POST_WAIT_MS). */
 static void on_notification(void *context, const uint8_t *packet, size_t length)
 {
     (void)context;
     uint8_t *buffer = pool_take(length);
     if (buffer == NULL) {
-        ESP_LOGE(TAG, "No buffer for a %u-byte notification; dropped", (unsigned)length);
+        atomic_fetch_add(&task_state.dropped.notifications, 1);
         return; /* The seq gap makes every client re-read (bridge spec 8.4) */
     }
     memcpy(buffer, packet, length);
-    post(&(hub_event_t){.type = EVENT_NOTIFICATION, .buffer = buffer, .length = length});
+    (void)post_within(
+        &(hub_event_t){.type = EVENT_NOTIFICATION, .buffer = buffer, .length = length}, 0);
 }
 
 static void on_reply(void *context, uint32_t tag, const dspi_reply_t *reply)
@@ -360,12 +421,13 @@ static void on_reply(void *context, uint32_t tag, const dspi_reply_t *reply)
         } else {
             /* Still delivered, so the request finishes and its client hears
              * back, but as a timeout with nothing in it. */
-            ESP_LOGE(TAG, "No buffer for a %u-byte answer; reported as a timeout",
-                     (unsigned)reply->length);
+            atomic_fetch_add(&task_state.dropped.answers, 1);
             event.reply = (dspi_reply_t){.kind = DSPI_REPLY_TIMEOUT};
         }
     }
-    post(&event);
+    /* Dropped if the queue is full: the hub finishes the request as lost
+     * when the next answer comes, or after HUB_REPLY_LOST_AFTER_MS. */
+    (void)post_within(&event, 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -378,8 +440,10 @@ static bool io_send_text(void *context, int slot, const char *text, size_t lengt
     const bool sent = http_server_send(slot, false, (const uint8_t *)text, length);
     if (!sent) {
         /* A JSON reply or event lost is worth knowing about; a dropped
-         * NOTIFY or POLL frame is routine under load and is not logged. */
-        ESP_LOGW(TAG, "Session %d: could not queue a %u-byte message", slot, (unsigned)length);
+         * NOTIFY or POLL frame is routine under load and is not counted. A
+         * client that never reads would otherwise get a log line for every
+         * request it sends (HUB_DROP_LOG_INTERVAL_MS). */
+        atomic_fetch_add(&task_state.dropped.messages, 1);
     }
     return sent;
 }
@@ -414,11 +478,35 @@ static uint32_t io_now_ms(void *context)
     return now_ms();
 }
 
+/* True once the uart task reports the link on `tx_pin` and `rx_pin`,
+ * waiting up to HUB_UART_MOVE_WAIT_MS: dspi_uart_reconfigure() only queues
+ * the move, which the uart task makes between requests. */
+static bool wait_for_uart_pins(uint8_t tx_pin, uint8_t rx_pin)
+{
+    const uint32_t started_ms = now_ms();
+    for (;;) {
+        dspi_uart_status_t link;
+        dspi_uart_get_status(&link);
+        if (link.tx_pin == tx_pin && link.rx_pin == rx_pin) {
+            return true;
+        }
+        if (now_ms() - started_ms >= HUB_UART_MOVE_WAIT_MS) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 /* Saves and applies new settings (bridge spec 8.11). Only what changed is
  * touched: the UART moves for new pins or rate, mDNS for a new hostname,
  * the status LED for a new type or pin. The name reaches DNS-SD through
  * the hub's advertise() that follows. A part that fails stays as it was in
- * task_state.settings, so asking again retries it. */
+ * task_state.settings, so asking again retries it.
+ *
+ * The UART and the LED may trade pins in one change, and each resets the
+ * pins it gives up. So the LED is turned off first, freeing its old pin
+ * before the UART can take it; then the UART moves; and the LED starts on
+ * its new pin last, after the UART has left it if it was the UART's. */
 static bool io_apply_settings(void *context, const bridge_settings_t *settings)
 {
     (void)context;
@@ -431,8 +519,21 @@ static bool io_apply_settings(void *context, const bridge_settings_t *settings)
     const bridge_settings_t old = task_state.settings;
     bridge_settings_t running = *settings;
     bool applied = true;
-    if (old.uart_tx_pin != settings->uart_tx_pin || old.uart_rx_pin != settings->uart_rx_pin ||
-        old.uart_baud != settings->uart_baud ||
+
+    const bool led_changes = old.led_type != settings->led_type || old.led_pin != settings->led_pin;
+    bool led_off = false;
+    if (led_changes && old.led_type != SETTINGS_LED_NONE) {
+        err = status_led_configure(SETTINGS_LED_NONE, BOARD_PIN_NONE);
+        led_off = err == ESP_OK;
+        if (!led_off) {
+            ESP_LOGE(TAG, "Could not turn the status LED off: %s", esp_err_to_name(err));
+        }
+    }
+
+    const bool uart_moves =
+        old.uart_tx_pin != settings->uart_tx_pin || old.uart_rx_pin != settings->uart_rx_pin;
+    bool uart_moved = !uart_moves;
+    if (uart_moves || old.uart_baud != settings->uart_baud ||
         old.uart_detect_baud != settings->uart_detect_baud) {
         err = dspi_uart_reconfigure(settings->uart_tx_pin, settings->uart_rx_pin,
                                     settings->uart_baud, settings->uart_detect_baud);
@@ -454,12 +555,22 @@ static bool io_apply_settings(void *context, const bridge_settings_t *settings)
             applied = false;
         }
     }
-    if (old.led_type != settings->led_type || old.led_pin != settings->led_pin) {
-        err = status_led_configure(settings->led_type, settings->led_pin);
+    if (led_changes) {
+        /* A pin the UART is giving up is free only once it has moved. */
+        const bool takes_uart_pin =
+            settings->led_type != SETTINGS_LED_NONE &&
+            (settings->led_pin == old.uart_tx_pin || settings->led_pin == old.uart_rx_pin);
+        if (takes_uart_pin && uart_moves && !uart_moved) {
+            uart_moved = running.uart_tx_pin == settings->uart_tx_pin &&
+                         wait_for_uart_pins(settings->uart_tx_pin, settings->uart_rx_pin);
+        }
+        err = takes_uart_pin && !uart_moved
+                  ? ESP_ERR_INVALID_STATE /* The UART still holds the pin */
+                  : status_led_configure(settings->led_type, settings->led_pin);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Could not change the status LED: %s", esp_err_to_name(err));
-            running.led_type = old.led_type;
-            running.led_pin = old.led_pin;
+            running.led_type = led_off ? SETTINGS_LED_NONE : old.led_type;
+            running.led_pin = led_off ? BOARD_PIN_NONE : old.led_pin;
             applied = false;
         }
     }
@@ -515,6 +626,9 @@ static void scan_task(void *argument)
     free(networks);
     atomic_store(&task_state.scan_running, false);
 
+    /* Without a body the hub answers with an error, so the request never
+     * goes unanswered. This task has nothing else to do, so it waits as
+     * long as a call from another task would for a place. */
     hub_event_t event = {.type = EVENT_REPLY_LATER,
                          .slot = request.slot,
                          .session_id = request.session_id,
@@ -522,8 +636,9 @@ static void scan_task(void *argument)
                          .body = body};
     if (body == NULL) {
         ESP_LOGE(TAG, "No memory for the Wi-Fi scan's answer");
-    } else {
-        post(&event);
+    }
+    if (!post_within(&event, HUB_CALL_TIMEOUT_MS)) {
+        ESP_LOGE(TAG, "Hub queue full; the Wi-Fi scan's answer was lost");
     }
     vTaskDelete(NULL);
 }
@@ -557,10 +672,14 @@ static bool io_wifi_join(void *context, const char *ssid, const char *password)
 }
 
 /* Erases what the level says, then restarts (Link spec 7.13). Runs from a
- * timer, so the replies and close frames have gone out first. */
+ * timer, so the replies and close frames have gone out first. A firmware
+ * still on trial that is running properly is confirmed first: the restart
+ * was asked for, and must not quietly return to the previous firmware
+ * (bridge spec 14.2). */
 static void restart_now(void *argument)
 {
     (void)argument;
+    ota_confirm_now_if_healthy();
     esp_err_t err = ESP_OK;
     switch (atomic_load(&task_state.restart_level)) {
     case HUB_RESTART_ONLY:
@@ -793,13 +912,64 @@ static void io_update_abort(void *context)
  * The loop
  * ------------------------------------------------------------------------- */
 
-static void handle_device_found(hub_t *hub, uint32_t baud)
+/* Applies device change `number`, unless a later one has been applied
+ * already. A found device takes the identity and rate last reported. */
+static void handle_device_change(hub_t *hub, event_type_t change, uint32_t number)
 {
-    dspi_identity_t identity;
-    taskENTER_CRITICAL(&task_state.found_identity_lock);
-    identity = task_state.found_identity;
-    taskEXIT_CRITICAL(&task_state.found_identity_lock);
+    if ((int32_t)(number - task_state.device.applied) <= 0) {
+        return; /* Older than one already applied */
+    }
+    task_state.device.applied = number;
+    if (change == EVENT_DEVICE_LOST) {
+        hub_device_lost(hub);
+        return;
+    }
+    taskENTER_CRITICAL(&task_state.device.lock);
+    const dspi_identity_t identity = task_state.device.identity;
+    const uint32_t baud = task_state.device.baud;
+    taskEXIT_CRITICAL(&task_state.device.lock);
     hub_device_found(hub, &identity, baud);
+}
+
+/* Applies a device change whose event found no place in the queue. */
+static void handle_unposted_device_change(hub_t *hub)
+{
+    taskENTER_CRITICAL(&task_state.device.lock);
+    const event_type_t change = task_state.device.unposted;
+    const uint32_t number = task_state.device.unposted_number;
+    task_state.device.unposted = NO_DEVICE_CHANGE;
+    taskEXIT_CRITICAL(&task_state.device.lock);
+    if (change != NO_DEVICE_CHANGE) {
+        handle_device_change(hub, change, number);
+    }
+}
+
+/* Answers a Wi-Fi scan whose answer could not be built. */
+static void reply_scan_failed(hub_t *hub, const hub_event_t *event)
+{
+    const hub_session_t *session = hub_open_session(hub, event->slot);
+    if (session != NULL && session->id == event->session_id) {
+        hub_reply_error(hub, event->slot, event->request_id, "internal",
+                        "the bridge ran out of memory for the scan");
+    }
+}
+
+/* Logs what was dropped since the last call, in one line. Hub task. */
+static void log_drops(void)
+{
+    const unsigned events = atomic_exchange(&task_state.dropped.events, 0);
+    const unsigned notifications = atomic_exchange(&task_state.dropped.notifications, 0);
+    const unsigned answers = atomic_exchange(&task_state.dropped.answers, 0);
+    const unsigned device = atomic_exchange(&task_state.dropped.device, 0);
+    const unsigned messages = atomic_exchange(&task_state.dropped.messages, 0);
+    if (events + notifications + answers + device + messages == 0) {
+        return;
+    }
+    ESP_LOGW(TAG,
+             "In the last %d s: %u events dropped (hub queue full), %u notifications and %u "
+             "answers without a buffer, %u device changes deferred, %u messages not sent "
+             "(session queue full)",
+             HUB_DROP_LOG_INTERVAL_MS / 1000, events, notifications, answers, device, messages);
 }
 
 static void handle_event(hub_event_t *event)
@@ -824,10 +994,8 @@ static void handle_event(hub_event_t *event)
         http_server_release_slot(event->slot); /* Only now may the slot be reused */
         break;
     case EVENT_DEVICE_FOUND:
-        handle_device_found(hub, event->baud);
-        break;
     case EVENT_DEVICE_LOST:
-        hub_device_lost(hub);
+        handle_device_change(hub, event->type, event->tag);
         break;
     case EVENT_NOTIFICATION:
         hub_notification(hub, event->buffer, event->length);
@@ -837,6 +1005,10 @@ static void handle_event(hub_event_t *event)
         hub_reply(hub, event->tag, &event->reply);
         break;
     case EVENT_REPLY_LATER:
+        if (event->body == NULL) {
+            reply_scan_failed(hub, event);
+            break;
+        }
         hub_reply_later(hub, event->slot, event->session_id, event->request_id, event->body);
         event->body = NULL; /* The hub owns it now */
         break;
@@ -854,6 +1026,8 @@ static void handle_event(hub_event_t *event)
     case EVENT_RESTART:
         hub_restart(hub, event->level);
         break;
+    case NO_DEVICE_CHANGE:
+        break;
     }
     release_event(event);
 }
@@ -861,20 +1035,33 @@ static void handle_event(hub_event_t *event)
 static void hub_task(void *argument)
 {
     (void)argument;
+    const int64_t tick_us = (int64_t)HUB_TICK_MS * 1000;
     int64_t next_tick_us = esp_timer_get_time();
+    uint32_t last_drop_log_ms = now_ms();
     for (;;) {
+        /* Rounded up, so the task sleeps until the tick is due rather than
+         * spinning through its last part. */
         const int64_t wait_us = next_tick_us - esp_timer_get_time();
-        const TickType_t wait = wait_us > 0 ? pdMS_TO_TICKS((uint32_t)(wait_us / 1000)) : 0;
+        const TickType_t wait = wait_us > 0 ? pdMS_TO_TICKS((uint32_t)((wait_us + 999) / 1000)) : 0;
 
         atomic_store(&task_state.last_loop_ms, now_ms());
         hub_event_t event;
         if (xQueueReceive(task_state.events, &event, wait) == pdTRUE) {
             handle_event(&event);
         }
-        if (esp_timer_get_time() >= next_tick_us) {
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_tick_us) {
+            handle_unposted_device_change(&task_state.hub);
             hub_tick(&task_state.hub);
             http_server_service();
-            next_tick_us += (int64_t)HUB_TICK_MS * 1000;
+            /* After a long piece of work, carry on from now rather than
+             * running every missed tick back to back. */
+            next_tick_us =
+                now_us - next_tick_us >= tick_us ? now_us + tick_us : next_tick_us + tick_us;
+        }
+        if (now_ms() - last_drop_log_ms >= HUB_DROP_LOG_INTERVAL_MS) {
+            log_drops();
+            last_drop_log_ms = now_ms();
         }
     }
 }
@@ -904,14 +1091,28 @@ static hub_io_t hub_io_functions(void)
 }
 
 /* Starts the hub on `settings`, with the PIN and paired clients saved
- * before, if any. */
+ * before, if any. PIN data that exists but cannot be used (unreadable, or
+ * another firmware's layout) must not start the bridge open: the hub then
+ * keeps the PIN on until one is set again (hub_config_t.auth_unreadable). */
 static void start_hub(const bridge_settings_t *settings)
 {
+    static saved_auth_t saved; /* Too big for app_main's stack */
+    const esp_err_t loaded = settings_load_auth(&saved, sizeof(saved));
+    const bool have_saved = loaded == ESP_OK && saved.layout == SAVED_AUTH_LAYOUT;
+    const bool unreadable = loaded == ESP_OK ? !have_saved : loaded != ESP_ERR_NOT_FOUND;
+    if (unreadable) {
+        ESP_LOGE(TAG,
+                 "The saved PIN data cannot be used (%s); the PIN stays on until it is set "
+                 "again",
+                 loaded == ESP_OK ? "unknown layout" : esp_err_to_name(loaded));
+    }
+
     const hub_config_t config = {
         .settings = *settings,
         .board = board_table(),
         .version = esp_app_get_description()->version,
         .max_sessions = board_max_sessions(),
+        .auth_unreadable = unreadable,
     };
     const hub_io_t io = hub_io_functions();
     const hub_auth_io_t auth_io = {
@@ -922,9 +1123,6 @@ static void start_hub(const bridge_settings_t *settings)
         .unix_time = auth_unix_time,
         .save = auth_save,
     };
-    static saved_auth_t saved; /* Too big for app_main's stack */
-    const bool have_saved =
-        settings_load_auth(&saved, sizeof(saved)) == ESP_OK && saved.layout == SAVED_AUTH_LAYOUT;
     hub_init(&task_state.hub, &io, &config, &auth_io, have_saved ? &saved.store : NULL);
     ESP_LOGI(TAG, "Authentication: %s", hub_pin_enabled(&task_state.hub) ? "PIN" : "none");
 }
@@ -1094,7 +1292,12 @@ esp_err_t hub_task_set_pin(const char *pin)
 
 bool hub_task_is_alive(void)
 {
-    return now_ms() - atomic_load(&task_state.last_loop_ms) < HUB_ALIVE_WITHIN_MS;
+    /* The loop's time is read first: read after the clock, a loop that ran
+     * in between would look 49 days old. Signed, so a time just ahead of
+     * the clock read on another core still counts as alive. */
+    const uint32_t last_loop_ms = atomic_load(&task_state.last_loop_ms);
+    const int32_t age_ms = (int32_t)(now_ms() - last_loop_ms);
+    return age_ms < HUB_ALIVE_WITHIN_MS;
 }
 
 esp_err_t hub_task_restart(hub_restart_level_t level)

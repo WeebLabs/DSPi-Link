@@ -10,12 +10,15 @@
 #                                                 firmware" on the settings page
 #       SHA256SUMS
 #   build/site/      the installer page for GitHub Pages: installer/index.html,
-#                    an ESP Web Tools manifest and the full images
+#                    an ESP Web Tools manifest, the full images, and ESP Web
+#                    Tools itself, so the page loads no script from elsewhere
 #
 # The version is PROJECT_VER in CMakeLists.txt, the one the firmware reports.
 #
 # Usage:
 #   tools/package_release.sh
+#
+# Needs npm (for ESP Web Tools) and Docker (for esptool).
 
 set -euo pipefail
 
@@ -23,6 +26,12 @@ BRIDGE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_DIR="$(cd "$BRIDGE_DIR/../.." && pwd)"
 IDF_VERSION="$(tr -d '[:space:]' < "$BRIDGE_DIR/idf_version.txt")"
 CHIPS=(esp32 esp32s3 esp32c3 esp32c6)
+
+# ESP Web Tools, served from the installer's own origin. The integrity is
+# the npm registry's for this exact version (npm view esp-web-tools@<version>
+# dist.integrity); change both together.
+ESP_WEB_TOOLS_VERSION="10.4.0"
+ESP_WEB_TOOLS_INTEGRITY="sha512-3pwkeFFm5Fj7UQo8SJNYK5RXrtNCpq6X9QoI6bMT4GBZWgrJqjn0YvM9ihG74BtMoSFYXfmDtkehuxe50PTMPQ=="
 
 version=$(sed -n -E 's/^set\(PROJECT_VER "([^"]+)"\)$/\1/p' "$BRIDGE_DIR/CMakeLists.txt")
 if [[ -z "${version}" ]]; then
@@ -64,9 +73,25 @@ for chip in "${CHIPS[@]}"; do
 done
 (cd "${release}" && shasum -a 256 -- *.bin > SHA256SUMS)
 
-# The installer site: the page, the full images, and the manifest that tells
-# ESP Web Tools which image suits the chip it finds.
+# ESP Web Tools' self-contained web build, checked against the pinned
+# integrity before anything of it is used.
+vendor="$BRIDGE_DIR/build/esp-web-tools"
+rm -rf "${vendor}"
+mkdir -p "${vendor}"
+(cd "${vendor}" && npm pack --ignore-scripts --silent "esp-web-tools@${ESP_WEB_TOOLS_VERSION}" > /dev/null)
+tarball="${vendor}/esp-web-tools-${ESP_WEB_TOOLS_VERSION}.tgz"
+integrity="sha512-$(openssl dgst -sha512 -binary "${tarball}" | base64 | tr -d '\n')"
+if [[ "${integrity}" != "${ESP_WEB_TOOLS_INTEGRITY}" ]]; then
+    echo "esp-web-tools ${ESP_WEB_TOOLS_VERSION} does not match its pinned integrity" >&2
+    exit 1
+fi
+tar -xzf "${tarball}" -C "${vendor}"
+
+# The installer site: the page, ESP Web Tools, the full images, and the
+# manifest that tells ESP Web Tools which image suits the chip it finds.
 cp -R "$BRIDGE_DIR/installer" "${site}/installer"
+mkdir -p "${site}/installer/esp-web-tools"
+cp "${vendor}"/package/dist/web/*.js "${vendor}/package/LICENSE" "${site}/installer/esp-web-tools/"
 cp "${release}"/dspi-bridge-"${version}"-esp32*.bin "${site}/installer/"
 rm "${site}"/installer/*-update.bin
 cat > "${site}/installer/manifest.json" <<JSON

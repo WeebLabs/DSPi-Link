@@ -29,6 +29,9 @@ export interface LedConfig {
   pin: number | null;
 }
 
+/** The keys of the Bridge section: everything but the UART. */
+export type BridgeValues = Omit<BridgeConfig, "uart">;
+
 /** The bridge's configuration, from hub.config.get. */
 export interface BridgeConfig {
   name: string;
@@ -73,9 +76,13 @@ export interface SettingsState {
   choices: BridgeOptions | null;
   stats: BridgeStats | null;
   loadError: string | null;
-  /** Unsaved edits; null when the section shows the saved configuration. */
-  uartDraft: UartConfig | null;
-  bridgeDraft: Omit<BridgeConfig, "uart"> | null;
+  /** Unsaved edits, only of the keys the user changed; null when the section
+   * shows the saved configuration. Saving sends only these keys, so a change
+   * another admin made meanwhile to any other key is kept (Link spec 7.10). */
+  uartDraft: Partial<UartConfig> | null;
+  bridgeDraft: Partial<BridgeValues> | null;
+  /** The bridge's address after a hostname change this page saved. */
+  movedTo: string | null;
   wifiStep: WifiStep;
   networks: WifiNetwork[];
   joinSsid: string;
@@ -152,6 +159,7 @@ export function initialState(client: LinkClient): SettingsState {
     loadError: null,
     uartDraft: null,
     bridgeDraft: null,
+    movedTo: null,
     wifiStep: "idle",
     networks: [],
     joinSsid: "",

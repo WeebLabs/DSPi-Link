@@ -78,10 +78,18 @@ esp_err_t net_set_hostname(const char *hostname);
 
 /*
  * Lists nearby 2.4 GHz networks, strongest first and each name once, into
- * `networks` (room for `capacity`). Returns how many were written: 0 if the
- * scan failed. Blocks its caller for a few seconds, so call it from a task
- * that may wait (the HTTP server's or the hub's), never the event task.
+ * `networks` (room for `capacity`), and how many in `found`. Blocks its
+ * caller for a few seconds, so call it from a task that may wait (the HTTP
+ * server's or the hub's), never the event task. One scan runs at a time; a
+ * second caller waits up to WIFI_SCAN_LOCK_WAIT_MS for the first.
+ *
+ * Returns ESP_OK (with `found` possibly 0: no networks in range),
+ * ESP_ERR_TIMEOUT if another scan held the radio too long, or the driver's
+ * error. On error `found` is 0.
  */
+esp_err_t net_scan_networks(net_network_t *networks, size_t capacity, size_t *found);
+
+/* As net_scan_networks(), returning the count, or 0 if the scan failed. */
 size_t net_scan(net_network_t *networks, size_t capacity);
 
 /* Checks a network name and password before anything is changed. Any task. */
@@ -101,8 +109,10 @@ esp_err_t net_join(const char *ssid, const char *password);
 esp_err_t net_finish_setup(void);
 
 /* True when the socket `fd` was accepted on the setup network rather than
- * the home network. The setup API answers only there (bridge spec 9.3).
- * Any task, while the socket is open. */
+ * the home network: it was sent to the setup network's address, from an
+ * address on the setup network's subnet. The setup API answers only there
+ * (bridge spec 9.3). False if either address cannot be read. Any task,
+ * while the socket is open. */
 bool net_socket_is_on_setup_network(int fd);
 
 /* The setup network's address, "192.168.4.1". Any task. */

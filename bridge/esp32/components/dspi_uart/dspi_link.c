@@ -61,19 +61,63 @@ static uint32_t reply_timeout_ms(const dspi_link_t *link, const dspi_request_t *
  * Receiving
  * ------------------------------------------------------------------------- */
 
-/* Takes the next received byte, reading more from the UART if the chunk is
- * used up. Returns false if nothing arrives within `timeout_ms`. */
+/* Milliseconds since bytes last arrived. */
+static uint32_t quiet_ms(const dspi_link_t *link)
+{
+    return now_ms(link) - link->last_byte_ms;
+}
+
+/*
+ * Takes the next received byte, reading more from the UART if the chunk is
+ * used up. Returns false if nothing arrives within `timeout_ms`.
+ *
+ * Part way through a frame it waits no longer than the rest of
+ * DSPI_UART_FRAME_GAP_MS. If the line stays quiet that long, the frame is
+ * abandoned and its bytes wait in the parser to be searched again, so a
+ * false start (noise, a lost byte) cannot swallow the next real frame.
+ */
 static bool next_byte(dspi_link_t *link, uint32_t timeout_ms, uint8_t *byte)
 {
     if (link->chunk_next == link->chunk_count) {
+        uint32_t wait = timeout_ms;
+        const bool in_frame = dspi_parser_in_frame(&link->parser);
+        if (in_frame) {
+            const uint32_t quiet = quiet_ms(link);
+            const uint32_t gap_left =
+                quiet < DSPI_UART_FRAME_GAP_MS ? DSPI_UART_FRAME_GAP_MS - quiet : 0;
+            wait = gap_left < wait ? gap_left : wait;
+        }
         link->chunk_count =
-            link->port.read(link->port.context, link->chunk, sizeof(link->chunk), timeout_ms);
+            link->port.read(link->port.context, link->chunk, sizeof(link->chunk), wait);
         link->chunk_next = 0;
         if (link->chunk_count == 0) {
+            if (in_frame && quiet_ms(link) >= DSPI_UART_FRAME_GAP_MS) {
+                dspi_parser_abandon(&link->parser);
+            }
             return false;
         }
+        link->last_byte_ms = now_ms(link);
     }
     *byte = link->chunk[link->chunk_next++];
+    return true;
+}
+
+/* Parses one byte: the next one waiting to be rescanned, or else the next
+ * received one. Returns false if neither came within `timeout_ms`.
+ * `received` says which it was. */
+static bool parse_next(dspi_link_t *link, uint32_t timeout_ms, dspi_parse_result_t *result,
+                       dspi_frame_t *frame, bool *received)
+{
+    *received = false;
+    if (dspi_parser_rescan(&link->parser, result, frame)) {
+        return true;
+    }
+    uint8_t byte;
+    if (!next_byte(link, timeout_ms, &byte)) {
+        return false;
+    }
+    *received = true;
+    *result = dspi_parser_feed(&link->parser, byte, frame);
     return true;
 }
 
@@ -120,7 +164,10 @@ static bool matches(const dspi_frame_t *frame, expected_answer_t expected)
 /*
  * Parses received bytes until the expected answer arrives or `deadline`
  * passes, relaying every notification on the way. Any other answer is a
- * late one to an earlier request and is dropped.
+ * late one to an earlier request and is dropped. Once the deadline has
+ * passed, bytes already received are still parsed, up to
+ * DSPI_UART_LATE_PARSE_BYTES, since the answer may have arrived in time
+ * while the uart task was held up.
  *
  * saw_corrupt: set when a damaged frame of the expected type arrived, which
  *              may have been the answer. A damaged notification is not.
@@ -128,18 +175,26 @@ static bool matches(const dspi_frame_t *frame, expected_answer_t expected)
 static wait_result_t receive_until(dspi_link_t *link, expected_answer_t expected, uint32_t deadline,
                                    dspi_frame_t *answer, bool *saw_corrupt)
 {
+    size_t late_bytes_left = DSPI_UART_LATE_PARSE_BYTES;
     for (;;) {
         const uint32_t remaining = remaining_ms(link, deadline);
-        if (remaining == 0) {
+        if (remaining == 0 && late_bytes_left == 0) {
             return WAIT_TIMED_OUT;
         }
-        uint8_t byte;
-        if (!next_byte(link, remaining, &byte)) {
+        dspi_parse_result_t result;
+        dspi_frame_t frame;
+        bool received;
+        if (!parse_next(link, remaining, &result, &frame, &received)) {
+            if (remaining == 0 && !dspi_parser_rescan_pending(&link->parser)) {
+                return WAIT_TIMED_OUT; /* Nothing more had arrived */
+            }
             continue; /* The loop re-checks the deadline */
         }
+        if (received && remaining == 0) {
+            late_bytes_left--;
+        }
 
-        dspi_frame_t frame;
-        switch (dspi_parser_feed(&link->parser, byte, &frame)) {
+        switch (result) {
         case DSPI_PARSE_FRAME:
             if (frame.type == DSPI_FRAME_TYPE_NOTIFICATION) {
                 relay_notification(link, &frame);
@@ -182,13 +237,17 @@ static void drain_until_silent(dspi_link_t *link)
     dspi_parser_reset(&link->parser);
 
     while (remaining_ms(link, give_up_at) > 0) {
-        uint8_t byte;
-        if (!next_byte(link, DSPI_UART_QUARANTINE_SILENCE_MS, &byte)) {
+        dspi_parse_result_t result;
+        dspi_frame_t frame;
+        bool received;
+        if (!parse_next(link, DSPI_UART_QUARANTINE_SILENCE_MS, &result, &frame, &received)) {
+            if (dspi_parser_rescan_pending(&link->parser) ||
+                quiet_ms(link) < DSPI_UART_QUARANTINE_SILENCE_MS) {
+                continue; /* An abandoned frame to search, or not yet silent */
+            }
             break; /* Silent long enough */
         }
-        dspi_frame_t frame;
-        if (dspi_parser_feed(&link->parser, byte, &frame) == DSPI_PARSE_FRAME &&
-            frame.type == DSPI_FRAME_TYPE_NOTIFICATION) {
+        if (result == DSPI_PARSE_FRAME && frame.type == DSPI_FRAME_TYPE_NOTIFICATION) {
             relay_notification(link, &frame);
         }
     }
@@ -210,6 +269,7 @@ void dspi_link_init(dspi_link_t *link, const dspi_port_t *port, uint32_t baud, u
     link->notification_context = handler_context;
     dspi_parser_init(&link->parser, buffer, capacity);
     link->last_reply_ms = now_ms(link);
+    link->last_byte_ms = link->last_reply_ms;
 }
 
 bool dspi_link_set_baud(dspi_link_t *link, uint32_t baud)
@@ -261,6 +321,9 @@ static void note_no_answer(dspi_link_t *link, bool timed_out)
     dspi_parser_reset(&link->parser);
     if (timed_out) {
         link->counters.timeouts++;
+    }
+    if (link->probing) {
+        return; /* Each probe changes the rate, which already flushes the receiver */
     }
     if (++link->unanswered_in_a_row < DSPI_UART_UNANSWERED_BEFORE_REINSTALL) {
         return;
@@ -373,14 +436,37 @@ const dspi_link_counters_t *dspi_link_counters(const dspi_link_t *link)
  * Finding the device
  * ------------------------------------------------------------------------- */
 
-/* The heartbeat and the baud probe: the interface status, the cheapest read
- * there is. */
+/* The baud probe: the interface status, the cheapest read there is. */
 static const dspi_request_t IFACE_STATUS_REQUEST = {
     .is_get = true, .request = REQ_GET_CTRL_IFACE_STATUS, .length = IFACE_STATUS_BYTES};
 
-bool dspi_link_heartbeat(dspi_link_t *link)
+static const dspi_request_t SERIAL_REQUEST = {
+    .is_get = true, .request = REQ_GET_SERIAL, .length = DSPI_SERIAL_MAX_CHARS};
+
+/* Copies a serial number's characters into `out` (DSPI_SERIAL_MAX_CHARS + 1
+ * bytes): raw bytes padded with NULs, so it stops at the first NUL. */
+static void copy_serial(const uint8_t *bytes, size_t length, char *out)
 {
-    return dspi_link_transact(link, &IFACE_STATUS_REQUEST, true).kind == DSPI_REPLY_ANSWERED;
+    size_t count = 0;
+    while (count < length && count < DSPI_SERIAL_MAX_CHARS && bytes[count] != 0) {
+        out[count] = (char)bytes[count];
+        count++;
+    }
+    out[count] = '\0';
+}
+
+dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial)
+{
+    const dspi_reply_t reply = dspi_link_transact(link, &SERIAL_REQUEST, true);
+    if (reply.kind != DSPI_REPLY_ANSWERED) {
+        return DSPI_HEARTBEAT_NO_ANSWER;
+    }
+    if (reply.status != DSPI_STATUS_OK) {
+        return DSPI_HEARTBEAT_SAME_DEVICE; /* Busy, say: it is there, and nothing says it changed */
+    }
+    char answered[DSPI_SERIAL_MAX_CHARS + 1];
+    copy_serial(reply.payload, reply.length, answered);
+    return strcmp(answered, serial) == 0 ? DSPI_HEARTBEAT_SAME_DEVICE : DSPI_HEARTBEAT_OTHER_DEVICE;
 }
 
 /* Asks for the interface status at `baud`. Any answer at all, even an error
@@ -393,8 +479,9 @@ static bool answers_at(dspi_link_t *link, uint32_t baud)
     return dspi_link_transact(link, &IFACE_STATUS_REQUEST, false).kind == DSPI_REPLY_ANSWERED;
 }
 
-bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
-                         size_t count)
+/* Tries `first_baud`, then each candidate not already tried. */
+static bool answers_at_any(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
+                           size_t count)
 {
     if (answers_at(link, first_baud)) {
         return true;
@@ -404,10 +491,21 @@ bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t 
             return true;
         }
     }
-    /* If the port refuses, the link stays at the last rate tried, and
-     * dspi_link_baud() still reports it truthfully. */
-    (void)dspi_link_set_baud(link, first_baud);
     return false;
+}
+
+bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
+                         size_t count)
+{
+    link->probing = true;
+    const bool found = answers_at_any(link, first_baud, candidates, count);
+    link->probing = false;
+    if (!found) {
+        /* If the port refuses, the link stays at the last rate tried, and
+         * dspi_link_baud() still reports it truthfully. */
+        (void)dspi_link_set_baud(link, first_baud);
+    }
+    return found;
 }
 
 /* Reads up to `capacity` bytes of a GET into `out`. Returns the number of
@@ -429,15 +527,12 @@ bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)
 {
     memset(identity, 0, sizeof(*identity));
 
-    /* The serial is raw bytes padded with NULs; stop at the first NUL. */
     uint8_t serial[DSPI_SERIAL_MAX_CHARS];
     const int serial_length = read_get(link, REQ_GET_SERIAL, serial, sizeof(serial));
     if (serial_length <= 0) {
         return false;
     }
-    for (int i = 0; i < serial_length && serial[i] != 0; i++) {
-        identity->serial[i] = (char)serial[i];
-    }
+    copy_serial(serial, (size_t)serial_length, identity->serial);
     if (identity->serial[0] == '\0') {
         return false;
     }

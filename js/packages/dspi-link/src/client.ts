@@ -26,6 +26,7 @@ import {
   type PollFrame,
   type ResyncFrame,
   LinkStatus,
+  ResyncReason,
   decodeFrame,
   encodeFrame,
 } from "./frames.js";
@@ -148,8 +149,18 @@ export interface LinkClientOptions {
 export interface ConnectOptions {
   /** Name the hub shows in its client list. */
   clientName: string;
-  /** Stored pairing token, if this client has one for this hub. */
+  /**
+   * Stored pairing token, if this client has one. It is tied to the first hub
+   * that answers, and never offered to a hub with another id. Prefer
+   * `tokenFor`, which picks the token by the id in the hub's hello.
+   */
   token?: string;
+  /**
+   * Looks up the token stored for a hub id (Link spec 6.2), called once the
+   * hub's hello has said which hub answered, on every connection, including
+   * reconnects. Return null or undefined when there is none.
+   */
+  tokenFor?: (hubId: string) => string | null | undefined;
   /** The application's name, sent in hello. */
   app?: string;
   /** The application's version, sent in hello. */
@@ -207,10 +218,17 @@ export interface LinkClientEventMap {
   devices: DeviceInfo[];
   notify: NotifyFrame;
   poll: PollFrame;
+  /**
+   * Re-read the device's state (Link spec 8.6). Sent for the hub's RESYNC
+   * frames, and also by the client itself, with reason 0, when it sees a gap
+   * in the NOTIFY sequence or in the firmware's `seq` (Link spec 8.3).
+   */
   resync: ResyncFrame;
   message: LinkMessage;
   /** The hub's configuration changed, by this session or another (Link spec 7.10). */
   hubConfig: HubConfig;
+  /** The hub refused or revoked the token held for `hubId`; forget the stored copy. */
+  tokenRejected: { hubId: string };
   error: Error;
   close: LinkCloseInfo;
 }
@@ -255,6 +273,13 @@ const ABANDONED_CLOSE_CODE = 1006;
 /** Error codes that mean the hub refused the stored token itself. */
 const TOKEN_REJECTION_CODES: ReadonlySet<string> = new Set(["unauthenticated", "denied"]);
 
+/** NOTIFY tags are u16 (Link spec 8.3); the firmware's `seq` is a u8. */
+const NOTIFY_TAG_MASK = 0xffff;
+const FIRMWARE_SEQ_MASK = 0xff;
+/** A v2 notification packet: version byte 2, and `seq` at byte 3. */
+const NOTIFY_PACKET_VERSION = 2;
+const NOTIFY_PACKET_SEQ_OFFSET = 3;
+
 /** One session to a hub. See the file comment. */
 export class LinkClient {
   private socket: WebSocketInstance | null = null;
@@ -270,7 +295,14 @@ export class LinkClient {
   private _role: LinkRole | null = null;
   private _policy: PolicyDescriptor | null = null;
   private _token: string | null = null;
+  /** The hub `_token` belongs to; null until a hello has said which hub answered. */
+  private tokenHubId: string | null = null;
   private devices = new Map<number, DeviceInfo>();
+
+  /** The last NOTIFY tag of this session, to spot a gap (Link spec 8.3). */
+  private lastNotifyTag: number | null = null;
+  /** Per device, the firmware `seq` of the last notification packet. */
+  private readonly lastFirmwareSeq = new Map<number, number>();
 
   private nextId = 1;
   private nextTag = 1;
@@ -449,6 +481,7 @@ export class LinkClient {
     this.url = url;
     this.connectOptions = options;
     this._token = options.token ?? null;
+    this.tokenHubId = null;
     this.manualClose = false;
     this.reconnectAttempt = 0;
     return this.open();
@@ -543,6 +576,10 @@ export class LinkClient {
   }
 
   private onOpen(): void {
+    // A new session numbers its NOTIFY frames afresh, and anything missed
+    // while disconnected is re-read on reconnecting anyway.
+    this.lastNotifyTag = null;
+    this.lastFirmwareSeq.clear();
     this.setState("handshaking");
     this.send({
       t: "hello",
@@ -581,7 +618,7 @@ export class LinkClient {
       this.options.reconnect && !this.manualClose && !FINAL_CLOSE_REASONS.has(reason);
 
     this.failPending(new Error(`connection closed (${code})`));
-    if (reason === "revoked") this._token = null;
+    if (reason === "revoked") this.dropToken();
     this.emit("close", { code, reason, willReconnect, message });
     this.rejectHandshake(new Error(`connection closed during handshake (${code})`));
 
@@ -651,6 +688,10 @@ export class LinkClient {
   private onDeviceUpdate(device: DeviceInfo): void {
     const previous = this.devices.get(device.handle);
     this.devices.set(device.handle, device);
+    // A device that is new or back has restarted its notification `seq`.
+    if (!previous || (previous.state !== "online" && device.state === "online")) {
+      this.lastFirmwareSeq.delete(device.handle);
+    }
     this.emit("devices", this.deviceList);
     // A device going offline ends its poll subscriptions at the hub (Link
     // spec 7.6), so they are sent again when it comes back.
@@ -664,6 +705,7 @@ export class LinkClient {
   private onDeviceRemoved(handle: number | undefined): void {
     if (handle === undefined || !this.devices.delete(handle)) return;
     this.pollSubscriptions.delete(handle);
+    this.lastFirmwareSeq.delete(handle);
     this.emit("devices", this.deviceList);
   }
 
@@ -687,6 +729,7 @@ export class LinkClient {
         return;
       }
       case "notify":
+        this.checkNotifySequence(frame);
         this.emit("notify", frame);
         return;
       case "poll":
@@ -703,6 +746,35 @@ export class LinkClient {
     }
   }
 
+  /**
+   * A missed notification shows as a gap in the session's NOTIFY tags or in a
+   * device's firmware `seq`; either way the client must re-read (Link spec
+   * 8.3 and 12). The tag counts every device's notifications, so a gap there
+   * could have been about any of them.
+   */
+  private checkNotifySequence(frame: NotifyFrame): void {
+    const stale = new Set<number>();
+    const expectedTag =
+      this.lastNotifyTag === null ? frame.tag : (this.lastNotifyTag + 1) & NOTIFY_TAG_MASK;
+    if (frame.tag !== expectedTag) {
+      for (const handle of this.devices.keys()) stale.add(handle);
+      stale.add(frame.handle);
+    }
+    this.lastNotifyTag = frame.tag;
+
+    const packet = frame.packet;
+    if (packet.length > NOTIFY_PACKET_SEQ_OFFSET && packet[0] === NOTIFY_PACKET_VERSION) {
+      const seq = packet[NOTIFY_PACKET_SEQ_OFFSET];
+      const last = this.lastFirmwareSeq.get(frame.handle);
+      if (last !== undefined && seq !== ((last + 1) & FIRMWARE_SEQ_MASK)) stale.add(frame.handle);
+      this.lastFirmwareSeq.set(frame.handle, seq);
+    }
+
+    for (const handle of stale) {
+      this.emit("resync", { type: "resync", tag: 0, handle, reason: ResyncReason.NOTIFY_DROPPED });
+    }
+  }
+
   private onHubHello(hello: HelloHubMessage): void {
     this._hub = hello;
     const socket = this.socket;
@@ -713,10 +785,11 @@ export class LinkClient {
       this.setState("authenticating");
       const { clientName, role } = this.connectOptions;
       this.sendPair(OPEN_ACCESS_PIN, clientName, role).catch((error: unknown) =>
-        this.onAuthFailed(asError(error), socket),
+        this.onOpenAccessPairFailed(asError(error), socket),
       );
       return;
     }
+    this.chooseToken(hello.hub?.id ?? null);
     if (this._token) {
       this.setState("authenticating");
       this.sendToken(this._token).catch((error: unknown) =>
@@ -745,10 +818,53 @@ export class LinkClient {
     if (socket !== this.socket) return;
     this.emit("error", error);
     if (error instanceof LinkProtocolError && TOKEN_REJECTION_CODES.has(error.code)) {
-      this._token = null;
+      this.dropToken();
     }
     this.setState("awaiting_pairing");
     this.settleHandshake();
+  }
+
+  /**
+   * An open-access hub opened the session with its hello (Link spec 6.1);
+   * the auth.pair was only to learn the session id. If it fails, the session
+   * goes on without one, as an admin, rather than asking for a PIN the hub
+   * does not want. Echo suppression is then off for this session.
+   */
+  private onOpenAccessPairFailed(error: Error, socket: WebSocketInstance | null): void {
+    if (socket !== this.socket) return;
+    this.emit("error", error);
+    void this.onAuthenticated({ t: "ok", id: 0, role: "admin" });
+  }
+
+  /**
+   * Picks the token to present to the hub whose hello just arrived. A token
+   * held for another hub is never offered: a different hub now answers at
+   * this address. With `tokenFor`, the token is looked up by the hub's id.
+   */
+  private chooseToken(hubId: string | null): void {
+    if (this._token && this.tokenHubId !== null && this.tokenHubId !== hubId) {
+      this._token = null;
+      this.tokenHubId = null;
+    }
+    if (!this._token && hubId !== null && this.connectOptions.tokenFor) {
+      this._token = this.connectOptions.tokenFor(hubId) ?? null;
+    }
+    if (this._token) this.tokenHubId = hubId;
+  }
+
+  /** Forgets a token the hub refused or revoked, and says so. */
+  private dropToken(): void {
+    const hubId = this.tokenHubId ?? this.hubId;
+    const had = this._token !== null;
+    this._token = null;
+    this.tokenHubId = null;
+    if (had && hubId) this.emit("tokenRejected", { hubId });
+  }
+
+  /** Keeps a token the hub just issued, tied to the hub that issued it. */
+  private keepToken(token: string | null): void {
+    this._token = token;
+    this.tokenHubId = token === null ? null : this.hubId;
   }
 
   private async sendPair(pin: string, name: string, role?: LinkRole): Promise<string | null> {
@@ -763,7 +879,7 @@ export class LinkClient {
     this._session = reply.session ?? null;
     this._role = reply.role ?? null;
     this._policy = reply.policy ?? null;
-    if (typeof reply.token === "string") this._token = reply.token;
+    if (typeof reply.token === "string") this.keepToken(reply.token);
     this.setState("ready");
     this.reconnectAttempt = 0;
     this.startPing();
@@ -968,8 +1084,27 @@ export class LinkClient {
     await this.request({ t: "poll.unsubscribe", id: 0, handle, slots });
   }
 
+  /**
+   * Sends every remembered subscription again on a new session, from the
+   * fresh device list. A handle the hub no longer has is forgotten (its
+   * device.removed went by while disconnected); an offline device is left
+   * until it comes back online. Each handle is restored on its own, so one
+   * failure never costs another device its feed.
+   */
   private async restorePollSubscriptions(): Promise<void> {
-    for (const handle of this.pollSubscriptions.keys()) await this.restorePolls(handle);
+    for (const handle of [...this.pollSubscriptions.keys()]) {
+      const device = this.devices.get(handle);
+      if (!device) {
+        this.pollSubscriptions.delete(handle);
+        continue;
+      }
+      if (device.state !== "online") continue;
+      try {
+        await this.restorePolls(handle);
+      } catch (error) {
+        this.emit("error", asError(error));
+      }
+    }
   }
 
   private async restorePolls(handle: number): Promise<void> {
@@ -1093,7 +1228,15 @@ export class LinkClient {
     const message: HubAuthSetMessage = { t: "hub.auth.set", id: 0, mode };
     if (pin !== undefined) message.pin = pin;
     const reply = await this.request(message);
-    this._token = typeof reply.token === "string" ? reply.token : null;
+    this.keepToken(typeof reply.token === "string" ? reply.token : null);
+    // The hello this session began with no longer says how the hub
+    // authenticates; keep it truthful for whoever reads `hub` next.
+    if (this._hub) {
+      const hello: HelloHubMessage = { ...this._hub, auth: mode };
+      if (mode === "pin") hello.pin_source = pin === undefined ? "window" : "fixed";
+      else delete hello.pin_source;
+      this._hub = hello;
+    }
     return this._token;
   }
 

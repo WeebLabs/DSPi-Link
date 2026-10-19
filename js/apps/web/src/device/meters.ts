@@ -34,6 +34,9 @@ export function createMeters(): Meters {
   let bars: HTMLElement[] = [];
   let cells: HTMLElement[] = [];
   let labels: string[] = [];
+  /** What the clip line says now; it is rewritten only when that changes,
+   * since it is read out each time it is. */
+  let clipWords = "";
 
   const root = el(
     "div",
@@ -42,7 +45,9 @@ export function createMeters(): Meters {
       "div",
       { class: "row spread" },
       el("h2", { text: "Meters", style: "margin:0" }),
-      el("span", { class: "row", role: "status" }, cpuText, clipText),
+      // The CPU figures change ten times a second, so they stay out of the
+      // live region; only a change in clipping is read out.
+      el("span", { class: "row" }, cpuText, el("span", { role: "status" }, clipText)),
     ),
     strip,
   );
@@ -51,6 +56,8 @@ export function createMeters(): Meters {
     root,
     build(inputs: number, outputs: number): void {
       clear(strip);
+      clipWords = "";
+      clipText.textContent = "";
       labels = channelLabels(inputs, outputs);
       bars = [];
       cells = [];
@@ -78,8 +85,12 @@ export function createMeters(): Meters {
         if (isClipped) clipped.push(labels[channel]);
       }
       cpuText.textContent = `CPU ${frame.cpu0}% / ${frame.cpu1}%`;
-      clipText.textContent = clipped.length ? `Clipping: ${clipped.join(", ")}` : "";
-      clipText.className = clipped.length ? "stat error" : "stat dim";
+      const words = clipped.length ? `Clipping: ${clipped.join(", ")}` : "";
+      if (words !== clipWords) {
+        clipWords = words;
+        clipText.textContent = words;
+        clipText.className = clipped.length ? "stat error" : "stat dim";
+      }
     },
   };
 }

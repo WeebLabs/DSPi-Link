@@ -69,6 +69,8 @@ static uint32_t now_ms(void *context)
 static bool apply_settings(void *context, const bridge_settings_t *settings)
 {
     fake_hub_io_t *fake = context;
+    fake->attempted = *settings;
+    fake->apply_attempts++;
     if (fake->refuse_apply) {
         return false;
     }

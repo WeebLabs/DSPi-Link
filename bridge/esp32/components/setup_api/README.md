@@ -2,7 +2,9 @@
 
 The setup network's small HTTP API (bridge spec 9.3), used by the setup
 page: the bridge's state, nearby networks, applying the choices and
-finishing. It answers only on the setup network.
+finishing. It answers only on the setup network, only to requests
+addressed to the setup address (192.168.4.1), and takes POSTs only as
+`application/json`, so a web page elsewhere cannot call it.
 
 | File | What it does | Portable |
 |------|--------------|----------|

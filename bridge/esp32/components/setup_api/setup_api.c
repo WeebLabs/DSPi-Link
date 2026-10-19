@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "board.h"
 #include "bridge_config.h"
@@ -204,9 +205,15 @@ static esp_err_t get_networks(httpd_req_t *request)
         ESP_LOGW(TAG, "No memory to list networks");
         return httpd_resp_send_500(request);
     }
-    const size_t count = net_scan(networks, SETUP_API_MAX_NETWORKS);
-    cJSON *body = networks_document(networks, count);
+    size_t count = 0;
+    const esp_err_t err = net_scan_networks(networks, SETUP_API_MAX_NETWORKS, &count);
+    cJSON *body = err == ESP_OK ? networks_document(networks, count) : NULL;
     free(networks);
+    if (err != ESP_OK) {
+        /* Not an empty list: the page would say no networks are in range. */
+        return send_error(request, "503 Service Unavailable", "busy",
+                          "The bridge could not look for networks just then. Try again.");
+    }
     return send_json(request, "200 OK", body);
 }
 
@@ -405,8 +412,37 @@ static void request_host(httpd_req_t *request, char *host, size_t size)
     host[strcspn(host, ":")] = '\0';
 }
 
-static esp_err_t route_api(httpd_req_t *request, const char *endpoint)
+/* True when the request's Content-Type is application/json, with or
+ * without parameters such as a charset. */
+static bool is_json_request(httpd_req_t *request)
 {
+    static const char JSON_TYPE[] = "application/json";
+    char type[64];
+    if (httpd_req_get_hdr_value_str(request, "Content-Type", type, sizeof(type)) != ESP_OK) {
+        return false; /* Missing, or too long to be this */
+    }
+    const size_t length = sizeof(JSON_TYPE) - 1;
+    return strncasecmp(type, JSON_TYPE, length) == 0 &&
+           (type[length] == '\0' || type[length] == ';' || type[length] == ' ');
+}
+
+/* The API answers only the setup page itself (bridge spec 9.3). The captive
+ * DNS gives every name the bridge's address, so a page from anywhere,
+ * still open in a browser on the setup network, could otherwise call the
+ * API under its own name (DNS rebinding) and read the answers. A browser
+ * sends a cross-site POST without asking the server first only for three
+ * form content types; application/json is not one, and port 80 answers no
+ * such question, so requiring it stops a page elsewhere posting blind. */
+static esp_err_t route_api(httpd_req_t *request, const char *host, const char *endpoint)
+{
+    if (strcmp(host, net_setup_address()) != 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Open the setup page at http://%s/.", net_setup_address());
+        return send_bad_request(request, msg);
+    }
+    if (request->method != HTTP_GET && !is_json_request(request)) {
+        return send_bad_request(request, "The request must be sent as application/json.");
+    }
     const bool is_get = request->method == HTTP_GET;
     if (is_get && strcmp(endpoint, "state") == 0) {
         return get_state(request);
@@ -436,7 +472,7 @@ esp_err_t setup_api_handle(httpd_req_t *request)
     ESP_LOGI(TAG, "%s http://%s%s", request->method == HTTP_GET ? "GET" : "POST", host, path);
 
     if (strncmp(path, API_PREFIX, strlen(API_PREFIX)) == 0) {
-        return route_api(request, path + strlen(API_PREFIX));
+        return route_api(request, host, path + strlen(API_PREFIX));
     }
     /* Any other host is a phone's connectivity check or a page the phone
      * wanted from the internet. */

@@ -29,6 +29,10 @@ let dialogCount = 0;
  */
 export function confirmAction(options: ConfirmOptions, signal?: AbortSignal): Promise<boolean> {
   if (signal?.aborted) return Promise.resolve(false);
+  // Safari before 15.4 has no <dialog>; the browser's own box says the same.
+  if (typeof HTMLDialogElement !== "function" || !("showModal" in HTMLDialogElement.prototype)) {
+    return Promise.resolve(window.confirm([options.title, ...options.body].join("\n\n")));
+  }
   return new Promise((resolve) => {
     const titleId = `confirm-title-${++dialogCount}`;
     const cancel = el("button", { type: "button", text: "Cancel" });

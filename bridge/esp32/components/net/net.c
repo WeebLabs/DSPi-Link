@@ -33,6 +33,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "mdns.h"
@@ -73,17 +74,20 @@ static struct {
     esp_netif_t *setup;
     esp_timer_handle_t retry_timer;
     esp_timer_handle_t tick_timer;
+    SemaphoreHandle_t scan_lock; /* One scan at a time (net_scan_networks) */
+    StaticSemaphore_t scan_lock_storage;
     char setup_ssid[33];
 
     /* Event task only. */
     net_machine_t machine;
     credentials_t saved;  /* The network that last worked; empty ssid if none */
+    bool saved_unwritten; /* `saved` could not be written to flash yet */
     credentials_t trying; /* The network the station is set to */
     bool setup_active;    /* The setup network is up */
     bool station_active;  /* The station should be connecting or connected */
     bool attempt_open;    /* A connect is under way, with no outcome yet */
     uint32_t attempt_started_ms;
-    bool associated; /* Joined to an access point, address or not */
+    bool associated; /* Joined to `trying`'s access point, address or not */
     unsigned password_failures;
     size_t retries;
     bool dns_started;
@@ -347,6 +351,9 @@ static void stop_station(void)
     }
     net_state.station_active = false;
     net_state.attempt_open = false;
+    /* Whatever the station was joined to, it is leaving; events still
+     * queued from that network must not count for the next (on_got_address). */
+    net_state.associated = false;
     const esp_err_t stopped = esp_timer_stop(net_state.retry_timer);
     if (stopped != ESP_OK && stopped != ESP_ERR_INVALID_STATE) {
         warn_on_error(stopped, "Stopping the Wi-Fi retry timer");
@@ -446,16 +453,22 @@ static void on_station_disconnected(const wifi_event_sta_disconnected_t *event)
     }
 }
 
+/* The network being tried has given an address: from now on it is the one
+ * to return to. If flash refuses it, it is still returned to until the
+ * bridge restarts, and the save is tried again at the next connection. */
 static void save_working_credentials(void)
 {
-    if (strcmp(net_state.trying.ssid, net_state.saved.ssid) == 0 &&
-        strcmp(net_state.trying.password, net_state.saved.password) == 0) {
+    const bool same = strcmp(net_state.trying.ssid, net_state.saved.ssid) == 0 &&
+                      strcmp(net_state.trying.password, net_state.saved.password) == 0;
+    if (same && !net_state.saved_unwritten) {
         return;
     }
     net_state.saved = net_state.trying;
     const esp_err_t err = settings_save_wifi(net_state.saved.ssid, net_state.saved.password);
+    net_state.saved_unwritten = err != ESP_OK;
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Could not save the Wi-Fi network: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Could not save the Wi-Fi network (%s); trying again at the next connection",
+                 esp_err_to_name(err));
     }
 }
 
@@ -463,6 +476,15 @@ static void on_got_address(const ip_event_got_ip_t *event)
 {
     char ip[16];
     snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+    /* An address counts only for the network now being tried. One still
+     * queued from the network the station has just left (a join was asked
+     * for as it arrived) would otherwise save the new network's credentials
+     * untried (Link spec 7.11). The station leaving drops the link, so that
+     * address is lost anyway. */
+    if (!net_state.station_active || !net_state.associated) {
+        ESP_LOGW(TAG, "Ignoring address %s from a network the station has left", ip);
+        return;
+    }
     net_state.retries = 0;
     net_state.password_failures = 0;
     net_state.attempt_open = false;
@@ -512,6 +534,15 @@ static void on_join_requested(const credentials_t *credentials)
     apply();
 }
 
+/* Joined an access point. Counts only if it is the network being tried, not
+ * one the station has just been told to leave. */
+static void on_station_connected(const wifi_event_sta_connected_t *event)
+{
+    const size_t length = strlen(net_state.trying.ssid);
+    net_state.associated = net_state.station_active && event->ssid_len == length &&
+                           memcmp(event->ssid, net_state.trying.ssid, length) == 0;
+}
+
 static void on_wifi_event(int32_t id, void *data)
 {
     switch (id) {
@@ -519,7 +550,7 @@ static void on_wifi_event(int32_t id, void *data)
         apply(); /* The driver is ready: connect if a network is wanted */
         break;
     case WIFI_EVENT_STA_CONNECTED:
-        net_state.associated = true;
+        on_station_connected(data);
         break;
     case WIFI_EVENT_STA_DISCONNECTED:
         on_station_disconnected(data);
@@ -687,25 +718,39 @@ static esp_err_t run_scan(void)
     return err;
 }
 
+esp_err_t net_scan_networks(net_network_t *networks, size_t capacity, size_t *found)
+{
+    *found = 0;
+    if (xSemaphoreTake(net_state.scan_lock, pdMS_TO_TICKS(WIFI_SCAN_LOCK_WAIT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "Wi-Fi scan refused: another is still running");
+        return ESP_ERR_TIMEOUT;
+    }
+    wifi_ap_record_t *records = NULL;
+    esp_err_t err = run_scan();
+    if (err == ESP_OK) {
+        records = calloc(WIFI_SCAN_MAX_RESULTS, sizeof(wifi_ap_record_t));
+        if (records == NULL) {
+            warn_on_error(esp_wifi_clear_ap_list(), "Freeing the scan's results");
+            err = ESP_ERR_NO_MEM;
+        }
+    }
+    if (err == ESP_OK) {
+        uint16_t count = WIFI_SCAN_MAX_RESULTS;
+        err = esp_wifi_scan_get_ap_records(&count, records);
+        if (err == ESP_OK) {
+            *found = collect_networks(records, count, networks, capacity);
+        }
+    }
+    free(records);
+    xSemaphoreGive(net_state.scan_lock);
+    warn_on_error(err, "Scanning for Wi-Fi networks");
+    return err;
+}
+
 size_t net_scan(net_network_t *networks, size_t capacity)
 {
-    esp_err_t err = run_scan();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(err));
-        return 0;
-    }
-    uint16_t count = WIFI_SCAN_MAX_RESULTS;
-    wifi_ap_record_t *records = calloc(WIFI_SCAN_MAX_RESULTS, sizeof(wifi_ap_record_t));
-    if (records == NULL) {
-        ESP_LOGW(TAG, "No memory for the Wi-Fi scan's results");
-        warn_on_error(esp_wifi_clear_ap_list(), "Freeing the scan's results");
-        return 0;
-    }
-    err = esp_wifi_scan_get_ap_records(&count, records);
-    warn_on_error(err, "Reading the scan's results");
-    const size_t found = err == ESP_OK ? collect_networks(records, count, networks, capacity) : 0;
-    free(records);
-    return found;
+    size_t found = 0;
+    return net_scan_networks(networks, capacity, &found) == ESP_OK ? found : 0;
 }
 
 const char *net_setup_address(void)
@@ -713,30 +758,53 @@ const char *net_setup_address(void)
     return "192.168.4.1"; /* ESP-IDF's default for the access point interface */
 }
 
+/* The IPv4 address in `address`, which the IPv6 servers report as
+ * ::ffff:a.b.c.d. False for a real IPv6 address, which the setup network
+ * never has. */
+static bool ipv4_of(const struct sockaddr_storage *address, uint32_t *ipv4)
+{
+    static const uint8_t V4_MAPPED_PREFIX[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+    if (address->ss_family == AF_INET) {
+        *ipv4 = ((const struct sockaddr_in *)address)->sin_addr.s_addr;
+        return true;
+    }
+    if (address->ss_family != AF_INET6) {
+        return false;
+    }
+    const uint8_t *bytes = ((const struct sockaddr_in6 *)address)->sin6_addr.s6_addr;
+    if (memcmp(bytes, V4_MAPPED_PREFIX, sizeof(V4_MAPPED_PREFIX)) != 0) {
+        return false;
+    }
+    memcpy(ipv4, bytes + sizeof(V4_MAPPED_PREFIX), sizeof(*ipv4));
+    return true;
+}
+
 bool net_socket_is_on_setup_network(int fd)
 {
     struct sockaddr_storage local;
-    socklen_t length = sizeof(local);
-    if (getsockname(fd, (struct sockaddr *)&local, &length) != 0) {
+    socklen_t local_length = sizeof(local);
+    struct sockaddr_storage peer;
+    socklen_t peer_length = sizeof(peer);
+    uint32_t local_ip = 0;
+    uint32_t peer_ip = 0;
+    if (getsockname(fd, (struct sockaddr *)&local, &local_length) != 0 ||
+        getpeername(fd, (struct sockaddr *)&peer, &peer_length) != 0 ||
+        !ipv4_of(&local, &local_ip) || !ipv4_of(&peer, &peer_ip)) {
         return false;
     }
-
-    /* The servers listen on IPv6, so IPv4 arrives as ::ffff:a.b.c.d. A real
-     * IPv6 address is never the setup network's, which has none. */
-    static const uint8_t V4_MAPPED_PREFIX[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
-    uint32_t address = 0;
-    if (local.ss_family == AF_INET) {
-        address = ((const struct sockaddr_in *)&local)->sin_addr.s_addr;
-    } else if (local.ss_family == AF_INET6) {
-        const uint8_t *bytes = ((const struct sockaddr_in6 *)&local)->sin6_addr.s6_addr;
-        if (memcmp(bytes, V4_MAPPED_PREFIX, sizeof(V4_MAPPED_PREFIX)) != 0) {
-            return false;
-        }
-        memcpy(&address, bytes + sizeof(V4_MAPPED_PREFIX), sizeof(address));
-    }
     esp_netif_ip_info_t setup_ip;
-    return esp_netif_get_ip_info(net_state.setup, &setup_ip) == ESP_OK &&
-           address == setup_ip.ip.addr;
+    if (esp_netif_get_ip_info(net_state.setup, &setup_ip) != ESP_OK) {
+        return false;
+    }
+    /* lwIP accepts a packet for any of the bridge's addresses on any
+     * interface, so the address the request was sent to is not enough: a
+     * computer on the home network could route 192.168.4.1 through the
+     * bridge. The sender must be on the setup network's subnet too, which
+     * such a computer cannot be, since the answers to that address go out
+     * on the setup network. */
+    const uint32_t mask = setup_ip.netmask.addr;
+    return local_ip == setup_ip.ip.addr && peer_ip != setup_ip.ip.addr &&
+           (peer_ip & mask) == (setup_ip.ip.addr & mask);
 }
 
 /* ---------------------------------------------------------------------------
@@ -777,8 +845,15 @@ static esp_err_t start_wifi(void)
     /* The bridge keeps credentials itself (bridge spec 11). */
     ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "Wi-Fi storage");
 
-    const bool have_saved =
-        settings_load_wifi(net_state.saved.ssid, net_state.saved.password) == ESP_OK;
+    const esp_err_t loaded = settings_load_wifi(net_state.saved.ssid, net_state.saved.password);
+    const bool have_saved = loaded == ESP_OK;
+    if (!have_saved) {
+        memset(&net_state.saved, 0, sizeof(net_state.saved));
+        if (loaded != ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "The saved Wi-Fi network cannot be read (%s); starting setup",
+                     esp_err_to_name(loaded));
+        }
+    }
     net_state.trying = net_state.saved;
     net_machine_init(&net_state.machine, have_saved, now_ms());
 
@@ -827,6 +902,7 @@ esp_err_t net_start(const char *hostname)
     ESP_RETURN_ON_ERROR(esp_event_handler_register(NET_EVENTS, ESP_EVENT_ANY_ID, on_event, NULL),
                         TAG, "network requests");
 
+    net_state.scan_lock = xSemaphoreCreateMutexStatic(&net_state.scan_lock_storage);
     const esp_timer_create_args_t retry = {.callback = post_retry, .name = "wifi_retry"};
     ESP_RETURN_ON_ERROR(esp_timer_create(&retry, &net_state.retry_timer), TAG, "retry timer");
     const esp_timer_create_args_t tick = {.callback = post_tick, .name = "net_tick"};

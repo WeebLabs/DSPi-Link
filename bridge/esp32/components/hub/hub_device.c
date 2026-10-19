@@ -51,6 +51,13 @@ bool hub_device_online(const hub_t *hub)
     return hub->device.state == HUB_DEVICE_ONLINE;
 }
 
+bool hub_device_notifies(const hub_t *hub)
+{
+    const dspi_identity_t *identity = &hub->device.identity;
+    return hub->device.state == HUB_DEVICE_ABSENT || !identity->has_uart_config ||
+           identity->notify_enabled;
+}
+
 /* "major.minor.patch" from the platform reply: bytes 1, 4 and 5 on current
  * firmware, or the nibbles of byte 2 on firmware that sends only 4 bytes. */
 static void format_firmware_version(const dspi_identity_t *identity, char *out, size_t size)
@@ -153,13 +160,15 @@ static void forget_device(hub_t *hub)
     memset(&hub->device, 0, sizeof(hub->device));
     hub->device.state = HUB_DEVICE_ABSENT;
     hub->snapshot.valid = false;
-    hub->snapshot.refreshing = false;
+    hub->snapshot.read_tag = 0; /* An answer still on its way is for the old board */
     hub->io.advertise(hub->io.context);
 }
 
-/* Starts a background read of the settings blob, which also gives the
- * device object its wire_version and inputs (bridge spec 8.6). */
-static void start_snapshot_refresh(hub_t *hub);
+/* Starts the next snapshot read if none is under way: the settings blob and
+ * then the status frame, or only the status frame while the cached blob can
+ * be trusted (bridge spec 8.6). The blob read also gives the device object
+ * its wire_version and inputs. */
+static void start_snapshot_read(hub_t *hub);
 
 void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud)
 {
@@ -204,7 +213,8 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
         }
     }
     hub->snapshot.valid = false;
-    start_snapshot_refresh(hub);
+    hub->snapshot.read_tag = 0;
+    start_snapshot_read(hub);
 }
 
 void hub_device_lost(hub_t *hub)
@@ -216,7 +226,7 @@ void hub_device_lost(hub_t *hub)
     hub->device.offline_since_ms = hub_now(hub);
     hub_polls_clear(hub); /* Subscriptions end when the device goes offline (Link spec 7.6) */
     fail_snapshot_waiters(hub, "no_device", NULL);
-    hub->snapshot.refreshing = false;
+    hub->snapshot.read_tag = 0; /* An answer still on its way is ignored */
     broadcast_device(hub, "device.changed");
 }
 
@@ -301,18 +311,49 @@ void hub_snapshot_mark_stale(hub_t *hub)
     hub->snapshot.stale = true;
 }
 
-static void start_snapshot_refresh(hub_t *hub)
+/* True while the cached blob is known to be current. Never when the DSPi
+ * sends no notifications: then nothing would tell the cache it changed. */
+static bool blob_trusted(const hub_t *hub)
 {
-    if (hub->snapshot.refreshing || !hub_device_online(hub)) {
+    return hub->snapshot.valid && !hub->snapshot.stale && hub_device_notifies(hub);
+}
+
+/* Queues the status read, which every waiter now present is to receive. */
+static uint32_t submit_status_read(hub_t *hub)
+{
+    /* The meter frame is 2 x channels + 7 bytes (Link spec 7.6). */
+    const dspi_request_t status_read = {
+        .is_get = true,
+        .request = REQ_GET_STATUS,
+        .value = STATUS_COMBINED_FRAME,
+        .length = (uint16_t)(2 * hub->device.channels + 7),
+    };
+    const uint32_t tag = hub_submit_own(hub, HUB_WORK_SNAPSHOT_STATUS, &status_read, true, NULL);
+    if (tag != 0) {
+        for (size_t i = 0; i < hub->snapshot.waiter_count; i++) {
+            hub->snapshot.waiters[i].covered = true;
+        }
+    }
+    return tag;
+}
+
+static void start_snapshot_read(hub_t *hub)
+{
+    hub_snapshot_t *snapshot = &hub->snapshot;
+    if (snapshot->read_tag != 0 || !hub_device_online(hub)) {
         return;
     }
-    /* Clear `stale` now: a change during the read marks it stale again. */
-    hub->snapshot.stale = false;
-    const dspi_request_t bulk_read = {.is_get = true, .request = REQ_GET_ALL_PARAMS, .length = 0};
-    if (hub_submit_own(hub, HUB_WORK_SNAPSHOT_BULK, &bulk_read, true, NULL)) {
-        hub->snapshot.refreshing = true;
+    if (blob_trusted(hub)) {
+        snapshot->read_tag = submit_status_read(hub);
     } else {
-        hub->snapshot.stale = true;
+        /* Clear `stale` now: a change during the read marks it stale again. */
+        snapshot->stale = false;
+        const dspi_request_t bulk_read = {
+            .is_get = true, .request = REQ_GET_ALL_PARAMS, .length = 0};
+        snapshot->read_tag = hub_submit_own(hub, HUB_WORK_SNAPSHOT_BULK, &bulk_read, true, NULL);
+    }
+    if (snapshot->read_tag == 0) {
+        snapshot->stale = true;
         fail_snapshot_waiters(hub, "busy", "the bridge's queue to the DSPi is full");
     }
 }
@@ -376,16 +417,11 @@ void hub_handle_device_snapshot(hub_t *hub, int slot, int id, const cJSON *messa
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;
     }
-
-    /* While a read is under way `stale` is already cleared, but the cache
-     * still holds the old blob: wait for the read like the first asker. */
-    hub_snapshot_t *snapshot = &hub->snapshot;
-    if (snapshot->valid && !snapshot->stale && !snapshot->refreshing) {
-        send_snapshot(hub, slot, id);
-        return;
-    }
+    /* The status frame is read fresh for every snapshot, and the blob too
+     * unless the cache is current (bridge spec 8.6). A request that comes
+     * while a status read is already on its way waits for the next one. */
     if (add_snapshot_waiter(hub, slot, id)) { /* Room for one per session */
-        start_snapshot_refresh(hub);
+        start_snapshot_read(hub);
     }
 }
 
@@ -407,11 +443,37 @@ static void learn_bulk_header(hub_t *hub)
     }
 }
 
+/* Answers the waiters a status read was asked for, and starts another read
+ * for any that came while it ran. */
+static void serve_snapshot_waiters(hub_t *hub)
+{
+    hub_snapshot_t *snapshot = &hub->snapshot;
+    size_t kept = 0;
+    for (size_t i = 0; i < snapshot->waiter_count; i++) {
+        const hub_snapshot_waiter_t waiter = snapshot->waiters[i];
+        if (!waiter.covered) {
+            snapshot->waiters[kept++] = waiter;
+            continue;
+        }
+        const hub_session_t *session = hub_open_session(hub, waiter.slot);
+        if (session != NULL && session->id == waiter.session_id) {
+            send_snapshot(hub, waiter.slot, waiter.request_id);
+        }
+    }
+    snapshot->waiter_count = kept;
+    if (kept > 0) {
+        start_snapshot_read(hub);
+    }
+}
+
 void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply)
 {
     hub_snapshot_t *snapshot = &hub->snapshot;
+    if (work->tag != snapshot->read_tag) {
+        return; /* For a read given up on: the device went away meanwhile */
+    }
+    snapshot->read_tag = 0;
     if (reply->kind != DSPI_REPLY_ANSWERED || reply->status != DSPI_STATUS_OK) {
-        snapshot->refreshing = false;
         snapshot->stale = true;
         fail_snapshot_waiters(hub, "busy", "the DSPi did not answer the snapshot read");
         return;
@@ -421,17 +483,11 @@ void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_rep
         snapshot->bulk_length =
             reply->length < sizeof(snapshot->bulk) ? reply->length : sizeof(snapshot->bulk);
         memcpy(snapshot->bulk, reply->payload, snapshot->bulk_length);
+        snapshot->read_ms = hub_now(hub);
         learn_bulk_header(hub);
-
-        /* The meter frame is 2 x channels + 7 bytes (Link spec 7.6). */
-        const dspi_request_t status_read = {
-            .is_get = true,
-            .request = REQ_GET_STATUS,
-            .value = STATUS_COMBINED_FRAME,
-            .length = (uint16_t)(2 * hub->device.channels + 7),
-        };
-        if (!hub_submit_own(hub, HUB_WORK_SNAPSHOT_STATUS, &status_read, true, NULL)) {
-            snapshot->refreshing = false;
+        snapshot->read_tag = submit_status_read(hub);
+        if (snapshot->read_tag == 0) {
+            snapshot->valid = false; /* The blob and the status no longer match */
             fail_snapshot_waiters(hub, "busy", "the bridge's queue to the DSPi is full");
         }
         return;
@@ -441,17 +497,7 @@ void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_rep
         reply->length < sizeof(snapshot->status) ? reply->length : sizeof(snapshot->status);
     memcpy(snapshot->status, reply->payload, snapshot->status_length);
     snapshot->valid = true;
-    snapshot->refreshing = false;
-    snapshot->read_ms = hub_now(hub);
-
-    for (size_t i = 0; i < snapshot->waiter_count; i++) {
-        const hub_snapshot_waiter_t *waiter = &snapshot->waiters[i];
-        const hub_session_t *session = hub_open_session(hub, waiter->slot);
-        if (session != NULL && session->id == waiter->session_id) {
-            send_snapshot(hub, waiter->slot, waiter->request_id);
-        }
-    }
-    snapshot->waiter_count = 0;
+    serve_snapshot_waiters(hub);
 }
 
 /* ---------------------------------------------------------------------------
@@ -475,6 +521,10 @@ void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message
     (void)hub_json_int(message, "handle", &handle); /* Absent: -1, no such device */
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(message, "name");
 
+    if (hub->sessions[slot].role == LINK_ROLE_VIEWER) {
+        hub_reply_error(hub, slot, id, "denied", "control or admin role required"); /* Link 7.4 */
+        return;
+    }
     if (handle != HUB_DEVICE_HANDLE || hub->device.state == HUB_DEVICE_ABSENT) {
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;

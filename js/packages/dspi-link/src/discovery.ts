@@ -109,11 +109,21 @@ export async function fetchHubInfo(
   defaultSecure = false,
   signal?: AbortSignal,
 ): Promise<HubInfo> {
-  const response = await fetch(infoUrl(input, defaultSecure), {
-    signal: signal ?? AbortSignal.timeout(HUB_INFO_TIMEOUT_MS),
-  });
-  if (!response.ok) throw new Error(`hub info: HTTP ${response.status}`);
-  const body = (await response.json()) as HubInfo;
+  // AbortSignal.timeout would do, but Safari before 16 lacks it.
+  const timeout = signal ? null : new AbortController();
+  const timer = timeout
+    ? setTimeout(() => timeout.abort(new Error("hub info timed out")), HUB_INFO_TIMEOUT_MS)
+    : null;
+  let body: HubInfo;
+  try {
+    const response = await fetch(infoUrl(input, defaultSecure), {
+      signal: signal ?? timeout?.signal,
+    });
+    if (!response.ok) throw new Error(`hub info: HTTP ${response.status}`);
+    body = (await response.json()) as HubInfo;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
   if (!body || typeof body !== "object" || !body.hub) {
     throw new Error("hub info: not a DSPi Link hub");
   }

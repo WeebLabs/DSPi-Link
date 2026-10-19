@@ -38,10 +38,15 @@ typedef struct {
     void (*session_opened)(void *context, int slot, uint32_t address);
 
     /* A text or binary message. The handler takes ownership of `data`, a
-     * heap buffer with a NUL after the last byte, and frees it with free(). */
+     * heap buffer with a NUL after the last byte, and hands it back with
+     * http_server_message_done() once the message has been handled or
+     * dropped: until then it counts against the session's share
+     * (HTTP_SESSION_INBOUND_MAX_*). */
     void (*session_message)(void *context, int slot, bool binary, uint8_t *data, size_t length);
 
-    /* A ping or pong arrived: the client is alive. */
+    /* A ping or pong arrived: the client is alive. Counts against the
+     * session's share like a message; the handler calls
+     * http_server_message_done(slot, NULL, 0) once it is done with it. */
     void (*session_activity)(void *context, int slot);
 
     /* The session's socket has closed. The slot stays reserved until
@@ -68,8 +73,9 @@ typedef struct {
 esp_err_t http_server_start(const http_server_config_t *config);
 
 /* Queues one WebSocket message; the bytes are copied. False when the slot is
- * not open, is closing, already has LINK_SESSION_QUEUE_FRAMES messages
- * waiting (bridge spec 8.2), or memory ran out. Any task. */
+ * not open, is closing, already has LINK_SESSION_QUEUE_FRAMES messages or
+ * HTTP_SESSION_QUEUE_MAX_BYTES waiting (bridge spec 8.2), or memory ran
+ * out. Any task. */
 bool http_server_send(int slot, bool binary, const uint8_t *data, size_t length);
 
 /* The IPv4 address (network byte order) of the client on socket `fd`, or 0
@@ -89,6 +95,12 @@ void http_server_close(int slot, uint16_t code);
 /* The hub has finished with a closed session; the slot may be reused. Hub
  * task only, after session_closed. */
 void http_server_release_slot(int slot);
+
+/* The hub has handled, or dropped, a message or activity that
+ * session_message or session_activity handed it: frees `data` (NULL for an
+ * activity) and gives the session back its `length` bytes of share. Exactly
+ * once per handler call. Any task. */
+void http_server_message_done(int slot, uint8_t *data, size_t length);
 
 /* Keeps the send queues moving: restarts sending, and closing, wherever an
  * earlier attempt found ESP-IDF's work queue full, and closes any session

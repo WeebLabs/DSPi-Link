@@ -4,9 +4,10 @@
  *
  * The slot table, with each session's queue of frames to send, is the only
  * state shared between tasks here: the HTTP server's task opens, closes and
- * sends, while the hub task queues frames and asks for closes. Every access
- * takes `slots_lock` for a few instructions; nothing is allocated or sent
- * while it is held.
+ * sends, while the hub task queues frames, asks for closes and hands back
+ * the messages it has handled (each session's share of the hub's queue,
+ * HTTP_SESSION_INBOUND_MAX_*). Every access takes `slots_lock` for a few
+ * instructions; nothing is allocated or sent while it is held.
  *
  * Only the server's task touches sockets. Another task that wants a session
  * closed marks its slot, and the send pump, on the server's task, makes the
@@ -38,15 +39,17 @@
 static const char *TAG = "http_server";
 
 #define LINK_SUBPROTOCOL "dspi-link-1"
-/* Room for the sub-protocols a client offers. The same size as the buffer
- * ESP-IDF reads the header into when it echoes the protocol back
- * (httpd_ws.c), so a list too long for ESP-IDF is refused here too, rather
- * than passing this check and then failing in the browser. */
-#define SUBPROTOCOL_HEADER_BYTES 50
+/* Room for the sub-protocols a client offers. ESP-IDF reads the header into
+ * a 50-byte buffer but passes it as 49 (httpd_ws.c), so it keeps 48
+ * characters; the same here means a list too long for ESP-IDF to find the
+ * Link protocol in is refused here too, rather than passing this check and
+ * then failing in the browser when the 101 names no protocol. */
+#define SUBPROTOCOL_HEADER_BYTES 49
 /* Room for an Origin header: the longest .local hostname, a scheme and a
  * port fit easily; anything longer is not the bridge's own origin. */
 #define ORIGIN_HEADER_BYTES 128
 #define CLOSE_NORMAL 1000
+#define CLOSE_TRY_AGAIN_LATER 1013 /* RFC 6455 registry: the session sent more than its share */
 #define CLOSE_PROTOCOL_ERROR 4000
 
 /* ---------------------------------------------------------------------------
@@ -76,12 +79,18 @@ typedef struct {
     bool close_wanted;
     bool close_requested;
     int64_t close_requested_us;
+    bool close_retrying; /* The first request did not close it: ask whatever the state */
 
     /* Frames waiting to be sent, oldest first (bridge spec 8.2). */
     outgoing_t *queue[LINK_SESSION_QUEUE_FRAMES];
     size_t queue_head;
     size_t queue_count;
+    size_t queued_bytes;      /* Payload bytes in `queue` */
     int64_t last_progress_us; /* When bytes last went out, while any wait */
+
+    /* Messages handed to the hub and not yet handled, and their bytes. */
+    size_t inbound_messages;
+    size_t inbound_bytes;
 
     /* The batch being sent: frames already encoded, of which `partial_sent`
      * bytes have gone. Created and freed only on the server's task. */
@@ -161,6 +170,7 @@ static size_t take_queue_locked(slot_t *slot, outgoing_t **out)
     }
     slot->queue_head = 0;
     slot->queue_count = 0;
+    slot->queued_bytes = 0;
     return count;
 }
 
@@ -276,6 +286,7 @@ static void carry_out_close(slot_t *slot)
 
     taskENTER_CRITICAL(&server_state.slots_lock);
     const bool due = slot->state == SLOT_OPEN && slot->close_wanted && !slot->close_requested;
+    const bool retrying = slot->close_retrying;
     const int fd = slot->fd;
     if (due) {
         unsent_count = take_queue_locked(slot, unsent);
@@ -289,8 +300,17 @@ static void carry_out_close(slot_t *slot)
     if (!due) {
         return;
     }
+    /* A client's close frame makes ESP-IDF queue a close of its own. That
+     * request names the session's record, not its fd, so a second one
+     * queued here could run after the record had been reused by a new
+     * connection and close that instead. Leave it to ESP-IDF, then; the
+     * retry in http_server_service() asks anyway if the socket is still
+     * open a second later (ESP-IDF's queue was full). */
+    const bool server_closing =
+        !retrying && httpd_ws_get_fd_info(server_state.link_server, fd) == HTTPD_WS_CLIENT_HTTP;
     /* NOT_FOUND: ESP-IDF has already dropped the session itself. */
-    const esp_err_t err = httpd_sess_trigger_close(server_state.link_server, fd);
+    const esp_err_t err =
+        server_closing ? ESP_OK : httpd_sess_trigger_close(server_state.link_server, fd);
     if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
         ESP_LOGD(TAG, "Closing socket %d deferred: %s", fd, esp_err_to_name(err));
         return;
@@ -320,6 +340,7 @@ static bool start_batch(slot_t *slot)
         bytes += size;
         slot->queue_head = (slot->queue_head + 1) % LINK_SESSION_QUEUE_FRAMES;
         slot->queue_count--;
+        slot->queued_bytes -= frame->length;
     }
     taskEXIT_CRITICAL(&server_state.slots_lock);
     if (count == 0) {
@@ -468,14 +489,19 @@ static bool queue_frame(int slot, uint8_t opcode, const uint8_t *data, size_t le
 
     taskENTER_CRITICAL(&server_state.slots_lock);
     slot_t *entry = &server_state.slots[slot];
+    /* A close frame is tiny and must not be lost to the byte limit; a frame
+     * larger than the limit still goes once the queue is empty. */
+    const bool room_for_bytes = opcode == WS_OPCODE_CLOSE || entry->queue_count == 0 ||
+                                entry->queued_bytes + length <= HTTP_SESSION_QUEUE_MAX_BYTES;
     const bool accepted = entry->state == SLOT_OPEN && !entry->close_queued &&
-                          entry->queue_count < LINK_SESSION_QUEUE_FRAMES;
+                          entry->queue_count < LINK_SESSION_QUEUE_FRAMES && room_for_bytes;
     if (accepted) {
         if (entry->queue_count == 0) {
             entry->last_progress_us = esp_timer_get_time();
         }
         entry->queue[(entry->queue_head + entry->queue_count) % LINK_SESSION_QUEUE_FRAMES] = frame;
         entry->queue_count++;
+        entry->queued_bytes += length;
         entry->close_queued = opcode == WS_OPCODE_CLOSE;
         server_state.work_added = true;
     }
@@ -534,6 +560,7 @@ void http_server_service(void)
         /* ESP-IDF accepted a close but the socket is still open: ask again. */
         if (open && slot->close_requested && now_us - slot->close_requested_us >= close_retry_us) {
             slot->close_requested = false;
+            slot->close_retrying = true;
         }
         const bool close_due = open && slot->close_wanted && !slot->close_requested;
         taskEXIT_CRITICAL(&server_state.slots_lock);
@@ -723,6 +750,62 @@ static esp_err_t after_handshake(httpd_req_t *request)
     return ESP_OK;
 }
 
+/* Counts one more message of `length` bytes from `slot` as handed to the
+ * hub, if the session's share allows (HTTP_SESSION_INBOUND_MAX_*). With
+ * `wait`, waits up to HTTP_INBOUND_WAIT_MS for the hub to work through what
+ * it has; that holds this task, and so every session, back only while a
+ * session sends faster than the hub works, which is the back-pressure
+ * wanted. False if there is no room. Server's task only. */
+static bool reserve_inbound(int slot, size_t length, bool wait)
+{
+    const int64_t deadline_us = esp_timer_get_time() + (int64_t)HTTP_INBOUND_WAIT_MS * 1000;
+    for (;;) {
+        taskENTER_CRITICAL(&server_state.slots_lock);
+        slot_t *entry = &server_state.slots[slot];
+        const bool room = entry->inbound_messages == 0 ||
+                          (entry->inbound_messages < HTTP_SESSION_INBOUND_MAX_MESSAGES &&
+                           entry->inbound_bytes + length <= HTTP_SESSION_INBOUND_MAX_BYTES);
+        if (room) {
+            entry->inbound_messages++;
+            entry->inbound_bytes += length;
+        }
+        taskEXIT_CRITICAL(&server_state.slots_lock);
+        if (room) {
+            return true;
+        }
+        if (!wait || esp_timer_get_time() >= deadline_us) {
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
+void http_server_message_done(int slot, uint8_t *data, size_t length)
+{
+    free(data);
+    if (!valid_slot(slot)) {
+        return;
+    }
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    slot_t *entry = &server_state.slots[slot];
+    if (entry->inbound_messages > 0) {
+        entry->inbound_messages--;
+    }
+    entry->inbound_bytes -= length < entry->inbound_bytes ? length : entry->inbound_bytes;
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+}
+
+/* True once the slot has a close on its way: its client's messages are no
+ * longer for the hub. */
+static bool slot_closing(int slot)
+{
+    taskENTER_CRITICAL(&server_state.slots_lock);
+    const slot_t *entry = &server_state.slots[slot];
+    const bool closing = entry->close_queued || entry->close_wanted;
+    taskEXIT_CRITICAL(&server_state.slots_lock);
+    return closing;
+}
+
 /* Answers a client's control frame: a pong for a ping, a close for a
  * close. The answers join the session's queue like any frame, because
  * writing straight to the socket could land in the middle of a batch the
@@ -730,14 +813,20 @@ static esp_err_t after_handshake(httpd_req_t *request)
 static void answer_control_frame(int slot, const httpd_ws_frame_t *frame)
 {
     const http_server_handlers_t *handlers = &server_state.config.handlers;
+    /* With messages of the session's still before the hub, those show it
+     * alive already; the activity is passed on only when there is room. */
+    const bool tell_hub =
+        (frame->type == HTTPD_WS_TYPE_PING || frame->type == HTTPD_WS_TYPE_PONG) &&
+        reserve_inbound(slot, 0, false);
     if (frame->type == HTTPD_WS_TYPE_PING) {
         if (!queue_frame(slot, WS_OPCODE_PONG, frame->payload, frame->len)) {
             ESP_LOGD(TAG, "Session %d: no room for a pong", slot); /* The next ping gets one */
         }
+    }
+    if (tell_hub) {
         handlers->session_activity(handlers->context, slot);
-    } else if (frame->type == HTTPD_WS_TYPE_PONG) {
-        handlers->session_activity(handlers->context, slot);
-    } else if (frame->type == HTTPD_WS_TYPE_CLOSE) {
+    }
+    if (frame->type == HTTPD_WS_TYPE_CLOSE) {
         /* Echo the client's close code; the pump closes once it has gone. */
         if (!queue_frame(slot, WS_OPCODE_CLOSE, frame->payload, frame->len >= 2 ? 2 : 0)) {
             http_server_close(slot, CLOSE_NORMAL);
@@ -763,6 +852,40 @@ static void send_close_now(int slot, uint16_t code)
     }
 }
 
+/* Reads the rest of a frame whose header has been read and throws it away,
+ * so the stream stays in step. False if the socket failed or the request's
+ * time budget ran out. */
+static bool discard_frame(httpd_req_t *request, httpd_ws_frame_t *frame)
+{
+    uint8_t scratch[128];
+    frame->payload = scratch;
+    bool read = true;
+    while (read && frame->left_len > 0) {
+        read = httpd_ws_recv_frame_part(request, frame, sizeof(scratch)) == ESP_OK;
+    }
+    frame->payload = NULL; /* `scratch` ends here */
+    return read;
+}
+
+/* Refuses a frame and closes the session with `code`. A frame small enough
+ * is read and thrown away first, and the close frame then goes out through
+ * the queue like any other, so the client learns why: closing with the
+ * frame unread would make TCP reset the connection and lose the close
+ * frame. A larger one is cut off at once, with the close frame written
+ * straight away as a last attempt. */
+static esp_err_t refuse_frame(httpd_req_t *request, httpd_ws_frame_t *frame, int slot,
+                              uint16_t code)
+{
+    if (frame->len <= HTTP_DISCARD_MAX_BYTES && discard_frame(request, frame)) {
+        if (!slot_closing(slot)) { /* Else the close already on its way stands */
+            http_server_close(slot, code);
+        }
+        return ESP_OK;
+    }
+    send_close_now(slot, code);
+    return ESP_FAIL;
+}
+
 /* Called for every frame a client sends. Each frame must be read in full
  * before returning, or the server loses its place in the stream; returning
  * an error instead makes the server close the socket. */
@@ -780,28 +903,42 @@ static esp_err_t on_link_socket(httpd_req_t *request)
     if (slot < 0) {
         return ESP_FAIL; /* No session for this socket: close it */
     }
-    if (frame.len > LINK_MAX_FRAME_BYTES || frame.type == HTTPD_WS_TYPE_CONTINUE) {
+    if (frame.len > LINK_MAX_FRAME_BYTES || frame.type == HTTPD_WS_TYPE_CONTINUE || !frame.final) {
         /* Too big, or fragmented, which no Link client sends (Link spec 4).
-         * The frame is not read, so the server must drop the socket now. */
-        send_close_now(slot, CLOSE_PROTOCOL_ERROR);
-        return ESP_FAIL;
+         * The first fragment counts too: it is not a whole message. */
+        return refuse_frame(request, &frame, slot, CLOSE_PROTOCOL_ERROR);
+    }
+    const bool message = frame.type == HTTPD_WS_TYPE_TEXT || frame.type == HTTPD_WS_TYPE_BINARY;
+    if (message && slot_closing(slot)) {
+        return discard_frame(request, &frame) ? ESP_OK : ESP_FAIL;
+    }
+    if (message && !reserve_inbound(slot, frame.len, true)) {
+        ESP_LOGW(TAG, "Session %d sends faster than the hub can take; closing it", slot);
+        return refuse_frame(request, &frame, slot, CLOSE_TRY_AGAIN_LATER);
     }
 
     uint8_t *data = malloc(frame.len + 1);
     if (data == NULL) {
+        if (message) {
+            http_server_message_done(slot, NULL, frame.len);
+        }
         return ESP_ERR_NO_MEM;
     }
     frame.payload = data;
     if (frame.len > 0) {
         err = httpd_ws_recv_frame(request, &frame, frame.len);
         if (err != ESP_OK) {
-            free(data);
+            if (message) {
+                http_server_message_done(slot, data, frame.len);
+            } else {
+                free(data);
+            }
             return err;
         }
     }
     data[frame.len] = '\0';
 
-    if (frame.type == HTTPD_WS_TYPE_TEXT || frame.type == HTTPD_WS_TYPE_BINARY) {
+    if (message) {
         /* Ownership of `data` passes to the handler. */
         handlers->session_message(handlers->context, slot, frame.type == HTTPD_WS_TYPE_BINARY, data,
                                   frame.len);

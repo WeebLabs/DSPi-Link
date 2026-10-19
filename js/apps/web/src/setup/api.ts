@@ -39,30 +39,66 @@ export class SetupError extends Error {
 /** Longer than a scan takes (a few seconds), shorter than a user's patience. */
 const REQUEST_TIMEOUT_MS = 8000;
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
+const NOT_ANSWERING = "The bridge isn't answering. Check this device is still on its network.";
+
+/** Something other than the bridge's setup API answered, such as a router's page. */
+const NOT_THE_BRIDGE =
+  "Something other than the bridge answered. Check this device is on its network.";
+
+async function request(path: string, init?: RequestInit): Promise<Record<string, unknown>> {
+  // AbortSignal.timeout would do, but Safari before 16 lacks it.
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
   try {
-    response = await fetch(`/setup/v1/${path}`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      ...init,
-    });
-  } catch {
-    throw new SetupError("The bridge isn't answering. Check this device is still on its network.");
+    let response: Response;
+    try {
+      response = await fetch(`/setup/v1/${path}`, {
+        cache: "no-store",
+        signal: timeout.signal,
+        ...init,
+      });
+    } catch {
+      throw new SetupError(NOT_ANSWERING);
+    }
+    const body: unknown = await response.json().catch(() => null);
+    const object = isObject(body) ? body : null;
+    if (!response.ok) {
+      const msg = typeof object?.msg === "string" ? object.msg : null;
+      throw new SetupError(msg ?? `The bridge refused the request (error ${response.status}).`);
+    }
+    if (!object) throw new SetupError(NOT_THE_BRIDGE);
+    return object;
+  } finally {
+    clearTimeout(timer);
   }
-  const body = (await response.json().catch(() => ({}))) as T & { msg?: string };
-  if (!response.ok) {
-    throw new SetupError(body.msg ?? `The bridge refused the request (error ${response.status}).`);
-  }
-  return body;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The reply to /state, checked: everything the page reads from it must be there. */
+function readState(body: Record<string, unknown>): SetupState {
+  const { dspi, wifi } = body;
+  const fine =
+    typeof body.name === "string" &&
+    typeof body.pin_required === "boolean" &&
+    isObject(dspi) &&
+    typeof dspi.found === "boolean" &&
+    isObject(wifi) &&
+    typeof wifi.join === "string" &&
+    typeof wifi.hostname === "string";
+  if (!fine) throw new SetupError(NOT_THE_BRIDGE);
+  return body as unknown as SetupState;
 }
 
 /**
  * @returns What the bridge knows now: its name, the DSPi and the Wi-Fi join.
- * @throws SetupError when the bridge does not answer or refuses.
+ * @throws SetupError when the bridge does not answer, refuses, or sends
+ *   something that is not its state.
  */
-export function getState(): Promise<SetupState> {
-  return request<SetupState>("state");
+export async function getState(): Promise<SetupState> {
+  return readState(await request("state"));
 }
 
 /**
@@ -70,8 +106,15 @@ export function getState(): Promise<SetupState> {
  * @throws SetupError when the bridge does not answer or refuses.
  */
 export async function getNetworks(): Promise<Network[]> {
-  const body = await request<{ networks?: Network[] }>("networks");
-  return body.networks ?? [];
+  const { networks } = await request("networks");
+  if (!Array.isArray(networks)) return [];
+  return networks.filter(
+    (network): network is Network =>
+      isObject(network) &&
+      typeof network.ssid === "string" &&
+      typeof network.rssi === "number" &&
+      typeof network.secure === "boolean",
+  );
 }
 
 /**
@@ -85,8 +128,8 @@ export interface PinChange {
   current_pin?: string;
 }
 
-function postJson<T>(path: string, body: unknown): Promise<T> {
-  return request<T>(path, {
+function postJson(path: string, body: unknown): Promise<Record<string, unknown>> {
+  return request(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

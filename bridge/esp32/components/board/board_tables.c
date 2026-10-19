@@ -28,13 +28,14 @@ bool board_pin_list_contains(board_pin_list_t list, uint8_t pin)
  * Left out: 0, 2, 5, 12, 15 (strapping); 1, 3 (boot console UART0);
  * 6 to 11 (flash); 16, 17 (PSRAM on WROVER, flash on PICO-D4); 37, 38 (not
  * broken out on WROOM or WROVER). 20, 24 and 28 to 31 do not exist.
- * 34, 35, 36 and 39 are input only, so they are offered for RX alone.
+ * 34, 35, 36 and 39 are input only and have no pull-up, so an RX line on
+ * one floats and reads noise whenever the DSPi is unplugged or off; they
+ * are not offered at all.
  * 2 is offered for an LED because many boards have one there.
  * ------------------------------------------------------------------------- */
 
 static const uint8_t ESP32_UART_TX_PINS[] = {4, 13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
-static const uint8_t ESP32_UART_RX_PINS[] = {4,  13, 14, 18, 19, 21, 22, 23, 25,
-                                             26, 27, 32, 33, 34, 35, 36, 39};
+static const uint8_t ESP32_UART_RX_PINS[] = {4, 13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
 static const uint8_t ESP32_LED_PINS[] = {2, 4, 13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33};
 
 const board_table_t BOARD_TABLE_ESP32 = {

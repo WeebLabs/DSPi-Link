@@ -150,7 +150,8 @@
 
 /* Attempts in a row with no valid answer (timeouts or corrupt answers)
  * before the UART driver is reinstalled. A receiver stuck on noise produces
- * corrupt frames, so they count too (bridge spec 7.4). */
+ * corrupt frames, so they count too (bridge spec 7.4). Probes while looking
+ * for a device do not: each changes the rate, which flushes the receiver. */
 #define DSPI_UART_UNANSWERED_BEFORE_REINSTALL 3
 
 /* Failed requests in a row before the device is reported lost. One timeout
@@ -180,6 +181,18 @@
 /* Bytes fetched from the UART driver in one read: enough to take a short
  * frame in one call without making the link state large. */
 #define DSPI_UART_READ_CHUNK_BYTES 64
+
+/* A frame whose bytes stop for this long is abandoned and its bytes after
+ * the sync byte are searched again for a real frame: it began at a 0xA5
+ * that was noise, or lost a byte. The DSPi sends a frame without pauses, so
+ * a gap this long inside one never happens on a working line. */
+#define DSPI_UART_FRAME_GAP_MS 20
+
+/* When a wait for an answer runs out, bytes already received are still
+ * parsed, up to what the driver's ring and the link's read-ahead hold. An
+ * answer that arrived in time may have waited there while the uart task
+ * was held up, by a handler or a busier task. */
+#define DSPI_UART_LATE_PARSE_BYTES (DSPI_UART_DRIVER_RX_BUFFER_BYTES + DSPI_UART_READ_CHUNK_BYTES)
 
 /* After a write returns, at most the 128-byte hardware FIFO is left to
  * send: 11 ms at 115200 baud. Anything longer means the UART is stuck. */
@@ -261,6 +274,18 @@
  * this long, by which time the attempt has usually finished. */
 #define WIFI_SCAN_RETRY_DELAY_MS 1500
 
+/* The setup page and hub.wifi.scan can ask at once; the driver runs one
+ * scan at a time, so the second waits this long for the first, which takes
+ * a few seconds, before it is answered busy. Short enough that the wait and
+ * its own scan fit in the setup page's 8 s request timeout. */
+#define WIFI_SCAN_LOCK_WAIT_MS 4000
+
+/* A downgrade erases the newer firmware's extra keys from the `bridge`
+ * namespace this many at a time, for at most this many rounds; any left
+ * are never read and do no harm (bridge spec 11). */
+#define SETTINGS_UNKNOWN_KEYS_PER_PASS 8
+#define SETTINGS_UNKNOWN_KEY_PASSES 4
+
 /* How long net_join() and net_finish_setup() wait for room in the event
  * queue, which the event task drains in milliseconds. */
 #define NET_REQUEST_TIMEOUT_MS 1000
@@ -326,6 +351,32 @@
 #define HTTP_KEEP_ALIVE_INTERVAL_S 5
 #define HTTP_KEEP_ALIVE_COUNT 3
 
+/* Most bytes of frames one session may have waiting to be sent, beside the
+ * batch being written: room for LINK_MAX_INFLIGHT of the largest answers.
+ * The frame count limit alone would let a client that reads slowly pin
+ * hundreds of kilobytes of bulk answers. A close frame is always taken. */
+#define HTTP_SESSION_QUEUE_MAX_BYTES 32768
+
+/* Most messages, and bytes of them, one session may have handed to the hub
+ * task and not yet seen handled. A client that sends faster than the hub
+ * works is held back here, so it can neither fill the hub's queue for
+ * everyone else nor pile up memory. A message that would go over waits
+ * for room; one larger than the byte limit is let in once nothing else of
+ * the session's is waiting. */
+#define HTTP_SESSION_INBOUND_MAX_MESSAGES 8
+#define HTTP_SESSION_INBOUND_MAX_BYTES 16384
+
+/* How long a session's next message waits for that room. The hub handles a
+ * message in well under this; a session still over its share after it is
+ * closed with 1013 (try again later). */
+#define HTTP_INBOUND_WAIT_MS 2000
+
+/* A frame the bridge refuses (too large, or fragmented) is read and thrown
+ * away up to this size, so the close frame that explains it reaches the
+ * client; closing with the frame unread makes TCP reset the connection,
+ * which loses the close frame. A larger one is cut off at once. */
+#define HTTP_DISCARD_MAX_BYTES 65535
+
 /* Largest JSON body the setup API reads: an apply request with the longest
  * network name, password and bridge name, and two PINs, fits in half. */
 #define SETUP_API_MAX_BODY_BYTES 512
@@ -375,9 +426,33 @@
  * Firmware updates (bridge spec 14)
  * ------------------------------------------------------------------------- */
 
-/* A new image confirms itself after running this long with every task up;
- * a crash before then rolls back (bridge spec 14.2). */
+/* A new image is first checked after running this long; a crash or restart
+ * before it is confirmed rolls back (bridge spec 14.2). */
 #define OTA_CONFIRM_AFTER_MS 60000
+
+/* A new image that is not healthy yet (Wi-Fi still joining, say), or whose
+ * confirmation could not be written, is checked again this often. */
+#define OTA_CONFIRM_RETRY_MS 10000
+
+/* A new image still not healthy this long after starting is given up and
+ * the previous one restored. Longer than WIFI_FALLBACK_AFTER_MS, so a home
+ * network that is down gives way to the setup network before then. */
+#define OTA_CONFIRM_GIVE_UP_MS (5 * 60 * 1000)
+
+/* ---------------------------------------------------------------------------
+ * Boot and supervision (bridge spec 6.5 and 12.3)
+ * ------------------------------------------------------------------------- */
+
+/* A boot step that fails waits this long, with the BOOT button watched,
+ * before restarting: a restart loop otherwise comes round faster than
+ * anyone could hold BOOT for a factory reset. */
+#define BOOT_FAILURE_RESTART_MS 60000
+
+/* How often the supervisor checks that the hub task and the uart task are
+ * still going round their loops, and how long either may stay stopped
+ * before it restarts the bridge. */
+#define SUPERVISOR_CHECK_MS 5000
+#define SUPERVISOR_RESTART_AFTER_MS 30000
 
 /* An update with no chunk written or received for this long is abandoned
  * (bridge spec 14.2). Generous: a phone that locks its screen pauses the
@@ -414,6 +489,17 @@
  * the oldest, the least likely to match, is forgotten. */
 #define HUB_ORIGIN_QUEUE_ENTRIES 16
 
+/* With the PIN on, sessions from one address that have not yet
+ * authenticated; a further one closes the oldest. Two lets a client
+ * reconnect while its last attempt is still timing out, yet one stranger
+ * cannot fill every slot with sessions that never pair. */
+#define HUB_UNAUTHENTICATED_PER_ADDRESS 2
+
+/* How often a connected paired client is marked seen, so the client a full
+ * list forgets is one that is away, not one that stays connected. Saved
+ * to flash at most every AUTH_LAST_SEEN_SAVE_INTERVAL_MS. */
+#define HUB_AUTH_TOUCH_INTERVAL_MS 60000
+
 /* After poll.error a failing poll is retried this often until it answers
  * again; Link spec 8.4 asks only for "a reduced rate". */
 #define HUB_POLL_FAILED_PERIOD_MS 1000
@@ -445,11 +531,30 @@
     (2 * LINK_MAX_SESSIONS_WITH_PSRAM + 2 + OTA_QUEUE_DEPTH + 1 + 1 + 6)
 
 /* How long a task waits for room in the hub task's queue before it drops
- * an ordinary event (a message, an answer, a notification) and logs it. A
- * lifecycle event waits longer, since losing one leaves a slot or the
- * device stuck. */
+ * an ordinary event (a session's message) and counts it. A lifecycle event
+ * waits longer, since losing one leaves a slot or the device stuck. The
+ * uart task waits less (HUB_UART_LIFECYCLE_POST_WAIT_MS). */
 #define HUB_EVENT_POST_TIMEOUT_MS 1000
 #define HUB_LIFECYCLE_POST_TIMEOUT_MS 5000
+
+/* The uart task never waits on the hub task for long: a request on the
+ * wire must not be held up. Answers and notifications are posted without
+ * waiting (a dropped answer is finished as lost by the hub; a dropped
+ * notification makes the clients re-read), and the device coming or going
+ * waits at most this long for a place in the reserve; if even that fails,
+ * the hub task picks the change up on its next tick. */
+#define HUB_UART_LIFECYCLE_POST_WAIT_MS 10
+
+/* Dropped events and unsent messages are counted, and the counts logged at
+ * most this often: a log line per drop, on the 115200-baud console, would
+ * slow the task that drops to a crawl just when it is busiest. */
+#define HUB_DROP_LOG_INTERVAL_MS 5000
+
+/* When new settings put the status LED on a pin the UART is leaving, the
+ * hub task waits up to this long for the uart task to have moved before it
+ * starts the LED there. The move waits behind at most a queue of requests,
+ * a few hundred milliseconds; this stays well inside HUB_ALIVE_WITHIN_MS. */
+#define HUB_UART_MOVE_WAIT_MS 1000
 
 /* Most another task waits to queue a call on the hub task (hub_task_*()). */
 #define HUB_CALL_TIMEOUT_MS 5000
@@ -462,7 +567,7 @@
  * task, so that path never allocates. Small ones take every notification
  * and non-bulk answer; large ones the bulk reads, which the UART carries
  * one at a time. An answer that finds none free arrives as a timeout, a
- * notification is dropped; both are logged. */
+ * notification is dropped; both are counted (HUB_DROP_LOG_INTERVAL_MS). */
 #define HUB_EVENT_SMALL_BUFFERS 32
 #define HUB_EVENT_SMALL_BUFFER_BYTES DSPI_UART_MAX_GET_REPLY_BYTES
 #define HUB_EVENT_LARGE_BUFFERS 2

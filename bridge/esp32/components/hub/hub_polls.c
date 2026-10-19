@@ -226,32 +226,90 @@ static size_t keys_after(const hub_session_t *session, const poll_request_t *req
     return key_count;
 }
 
-/* Takes the requests into the session's slots, granting rates within its
- * budget (bridge spec 7.7): every poll gets at least 1 Hz. Each grant is
- * added to `granted`. */
-static void grant_requests(hub_t *hub, hub_session_t *session, const poll_request_t *requests,
-                           int count, cJSON *granted)
+/* One distinct poll and the rate its group runs at. */
+typedef struct {
+    hub_poll_key_t key;
+    uint32_t hz;
+} poll_rate_t;
+
+/* Raises `key`'s rate in `rates` to at least `hz`, adding it if it is new.
+ * `rates` has room for every distinct key a caller can add. */
+static poll_rate_t *raise_rate(poll_rate_t *rates, size_t *count, const hub_poll_key_t *key,
+                               uint32_t hz)
 {
-    for (int i = 0; i < count; i++) {
-        session->polls[requests[i].slot].active = false; /* Replaced */
+    for (size_t i = 0; i < *count; i++) {
+        if (same_key(&rates[i].key, key)) {
+            rates[i].hz = hz > rates[i].hz ? hz : rates[i].hz;
+            return &rates[i];
+        }
+    }
+    rates[*count] = (poll_rate_t){.key = *key, .hz = hz};
+    return &rates[(*count)++];
+}
+
+/*
+ * Grants rates for `requests` against one budget for the whole link
+ * (bridge spec 7.7): every group, whoever subscribed it, costs its bytes
+ * at its fastest rate, and a poll identical to one already running costs
+ * only the rate it adds. Writes each grant to `granted_hz`. Returns -1 if
+ * every request gets at least 1 Hz, or the index of the first that cannot,
+ * in which case nothing may be taken.
+ */
+static int grant_rates(const hub_t *hub, int slot, const poll_request_t *requests, int count,
+                       uint32_t granted_hz[HUB_POLL_SLOTS])
+{
+    /* Every other session's polls, and this one's that stay. The groups
+     * check before this keeps them to HUB_MAX_POLL_GROUPS distinct keys. */
+    poll_rate_t rates[HUB_MAX_POLL_GROUPS + HUB_POLL_SLOTS];
+    size_t rate_count = 0;
+    for (size_t s = 0; s < hub->config.max_sessions; s++) {
+        const hub_session_t *session = &hub->sessions[s];
+        if (session->state != HUB_SESSION_OPEN) {
+            continue;
+        }
+        for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
+            const hub_poll_slot_t *poll = &session->polls[p];
+            if (poll->active && !((int)s == slot && slot_is_requested(p, requests, count))) {
+                (void)raise_rate(rates, &rate_count, &poll->key, poll->hz);
+            }
+        }
     }
     uint32_t used = 0;
-    for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-        if (session->polls[p].active) {
-            used += poll_cost_bytes(&session->polls[p].key) * session->polls[p].hz;
-        }
+    for (size_t i = 0; i < rate_count; i++) {
+        used += poll_cost_bytes(&rates[i].key) * rates[i].hz;
     }
     const uint32_t budget = hub_poll_budget(hub);
 
     for (int i = 0; i < count; i++) {
         const uint32_t cost = poll_cost_bytes(&requests[i].key);
-        const uint32_t affordable = used < budget ? (budget - used) / cost : 0;
+        poll_rate_t *rate = raise_rate(rates, &rate_count, &requests[i].key, 0);
+        const uint32_t running_hz = rate->hz;
         uint32_t hz = (uint32_t)requests[i].hz;
         hz = hz > LINK_POLL_MAX_HZ ? LINK_POLL_MAX_HZ : hz;
-        hz = hz > affordable ? affordable : hz;
-        hz = hz < 1 ? 1 : hz;
-        used += cost * hz;
+        if (hz > running_hz) {
+            /* Only the rate above what already runs costs anything. */
+            const uint32_t affordable = used < budget ? (budget - used) / cost : 0;
+            hz = hz > running_hz + affordable ? running_hz + affordable : hz;
+        }
+        if (hz < 1) {
+            return i;
+        }
+        if (hz > running_hz) {
+            used += cost * (hz - running_hz);
+            rate->hz = hz;
+        }
+        granted_hz[i] = hz;
+    }
+    return -1;
+}
 
+/* Takes the requests into the session's slots at the rates granted. Each
+ * grant is added to `granted`. */
+static void take_requests(hub_t *hub, hub_session_t *session, const poll_request_t *requests,
+                          int count, const uint32_t granted_hz[HUB_POLL_SLOTS], cJSON *granted)
+{
+    for (int i = 0; i < count; i++) {
+        const uint32_t hz = granted_hz[i];
         /* last_sent_ms starts a period back, so the first answer goes out. */
         session->polls[requests[i].slot] = (hub_poll_slot_t){
             .active = true,
@@ -287,9 +345,16 @@ void hub_handle_poll_subscribe(hub_t *hub, int slot, int id, const cJSON *messag
         hub_reply_error(hub, slot, id, "busy", "the bridge is already running its most polls");
         return; /* Nothing has changed */
     }
+    uint32_t granted_hz[HUB_POLL_SLOTS];
+    if (grant_rates(hub, slot, requests, count, granted_hz) >= 0) {
+        hub_reply_error(hub, slot, id, "busy",
+                        "the poll budget cannot fit these polls even at 1 Hz");
+        return; /* Nothing has changed */
+    }
 
     cJSON *body = cJSON_CreateObject();
-    grant_requests(hub, session, requests, count, cJSON_AddArrayToObject(body, "granted"));
+    take_requests(hub, session, requests, count, granted_hz,
+                  cJSON_AddArrayToObject(body, "granted"));
     rebuild_groups(hub);
     hub_reply_ok(hub, slot, id, body);
 }
@@ -368,7 +433,7 @@ void hub_polls_tick(hub_t *hub)
     };
     /* No retry: the next tick is the retry, and it is never stale. A full
      * queue is the same: the poll simply runs at its next due time. */
-    hub->poll_pending = hub_submit_own(hub, HUB_WORK_POLL, &request, false, &due->key);
+    hub->poll_pending = hub_submit_own(hub, HUB_WORK_POLL, &request, false, &due->key) != 0;
 }
 
 /* Sends poll.error to every session subscribed to `key` (Link spec 8.4). */

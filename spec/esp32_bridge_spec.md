@@ -140,7 +140,7 @@ boot mode, which a DSPi driving them could upset).
 
 | Chip | Default TX | Default RX | BOOT button | Offered for the UART |
 |------|-----------|-----------|-------------|----------------------|
-| ESP32 | GPIO 19 | GPIO 18 | GPIO 0 | 4, 13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33; also 34, 35, 36, 39 for RX only (they are input only) |
+| ESP32 | GPIO 19 | GPIO 18 | GPIO 0 | 4, 13, 14, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33 |
 | ESP32-S3 | GPIO 17 | GPIO 18 | GPIO 0 | 1, 2, 4 to 18, 21, 38 to 42 |
 | ESP32-C3 | GPIO 5 | GPIO 4 | GPIO 9 | 0, 1, 3, 4, 5, 6, 7, 10 |
 | ESP32-C6 | GPIO 22 | GPIO 23 | GPIO 9 | 0, 1, 2, 3, 6, 7, 18 to 23 |
@@ -149,8 +149,11 @@ Pins left out, and why:
 
 - **ESP32:** 0, 2, 5, 12 and 15 are strapping pins; 1 and 3 are the boot
   console; 6 to 11 connect to flash; 16 and 17 connect to PSRAM on WROVER
-  modules and to flash on PICO-D4 modules; 37 and 38 are not broken out on
-  WROOM or WROVER modules.
+  modules and to flash on PICO-D4 modules; 34 to 39 are input only and
+  have no pull-up, so an RX line on one would float and read noise whenever
+  the DSPi is unplugged or off; 37 and 38 are also not broken out on WROOM
+  or WROVER modules. A saved pin the chip no longer offers fails validation,
+  and both UART pins return to the defaults (section 11).
 - **ESP32-S3:** 0, 3, 45 and 46 are strapping pins; 19 and 20 are USB; 26 to
   32 connect to flash and PSRAM; 33 to 37 connect to octal flash or PSRAM on
   many modules; 43 and 44 are the boot console; 47 and 48 run at 1.8 V on
@@ -167,8 +170,11 @@ their LED: 2 on the ESP32, 48 on the ESP32-S3 (DevKitC-1 v1.0), 8 on the
 ESP32-C3 and ESP32-C6, and 15 on the ESP32-C6 (XIAO). Driving an LED after
 boot cannot upset a strapping pin.
 
-The defaults are chosen to be broken out on the common boards in section
-4.1. The `board` component (section 6.4) holds these lists as the single
+The defaults are broken out on the development boards in section 4.1
+(DevKitC and DevKitM). Smaller boards such as the Seeed XIAO and M5Stack
+AtomS3 break out fewer pins: wire the DSPi to two of the pins in the lists
+above that the board does break out, and choose them on the settings page,
+which offers exactly these lists. The `board` component (section 6.4) holds these lists as the single
 source of truth, and the host tests check them against the exclusions
 above. The bridge always uses UART1, which every
 supported chip has, and leaves UART0 to the boot console.
@@ -269,7 +275,10 @@ session slots, the cached `/dspi/v1/info` document, and the Wi-Fi status.
   state machine that can be read top to bottom and tested on a computer.
 - **The uart task owns the UART.** It takes one request at a time from its
   queue, runs it to completion and posts the result back. It also reads
-  notifications between requests and probes for the device.
+  notifications between requests and probes for the device. The UART's
+  interrupt runs from internal RAM (`CONFIG_UART_ISR_IN_IRAM`), so it keeps
+  receiving while flash is being written, during an update or a settings
+  save.
 - **The HTTP task belongs to ESP-IDF.** Handlers on it only copy input and
   post events to the hub task; they never touch hub state. Outbound frames
   wait in each session's queue, and one job on the HTTP task sends them in
@@ -291,6 +300,14 @@ session slots, the cached `/dspi/v1/info` document, and the Wi-Fi status.
   empty still reaches its client, as a timeout. Part of the hub task's
   queue is kept for the events that must never be lost: sessions opening
   and closing, the DSPi appearing and going, update progress and restart.
+- **The uart task never waits on the hub.** It posts answers and
+  notifications without waiting; a dropped answer is finished as a timeout
+  by the hub. A DSPi appearing or going waits a few milliseconds at most,
+  and otherwise the hub picks the latest change up on its next tick. Drops
+  are counted and logged together every few seconds, never one line each.
+- **No session can crowd out the others.** Each session may have a few
+  messages (8, and 16 KB) waiting for the hub at once; a session over its
+  share is held back for up to 2 s, then closed with code 1013.
 - **No answer holds the queue.** If the uart task's answer to the oldest
   request has not arrived well after the uart task's own timeouts, the hub
   finishes that request as a timeout and ignores a late answer.
@@ -370,20 +387,29 @@ the same source compiles into the firmware and into the host tests.
 `app_main` does only this, in this order, with one line of comment per
 step:
 
-1. Initialise NVS. If it reports a version mismatch or no free pages, erase
+1. Start the button watcher, first, so a factory reset works even when a
+   later step fails (section 12.1).
+2. Initialise NVS. If it reports a version mismatch or no free pages, erase
    and initialise it again, and log that this happened.
-2. Load settings (`settings`). On first boot, generate the hub id (UUID v4
-   from the hardware random number generator) and default name.
-3. Start the status LED and the button watcher.
-4. Start networking (`net`): station mode if a home network is saved,
+3. Load settings (`settings`). On first boot, generate the hub id (UUID v4
+   from the hardware random number generator) and default name. Log the
+   startup summary, including what started the bridge (section 12.3).
+4. Start the status LED.
+5. Start networking (`net`): station mode if a home network is saved,
    otherwise the setup network. mDNS starts here, so the hub has somewhere
    to advertise from its first moment.
-5. Start the hub task, which starts the uart task with the saved pins and
+6. Start the hub task, which starts the uart task with the saved pins and
    baud rate.
-6. Start the HTTP servers, with Link sessions going to the hub task and the
+7. Start the HTTP servers, with Link sessions going to the hub task and the
    setup network's requests to the setup API. `app_main` connects the two so
    that neither component depends on the other.
-7. If this image is new, start the rollback confirmation timer (section 14.2).
+8. Start the supervisor (section 12.3).
+9. If this image is new, start the rollback confirmation timer (section 14.2).
+
+If a step fails, the bridge logs which step it was, waits 60 s with the
+button still watched, then restarts. It does not abort at once, because a
+restart loop shorter than a second would leave no time to hold BOOT. An
+image on trial then returns to the previous one.
 
 ---
 
@@ -430,7 +456,13 @@ one-at-a-time use.
   the largest possible response at the current baud rate. At 1 Mbaud that is
   about 160 ms for an ordinary command and about 280 ms for a bulk read. The
   150 ms margin covers the DSPi's flash-write blackout of about 45 ms and
-  its internal 50 ms busy retry.
+  its internal 50 ms busy retry. Bytes that arrived before the deadline
+  still count when they are parsed after it, so a briefly delayed uart task
+  does not turn a real answer into a timeout.
+- **Resynchronising.** A frame that fails its CRC, claims more payload than
+  a frame can carry, or stops arriving for 20 ms is discarded, and its bytes
+  after the `A5` are searched again for a sync byte. Noise or a lost byte
+  therefore costs at most the damaged frame, never the next one.
 
 ### 7.3 Retries
 
@@ -448,11 +480,14 @@ The uart task sends a request at most twice, and only in these cases:
 Other requests with no valid answer are not repeated, because the bridge
 cannot know whether they ran. `BUSY` (0x01) and `BULK_LOCKED` (0x04) are
 passed to the client unchanged, since the firmware has already retried for
-50 ms. When the last attempt gets no answer, the client receives Link
-status `0x82 TIMEOUT`; when it gets an answer that fails its CRC, status
-`0x05 CRC_ERROR`. A damaged frame counts as that answer only if its header
-says it is the kind awaited; a damaged notification followed by silence
-gives `TIMEOUT`. Every DSPi status is passed on unchanged.
+50 ms. When the last attempt gets no valid answer, whether nothing came or
+the answer failed its CRC, the client receives Link status `0x82 TIMEOUT`:
+the command may or may not have run. `0x05 CRC_ERROR` reaches a client only
+when the DSPi itself reports it, meaning the DSPi did not run the frame, so
+a client that retries on it never repeats a command that ran. A damaged
+frame counts as an answer only if its header says it is the kind awaited; a
+damaged notification followed by silence is simply no answer. Every DSPi
+status is passed on unchanged.
 
 ### 7.4 Recovery after a timeout
 
@@ -470,7 +505,9 @@ request, because responses carry no request id. Two rules prevent this:
 After 3 requests in a row without a valid answer, whether they timed out
 or got a damaged answer, the uart task also reinstalls the UART driver,
 which clears a receiver stuck on noise. Damaged answers count as well,
-because noise is exactly what a stuck receiver produces.
+because noise is exactly what a stuck receiver produces. This applies only
+while a device is present: probes (section 7.5) do not count, because each
+probe changes the baud rate, which already flushes the receiver.
 
 ### 7.5 Finding the baud rate
 
@@ -492,7 +529,13 @@ reports into Link events.
   `REQ_GET_UART_CONFIG` (0xF6), then reports the device found with those
   values. The hub assigns handle 0 and sends `device.added`.
 - **Watching.** When the link has carried no traffic for 1 s, the uart task
-  sends 0xF9 as a heartbeat.
+  sends `REQ_GET_SERIAL` (0x7E) as a heartbeat. An answer with a different
+  serial means another DSPi was plugged in: the uart task reports the device
+  lost, and the next probe finds the new one (see Swapping). A quick reboot
+  of the same DSPi cannot be told apart from no change.
+- **Notifications** are relayed only while a device is present. Frames that
+  arrive before the device is reported found are dropped, since no client
+  could yet place them.
 - **Losing.** Three requests in a row without a valid answer mark the
   device lost. A single timeout never does (Link spec 8.2). The hub reports the
   device `offline` and keeps handle 0 for 60 s, then sends
@@ -511,7 +554,11 @@ task's single queue, in this order of priority:
 
 Polls are granted against a budget of `baud / 25` bytes per second (40,000
 at 1 Mbaud), which leaves more than half of the link for commands and
-notifications.
+notifications. The budget is shared by every session, not given to each.
+Identical polls from different sessions are read once, at the fastest rate
+asked for, and count once. A `poll.subscribe` whose polls cannot all be
+granted at least 1 Hz within what is left is answered `busy`, and nothing
+changes.
 
 ---
 
@@ -552,6 +599,10 @@ notifications.
   on the Link port is taken, a new connection replaces the one used least
   recently, and TCP keep-alive drops peers that vanished without closing,
   so idle connections cannot hold the port.
+- With the PIN on, one address may hold at most 2 sessions that have not
+  yet authenticated. A third closes that address's oldest unauthenticated
+  session with code 4001, so one client cannot fill every slot before
+  pairing.
 - JSON messages, on the Link port and from the setup page, may nest at
   most 8 levels; anything deeper is refused unparsed, because the parser's
   recursion would otherwise overflow the stack of the task parsing it.
@@ -569,6 +620,11 @@ notifications.
   code 1011.
 - Pongs and close replies join the same queue, since writing them straight
   to the socket could split a batch that is part sent.
+- A session's send queue is also capped at 32 KB, so a client that asks for
+  bulk reads and never reads them cannot take the bridge's memory.
+- A frame too large, or fragmented (a first fragment included), is read and
+  thrown away, up to 64 KB, so the close code 4000 that follows reaches the
+  client; anything larger is cut off at once.
 - The Link WebSocket also answers on the setup network, so a phone on the
   setup network can control the DSPi before any home network is set up.
 
@@ -591,9 +647,13 @@ session with the client's `tag`. The hub never interprets payloads.
 
 Every notification frame from the DSPi is relayed to every authenticated
 session as a NOTIFY frame (Link spec 8.3). For `origin`, the hub keeps a
-queue of the sessions that sent SETs, in dispatch order, and drops entries
-older than 1 s. A notification whose source byte is `HOST_SET`, `BULK_SET`
-or `UART` takes the oldest entry.
+queue of the sessions that sent writes, in dispatch order: SETs, and GETs
+that `link_policy` classes as anything but *read* (write-as-read commands
+such as `REQ_RTA_CONTROL`). An entry's 1 s lifetime counts from when the
+uart task takes the write up, not from when it was queued, and a write the
+DSPi refuses leaves the queue at once, since it will cause no notification.
+A notification whose source byte is `HOST_SET`, `BULK_SET` or `UART` takes
+the oldest entry.
 
 The hub also watches the notification `seq` byte. On a gap it sends RESYNC
 with reason 0 to every session and marks the snapshot cache stale.
@@ -610,10 +670,17 @@ subscribes.
 
 The hub keeps one cached bulk blob and refreshes it by re-reading, as Link
 spec 7.5 allows, rather than by patching. Any `PARAM_CHANGED` or
-`BULK_INVALIDATED` notification, and any SET the hub forwards, marks the
-cache stale. A `device.snapshot` request served from a stale cache first
-re-reads the blob, which takes about 61 ms at 1 Mbaud. `status_b64` is read
-fresh for every snapshot. The blob is also read once when the device is
+`BULK_INVALIDATED` notification, and any write the hub forwards (a SET or a
+write-as-read GET), marks the cache stale. When the DSPi has
+`notify_enable` off, no notification can say what changed, so every
+snapshot re-reads the blob.
+
+Every `device.snapshot` request gets a fresh status read, plus a blob read
+when the cache is stale, which takes about 61 ms at 1 Mbaud. A request that
+arrives while a status read is already under way waits for the next one,
+so its answer never predates it. The hub matches each read's answer to the
+read by its tag, so an answer that arrives after the device went offline
+and came back is ignored. The blob is also read once when the device is
 found, which gives `wire_version` for the device object.
 
 ### 8.7 Locks, names and stats
@@ -657,10 +724,21 @@ found, which gives `wire_version` for the device object.
   iterations took 1.5 s on an ESP32-S3 and held up every session.
 - Tokens are 32 bytes from the hardware random number generator. The bridge
   stores their SHA-256 hashes for up to 16 clients. When the list is full,
-  pairing a new client evicts the one seen least recently.
-- `last_seen` is saved at most once an hour per client, to spare flash.
-  Timestamps come from SNTP. A timestamp taken before the clock was set is
-  left out of `auth.list`.
+  pairing a new client evicts the one seen least recently, and any session
+  the evicted client still has open is closed with code 4002.
+- `last_seen` is refreshed every minute while a client is connected, and
+  saved at most once an hour per client, to spare flash. Timestamps come
+  from SNTP. A timestamp taken before the clock was set is left out of
+  `auth.list`.
+- Client names are stored and sent as valid UTF-8: each bad byte or control
+  character becomes `?`, and a long name is cut only between characters.
+  Names saved by older firmware are repaired when loaded.
+- `hub.stats` and `hub.rename` require `admin` (Link spec 7.9), and
+  `device.rename` requires `control` or `admin`.
+- If the saved PIN data cannot be read, the bridge fails closed: it reports
+  `auth: "pin"`, answers every `auth.pair` and `auth.token` with `internal`,
+  and recovers when a new PIN is set, from the setup page after a factory
+  reset (section 12.2).
 - `auth.list` and `auth.revoke` are supported. `auth.set_role` answers
   `unsupported`, because every paired client is `admin`.
 - Rate limits follow Link spec 6.2 for a fixed PIN.
@@ -717,7 +795,10 @@ The bridge implements Link spec 7.10 to 7.14:
 | `led.pin` | The LED's pin, or `null` when `led.type` is `none`. | At once |
 
 Changing the UART pins or baud rate drops the device (`offline`) until it
-is found again, which the settings page explains before saving.
+is found again, which the settings page explains before saving. When one
+change moves both the UART and the LED, the LED lets go of its old pin
+first, the UART moves, and the LED starts last, so the two may trade pins in
+a single change.
 
 ---
 
@@ -772,9 +853,13 @@ network. A user who wants that window protected turns the PIN on.
 ### 9.3 The setup API
 
 Plain HTTP and JSON under `/setup/v1/`, answered only on the setup network:
-port 80 checks which interface each request arrived on, and from the home
-network it only ever redirects to the Link port. These paths are outside
-the Link protocol (Link spec 4.2) and carry no device commands.
+a request counts only if it arrived on the setup network's address from an
+address on its subnet, and from the home network port 80 only ever
+redirects to the Link port. The API also answers only requests whose
+`Host` is `192.168.4.1`, and takes POSTs only as `Content-Type:
+application/json`, so a web page open in the phone's browser cannot drive
+it. These paths are outside the Link protocol (Link spec 4.2) and carry no
+device commands.
 
 ```
 GET  /setup/v1/state
@@ -814,6 +899,8 @@ POST /setup/v1/finish
   the request just then; the page may try again).
 - A password is empty for an open network, or 8 to 63 characters, or
   exactly 64 hex digits, as WPA2 allows.
+- `networks` answers `busy` when a scan fails or another scan holds the
+  radio, rather than an empty list.
 
 ---
 
@@ -922,20 +1009,25 @@ default.
 | Namespace | Keys | Erased by |
 |-----------|------|-----------|
 | `bridge` | `schema` (u8), `hid`, `name`, `hostname`, `uart_tx`, `uart_rx`, `uart_baud`, `uart_detect`, `led_type`, `led_pin` | factory reset |
-| `wifi` | `ssid`, `password` | network or factory reset |
-| `auth` | `mode`, `pin_hash`, `pin_salt`, `clients` (blob: up to 16 records of token hash, name, created, last seen) | factory reset |
+| `wifi` | `network` (one blob: the name and password, always written together; the older separate `ssid` and `password` keys are read only when it is missing, and erased at the next save) | network or factory reset |
+| `auth` | `store` (one blob: a layout number, then whether the PIN is on, its hash and salt, and up to 16 records of token hash, name, created and last seen) | factory reset |
 | `devices` | `names` (blob: up to 8 records of serial and name) | factory reset |
 
 - The bridge stores Wi-Fi credentials itself and keeps ESP-IDF's own copy in
   RAM only (`WIFI_STORAGE_RAM`), so forgetting a network is one explicit
   erase.
+- If the `auth` blob is saved but cannot be read, or has a layout this
+  firmware does not know, the bridge starts with the PIN on and no usable
+  PIN, refusing every pairing, rather than starting open. A factory reset
+  recovers it. A firmware that changes the layout migrates the old one.
 - Every key is written before `schema`, so a power cut part way through
   leaves no schema and the next start begins again from defaults. A key
   that is missing or invalid at start is saved back with its default, so a
   generated value such as the hub id is never generated twice.
 - `schema` starts at 1. A firmware that finds an older schema migrates it
-  step by step; one that finds a newer schema (after a downgrade) resets the
-  `bridge` namespace to defaults and keeps the others.
+  step by step; one that finds a newer schema (after a downgrade) erases
+  only the keys in `bridge` it does not know, rewrites the ones it knows
+  with `schema` last, and keeps the hub id and the other namespaces.
 - Nothing is written on the command path. Settings are written only when the
   user changes them, plus the hourly `last_seen` update.
 
@@ -945,9 +1037,9 @@ default.
 
 ### 12.1 BOOT button
 
-The BOOT button is read only after the firmware has started. Holding it
-while power is applied puts the ESP32 into its download mode instead, which
-the README mentions.
+The BOOT button is read from the first step of the boot (section 6.5), so
+it works even when a later step fails. Holding it while power is applied
+puts the ESP32 into its download mode instead, which the README mentions.
 
 | Hold | LED (if fitted) | On release |
 |------|-----------------|------------|
@@ -977,9 +1069,12 @@ other way, because any other way would also be open to a stranger.
 
 ### 12.3 Crashes
 
-The bridge restarts itself on a crash or a watchdog timeout, and logs the
-reset reason at boot. Section 14.2 handles a new firmware that keeps
-crashing.
+The bridge restarts itself on a crash or a task watchdog timeout
+(`CONFIG_ESP_TASK_WDT_PANIC`), and logs what started it as "Started by: …"
+in the startup summary. A supervisor timer checks every 5 s that the hub
+task and the uart task are still going round their loops, and restarts the
+bridge when either has stopped for 30 s. Section 14.2 handles a new
+firmware that keeps crashing.
 
 ---
 
@@ -1047,10 +1142,18 @@ that the margin covers future growth. CI fails a build that exceeds it.
   ("restart the bridge first"), so the image the bootloader will start is
   never overwritten.
 - With rollback enabled in the bootloader, the new image starts in a
-  pending state. It confirms itself only after it has run for 60 s with the
-  hub task and the uart task both still going round their loops (Wi-Fi
-  started, or the boot would not have got that far). If it crashes or
-  restarts before that, the bootloader returns to the previous image.
+  pending state. It confirms itself once it runs properly: the hub task and
+  the uart task both going round their loops, the bridge on its home
+  network with an address or on its setup network, and the Link server
+  running. The first check is at 60 s, then every 10 s; an image still not
+  running properly after 5 min returns to the previous one. That limit is
+  longer than the 3 min Wi-Fi fallback (section 9.1), so an image waiting
+  for its home network is not judged before the setup network comes up. A
+  confirmation that fails to write is tried again 10 s later. If the image
+  crashes or restarts before it is confirmed, the bootloader returns to the
+  previous image, except that a restart the user asks for (`hub.restart`,
+  `hub.reset` or the BOOT button) first confirms an image that is running
+  properly at that moment.
 - While a new image is still on trial, another update is refused ("try
   again in a minute"), because ESP-IDF keeps the image it would return to.
 - On the ESP32-S3, a 983 KB image took about 4 to 7 s to send and check,
@@ -1067,13 +1170,18 @@ that the margin covers future growth. CI fails a build that exceeds it.
 - The installer page uses ESP Web Tools, which flashes from Chrome or Edge
   over USB. Its manifest lists one build per chip family, so the page picks
   the right image by itself. The page is hosted on GitHub Pages from this
-  repository.
+  repository, and serves ESP Web Tools from its own site: packaging
+  downloads one pinned version, checks it against the registry's SHA-512
+  integrity, and stops if it differs.
 - A release is made by pushing a tag `bridge-v<version>`, where `<version>`
   is the firmware's `PROJECT_VER`. CI checks they match, builds every chip,
-  boots each full image in QEMU (all chips but the ESP32-C6, which QEMU
-  lacks), attaches the files and their SHA-256 sums to the release, and
-  publishes the installer page. `tools/package_release.sh` does the
-  packaging, locally as in CI.
+  boots each full image in QEMU up to starting the network (all chips but
+  the ESP32-C6, which QEMU lacks; QEMU cannot start Wi-Fi), attaches the
+  files and their SHA-256 sums to the release, and publishes the installer
+  page. `tools/package_release.sh` does the packaging, locally as in CI.
+  The workflows pin every action by commit, and the repository's
+  `github-pages` environment needs a deployment rule for `bridge-v*` tags,
+  or GitHub refuses to publish the page from a release tag.
 - Developers build and flash with `idf.py` (section 17 and the README).
 
 ---

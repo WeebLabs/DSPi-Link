@@ -79,6 +79,13 @@ void hub_close_session(hub_t *hub, int slot, uint16_t code);
 /* Closes every live session except `except_slot` (-1 for none). */
 void hub_close_sessions(hub_t *hub, uint16_t code, int except_slot);
 
+/* Closes the open sessions of paired client `cid` (none for 0), except
+ * `except_slot` (-1 for none). */
+void hub_close_client_sessions(hub_t *hub, uint16_t cid, uint16_t code, int except_slot);
+
+/* Milliseconds since hub_init(), in 64 bits so hub.stats never wraps. */
+uint64_t hub_uptime_ms(hub_t *hub);
+
 /* "pin" or "none", as hello, the TXT record and the info endpoint say. */
 const char *hub_auth_mode(const hub_t *hub);
 
@@ -121,9 +128,10 @@ void hub_handle_reset(hub_t *hub, int slot, int id, const cJSON *message);
 void hub_commands_handle_frame(hub_t *hub, int slot, const uint8_t *data, size_t length);
 
 /* Queues a request the hub makes for itself (a poll or a snapshot read).
- * Returns false if the uart task's queue is full. */
-bool hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request, bool may_retry,
-                    const hub_poll_key_t *poll);
+ * Returns its tag, which is never 0, or 0 if the uart task's queue is
+ * full. */
+uint32_t hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request,
+                        bool may_retry, const hub_poll_key_t *poll);
 
 /* The session that most likely caused a notification from `source`, or 0
  * (Link spec 8.3). */
@@ -142,6 +150,11 @@ cJSON *hub_device_json(const hub_t *hub);
 
 /* True when handle 0 is a device that is online. */
 bool hub_device_online(const hub_t *hub);
+
+/* False when the DSPi is known to have notifications turned off (bridge
+ * spec 5): then `notify` is not offered and the snapshot cache cannot see
+ * changes, so every snapshot reads the blob again. */
+bool hub_device_notifies(const hub_t *hub);
 
 void hub_handle_device_list(hub_t *hub, int slot, int id, const cJSON *message);
 void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message);

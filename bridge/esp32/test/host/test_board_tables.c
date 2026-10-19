@@ -20,7 +20,7 @@ typedef struct {
     const board_table_t *table;
     const uint8_t *never_for_uart; /* Flash, PSRAM, USB, console, strapping */
     size_t never_for_uart_count;
-    const uint8_t *input_only; /* May be RX, never TX or LED */
+    const uint8_t *input_only; /* No output and no pull-up: never offered */
     size_t input_only_count;
 } chip_facts_t;
 
@@ -92,11 +92,14 @@ static void unsafe_pins_are_never_offered_for_the_uart(void)
     }
 }
 
-static void input_only_pins_are_never_outputs(void)
+/* Input-only pins cannot drive TX or an LED, and have no pull-up, so an
+ * RX line on one would float whenever the DSPi is unplugged or off. */
+static void input_only_pins_are_never_offered(void)
 {
     for (size_t i = 0; i < COUNT(CHIPS); i++) {
         const chip_facts_t *chip = &CHIPS[i];
         CHECK(!contains_any(chip->table->uart_tx_pins, chip->input_only, chip->input_only_count));
+        CHECK(!contains_any(chip->table->uart_rx_pins, chip->input_only, chip->input_only_count));
         CHECK(!contains_any(chip->table->led_pins, chip->input_only, chip->input_only_count));
     }
 }
@@ -124,7 +127,7 @@ void test_board_tables(void)
     RUN(lists_are_sorted_and_unique);
     RUN(defaults_are_offered_and_distinct);
     RUN(unsafe_pins_are_never_offered_for_the_uart);
-    RUN(input_only_pins_are_never_outputs);
+    RUN(input_only_pins_are_never_offered);
     RUN(boot_button_is_never_offered);
     RUN(chip_names_match_esp_idf_targets);
 }

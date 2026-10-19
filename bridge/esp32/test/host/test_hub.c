@@ -31,10 +31,12 @@ static const dspi_identity_t IDENTITY = {
  * Helpers
  * ------------------------------------------------------------------------- */
 
+static uint32_t unix_now;
+
 static uint32_t fake_unix_time(void *context)
 {
     (void)context;
-    return 1800000000; /* 2027-01-15 */
+    return unix_now;
 }
 
 static uint32_t fake_auth_now(void *context)
@@ -51,8 +53,11 @@ static void fake_auth_save(void *context, const hub_auth_store_t *store)
 
 #define CLIENT_ADDRESS 0x0A01A8C0u /* 192.168.1.10 */
 
-static void start(void)
+/* Starts the hub as hub_task does; `auth_unreadable` as when the saved PIN
+ * could not be read. */
+static void start_with(bool auth_unreadable)
 {
+    unix_now = 1800000000; /* 2027-01-15 */
     const hub_io_t io = fake_hub_io_init(&io_record);
     fake_crypto_reset();
     static const uint8_t MAC[6] = {0x80, 0x45, 0x6B, 0x35, 0x1B, 0x34};
@@ -61,6 +66,7 @@ static void start(void)
         .board = &BOARD_TABLE_ESP32S3,
         .version = "0.1.0",
         .max_sessions = 4,
+        .auth_unreadable = auth_unreadable,
     };
     settings_model_defaults(&config.settings, &BOARD_TABLE_ESP32S3, MAC, RANDOM);
     const hub_auth_io_t auth_io = {
@@ -72,6 +78,11 @@ static void start(void)
         .save = fake_auth_save,
     };
     hub_init(&hub, &io, &config, &auth_io, NULL);
+}
+
+static void start(void)
+{
+    start_with(false);
 }
 
 static void forget_messages(void)
@@ -488,7 +499,7 @@ static void failures_map_to_link_statuses(void)
 
     send_cmd(0, 2, true, 0x7F, 7, NULL);
     hub_reply(&hub, io_record.submissions[1].tag, &(dspi_reply_t){.kind = DSPI_REPLY_CORRUPT});
-    CHECK(last_status(0) == DSPI_STATUS_CRC_ERROR);
+    CHECK(last_status(0) == LINK_STATUS_TIMEOUT); /* It may have run: never "retry" */
 
     send_cmd(0, 3, true, 0x7F, 7, NULL);
     answer_last(DSPI_STATUS_BUSY, NULL, 0);
@@ -664,25 +675,122 @@ static void only_reads_may_be_polled(void)
  * Snapshot and locks
  * ------------------------------------------------------------------------- */
 
-static void snapshots_come_from_the_cache_until_something_changes(void)
+static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uint16_t length);
+
+/* The request of the last submission, or -1 if there is none. */
+static int last_request(void)
+{
+    return io_record.submission_count > 0
+               ? io_record.submissions[io_record.submission_count - 1].request.request
+               : -1;
+}
+
+static void snapshots_read_the_status_fresh_and_the_blob_when_it_changed(void)
 {
     start();
     open_session(0);
     attach_device();
 
+    /* The blob is current, so only the status frame is read (bridge spec
+     * 8.6), and the answer waits for it. */
+    forget_messages();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
-    CHECK(io_record.submission_count == 0); /* Served from the cache */
+    CHECK(io_record.submission_count == 1 && last_request() == 0x50);
+    CHECK(last_json(0, "ok") == NULL);
+    static const uint8_t status[41] = {7, 7, 7};
+    answer_last(0, status, sizeof(status));
     cJSON *ok = last_json(0, "ok");
-    CHECK(strlen(json_string(ok, "bulk_b64")) == 8184); /* 6136 bytes as base64 */
-    CHECK(strlen(json_string(ok, "status_b64")) == 56);
+    CHECK(strlen(json_string(ok, "bulk_b64")) == 8184);            /* 6136 bytes as base64 */
+    CHECK(strncmp(json_string(ok, "status_b64"), "BwcH", 4) == 0); /* The new frame */
     CHECK(json_number(ok, "wire_version") == 32);
     cJSON_Delete(ok);
 
     notify(1, 1);
     forget_messages();
+    forget_submissions();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
-    CHECK(io_record.submission_count == 1); /* Stale: read again */
+    CHECK(io_record.submission_count == 1 && last_request() == 0xA0); /* Stale: blob too */
     CHECK(last_json(0, "ok") == NULL);
+}
+
+static void a_snapshot_asked_during_a_status_read_waits_for_the_next(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    forget_messages();
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    send_json(1, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
+    CHECK(io_record.submission_count == 1); /* One read at a time */
+    static const uint8_t status[41] = {1};
+    answer_last(0, status, sizeof(status));
+    cJSON *ok = last_json(0, "ok");
+    CHECK(ok != NULL);
+    cJSON_Delete(ok);
+    CHECK(last_json(1, "ok") == NULL); /* Its read had started before it asked */
+    CHECK(io_record.submission_count == 2 && last_request() == 0x50);
+    answer_last(0, status, sizeof(status));
+    ok = last_json(1, "ok");
+    CHECK(ok != NULL && json_number(ok, "id") == 7);
+    cJSON_Delete(ok);
+}
+
+static void without_notifications_every_snapshot_reads_the_blob(void)
+{
+    start();
+    open_session(0);
+    dspi_identity_t quiet = IDENTITY;
+    quiet.notify_enabled = false;
+    hub_device_found(&hub, &quiet, 1000000);
+    static uint8_t bulk[6136] = {32, 0, 17};
+    answer_last(0, bulk, sizeof(bulk));
+    static const uint8_t status[41] = {1};
+    answer_last(0, status, sizeof(status));
+    forget_submissions();
+
+    /* Nothing would tell the cache the DSPi changed, so it is never trusted. */
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
+}
+
+static void write_as_read_commands_mark_the_cache_stale(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    send_cmd(0, 1, true, 0x91 /* PRESET_LOAD, a GET that writes */, 1, NULL);
+    answer_last(0, (const uint8_t[]){0}, 1);
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
+}
+
+static void an_answer_for_an_abandoned_snapshot_read_is_ignored(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    notify(1, 1);
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    const uint32_t old_read = io_record.submissions[io_record.submission_count - 1].tag;
+    hub_device_lost(&hub);
+    hub_device_found(&hub, &IDENTITY, 1000000); /* Reads the blob again */
+    const uint32_t new_read = io_record.submissions[io_record.submission_count - 1].tag;
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
+    forget_messages();
+
+    /* The old read's late failure neither fails the new waiter nor ends the
+     * new read. */
+    answer_tag(old_read, 2, NULL, 0);
+    CHECK(last_json(0, "err") == NULL);
+    static uint8_t bulk[6136] = {32, 0, 17};
+    answer_tag(new_read, 0, bulk, sizeof(bulk));
+    static const uint8_t status[41] = {1};
+    answer_last(0, status, sizeof(status));
+    cJSON *ok = last_json(0, "ok");
+    CHECK(ok != NULL && json_number(ok, "id") == 7);
+    cJSON_Delete(ok);
 }
 
 static void a_lock_keeps_other_sessions_out(void)
@@ -1373,6 +1481,313 @@ static void a_failed_hash_keeps_the_pin_off(void)
     CHECK(io_record.close_code[0] == 0);
 }
 
+/* ---------------------------------------------------------------------------
+ * Origins, the poll budget, names, roles and other audit findings
+ * ------------------------------------------------------------------------- */
+
+static uint16_t last_notify_origin(int slot)
+{
+    const fake_message_t *frame = last_frame(slot, LINK_FRAME_NOTIFY);
+    return frame != NULL ? (uint16_t)(frame->data[6] | (frame->data[7] << 8)) : 0xFFFF;
+}
+
+static void a_refused_write_claims_no_notification(void)
+{
+    start();
+    open_session(0);
+    const int second = open_session(1);
+    attach_device();
+    send_cmd(0, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    answer_last(2 /* ERROR: nothing changed */, NULL, 0);
+    send_cmd(1, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    answer_last(0, NULL, 0);
+    notify(1, 1 /* HOST_SET */);
+    CHECK(last_notify_origin(0) == second);
+}
+
+static void write_as_read_commands_are_attributed(void)
+{
+    start();
+    const int loader = open_session(0);
+    attach_device();
+    send_cmd(0, 1, true, 0x91 /* PRESET_LOAD */, 1, NULL);
+    answer_last(0, (const uint8_t[]){0}, 1);
+    notify(1, 1);
+    CHECK(last_notify_origin(0) == loader);
+}
+
+static void a_write_queued_behind_a_slow_one_keeps_its_window(void)
+{
+    start();
+    const int writer = open_session(0);
+    attach_device();
+    send_cmd(0, 1, true, 0x7F, 7, NULL); /* A read first */
+    const uint32_t read = io_record.submissions[0].tag;
+    send_cmd(0, 2, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    const uint32_t write = io_record.submissions[1].tag;
+    io_record.now_ms += 2 * LINK_ORIGIN_WINDOW_MS; /* The read takes its time */
+    answer_tag(read, 0, (const uint8_t[]){1}, 1);
+    io_record.now_ms += 10;
+    answer_tag(write, 0, NULL, 0);
+    notify(1, 1);
+    /* The window runs from when the DSPi was asked, not from when it was queued. */
+    CHECK(last_notify_origin(0) == writer);
+}
+
+static void subscribe_one(int slot, int poll_slot, int request, int value, int length, int hz)
+{
+    send_json(slot,
+              "{\"t\":\"poll.subscribe\",\"id\":30,\"handle\":0,\"polls\":[{\"slot\":%d,\"req\":%d,"
+              "\"val\":%d,\"idx\":2,\"len\":%d,\"hz\":%d}]}",
+              poll_slot, request, value, length, hz);
+}
+
+static void the_poll_budget_is_shared_by_every_session(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+
+    /* One bulk-sized poll takes most of the 40,000 bytes a second. */
+    subscribe_one(0, 0, 0xA0, 0, 8192, 20);
+    cJSON *ok = last_json(0, "ok");
+    const cJSON *grant = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(ok, "granted"), 0);
+    const int granted = json_number(grant, "hz");
+    CHECK(granted >= 1 && granted < 20);
+    CHECK((uint32_t)granted * 8192 <= hub_poll_budget(&hub));
+    cJSON_Delete(ok);
+
+    /* Another session cannot add a second one on top, even at 1 Hz... */
+    subscribe_one(1, 0, 0xA0, 1, 8192, 1);
+    cJSON *err = last_json(1, "err");
+    CHECK(strcmp(json_string(err, "code"), "busy") == 0);
+    cJSON_Delete(err);
+    CHECK(!hub.sessions[1].polls[0].active);
+
+    /* ...but may share the one that runs, which costs nothing more. */
+    forget_messages();
+    subscribe_one(1, 0, 0xA0, 0, 8192, 1);
+    ok = last_json(1, "ok");
+    grant = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(ok, "granted"), 0);
+    CHECK(json_number(grant, "hz") == 1);
+    cJSON_Delete(ok);
+}
+
+/* True when `length` bytes are well-formed UTF-8. */
+static bool valid_utf8(const uint8_t *text, size_t length)
+{
+    for (size_t i = 0; i < length;) {
+        const uint8_t lead = text[i];
+        const size_t size = lead < 0x80           ? 1
+                            : (lead >> 5) == 0x6  ? 2
+                            : (lead >> 4) == 0xE  ? 3
+                            : (lead >> 3) == 0x1E ? 4
+                                                  : 0;
+        if (size == 0 || i + size > length) {
+            return false;
+        }
+        for (size_t k = 1; k < size; k++) {
+            if ((text[i + k] & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+        i += size;
+    }
+    return true;
+}
+
+static void client_names_are_kept_valid_utf8(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
+    /* 64 bytes: a cut at 63 would split the last character. */
+    char name[128] = "a";
+    for (int i = 0; i < 21; i++) {
+        strcat(name, "\xE6\x97\xA5");
+    }
+    send_json(0,
+              "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":2},\"client\":{\"name\":\"%s\"}}",
+              name);
+    send_json(0, "{\"t\":\"auth.pair\",\"id\":2,\"pin\":\"482913\"}");
+    forget_messages();
+    send_json(0, "{\"t\":\"auth.list\",\"id\":3}");
+    CHECK(io_record.message_count == 1);
+    CHECK(valid_utf8(io_record.messages[0].data, io_record.messages[0].length));
+    cJSON *ok = last_json(0, "ok");
+    const cJSON *client = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(ok, "clients"), 0);
+    CHECK(strlen(json_string(client, "name")) == 61); /* "a" and 20 whole characters */
+    cJSON_Delete(ok);
+
+    /* Bytes that are not UTF-8 at all become '?'. */
+    hub_session_opened(&hub, 1, CLIENT_ADDRESS);
+    send_json(1, "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":2},\"client\":{\"name\":"
+                 "\"x\xFF\xC0\"}}");
+    CHECK(strcmp(hub.sessions[1].client_name, "x??") == 0);
+}
+
+static void an_unreadable_pin_lets_nobody_in_until_it_is_set_again(void)
+{
+    start_with(true);
+    hub_session_opened(&hub, 0, CLIENT_ADDRESS);
+    send_json(0, "{\"t\":\"hello\",\"proto\":{\"major\":1,\"minor\":2}}");
+    cJSON *hello = last_json(0, "hello");
+    CHECK(strcmp(json_string(hello, "auth"), "pin") == 0);
+    CHECK(strcmp(json_string(hello, "pin_source"), "fixed") == 0);
+    cJSON_Delete(hello);
+
+    send_json(0, "{\"t\":\"auth.pair\",\"id\":1,\"pin\":\"000000\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    forget_messages();
+    send_json(0, "{\"t\":\"auth.token\",\"id\":2,\"token\":\"%043d\"}", 0);
+    err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    CHECK(hub.sessions[0].state == HUB_SESSION_AUTHENTICATING);
+    CHECK(hub_check_pin(&hub, CLIENT_ADDRESS, "000000") == HUB_AUTH_UNAVAILABLE);
+    CHECK(hub_pin_enabled(&hub));
+
+    /* Setting the PIN from the setup page recovers. */
+    CHECK(hub_set_pin(&hub, "482913") == HUB_AUTH_OK);
+    CHECK(hub_check_pin(&hub, CLIENT_ADDRESS, "482913") == HUB_AUTH_OK);
+    start_with(true);
+    CHECK(hub_set_pin(&hub, NULL) == HUB_AUTH_OK);
+    CHECK(!hub_pin_enabled(&hub));
+}
+
+static void one_address_cannot_fill_the_bridge_unauthenticated(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    hello_only(0);
+    io_record.now_ms += 10;
+    hello_only(1);
+    io_record.now_ms += 10;
+    CHECK(io_record.close_code[0] == 0 && io_record.close_code[1] == 0);
+    hello_only(2); /* A third from the same address closes its oldest */
+    CHECK(io_record.close_code[0] == 4001);
+    CHECK(io_record.close_code[1] == 0 && io_record.close_code[2] == 0);
+    hub_session_opened(&hub, 3, CLIENT_ADDRESS + 1); /* Others are not affected */
+    CHECK(io_record.close_code[3] == 0);
+
+    /* With auth none every session is in at hello, so nothing is limited. */
+    start();
+    for (int slot = 0; slot < 3; slot++) {
+        open_session(slot);
+    }
+    CHECK(io_record.close_code[0] == 0);
+}
+
+/* Pairs session `slot` with the PIN; returns its client id. */
+static uint16_t pair_session(int slot)
+{
+    hello_only(slot);
+    send_json(slot, "{\"t\":\"auth.pair\",\"id\":1,\"pin\":\"482913\",\"name\":\"S%d\"}", slot);
+    return hub.sessions[slot].cid;
+}
+
+/* Pairs clients straight through hub_auth until the list is full. */
+static void fill_client_list(void)
+{
+    char token[HUB_AUTH_TOKEN_CHARS + 1];
+    uint16_t cid = 0;
+    size_t count = 0;
+    const hub_auth_client_t *clients = hub_auth_clients(&hub.auth, &count);
+    for (size_t i = 0; i < count; i++) {
+        if (!clients[i].used) {
+            CHECK(hub_auth_issue(&hub.auth, "Other", token, &cid, NULL) == HUB_AUTH_OK);
+        }
+    }
+}
+
+static void a_client_forgotten_for_room_is_disconnected(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    pair_session(0); /* The first in the list, and so the stalest */
+    unix_now += 10;
+    fill_client_list();
+    unix_now += 10;
+    pair_session(1);
+    CHECK(io_record.close_code[0] == 4002); /* Its token is gone */
+    CHECK(io_record.close_code[1] == 0);
+}
+
+static void a_connected_client_stays_seen(void)
+{
+    start();
+    hub_set_pin(&hub, "482913");
+    pair_session(0);
+    unix_now += 10;
+    fill_client_list();
+    /* Session 0 stays connected while time passes. */
+    for (int i = 0; i < 3; i++) {
+        io_record.now_ms += HUB_AUTH_TOUCH_INTERVAL_MS;
+        unix_now += 60;
+        hub_session_activity(&hub, 0);
+        hub_tick(&hub);
+    }
+    pair_session(1); /* Forgets a client that is away instead */
+    CHECK(io_record.close_code[0] == 0);
+    CHECK(hub.sessions[0].state == HUB_SESSION_OPEN);
+}
+
+static void viewers_cannot_administer_or_rename(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    hub.sessions[0].role = LINK_ROLE_VIEWER; /* A hub with roles would grant this */
+    const char *requests[] = {
+        "{\"t\":\"hub.stats\",\"id\":1}",
+        "{\"t\":\"hub.rename\",\"id\":1,\"name\":\"Studio\"}",
+        "{\"t\":\"device.rename\",\"id\":1,\"handle\":0,\"name\":\"Studio\"}",
+    };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        forget_messages();
+        send_json(0, "%s", requests[i]);
+        cJSON *err = last_json(0, "err");
+        CHECK(strcmp(json_string(err, "code"), "denied") == 0);
+        cJSON_Delete(err);
+    }
+    CHECK(io_record.apply_attempts == 0);
+    CHECK(io_record.saved_device_name[0] == '\0');
+}
+
+static void uptime_survives_the_clock_wrapping(void)
+{
+    start();
+    open_session(0);
+    for (int hour = 0; hour < 50 * 24; hour++) {
+        io_record.now_ms += 60u * 60u * 1000u;
+        hub_tick(&hub);
+    }
+    open_session(1); /* Session 0 timed out long ago */
+    send_json(1, "{\"t\":\"hub.stats\",\"id\":1}");
+    cJSON *ok = last_json(1, "ok");
+    CHECK(json_number(ok, "uptime_s") == 50 * 24 * 3600);
+    cJSON_Delete(ok);
+}
+
+static void a_failed_change_puts_the_old_settings_back(void)
+{
+    start();
+    open_session(0);
+    const uint32_t old_baud = hub.config.settings.uart_baud;
+    io_record.refuse_apply = true;
+    send_json(0, "{\"t\":\"hub.config.set\",\"id\":2,\"config\":{\"uart\":{\"baud\":921600}}}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    /* The I/O may have saved part of it: the old settings go back. */
+    CHECK(io_record.apply_attempts == 2);
+    CHECK(io_record.attempted.uart_baud == old_baud);
+    CHECK(hub.config.settings.uart_baud == old_baud);
+}
+
 void test_hub(void)
 {
     RUN(hello_describes_the_bridge);
@@ -1402,7 +1817,11 @@ void test_hub(void)
     RUN(commands_go_before_polls);
     RUN(polling_stops_when_nobody_subscribes);
     RUN(only_reads_may_be_polled);
-    RUN(snapshots_come_from_the_cache_until_something_changes);
+    RUN(snapshots_read_the_status_fresh_and_the_blob_when_it_changed);
+    RUN(a_snapshot_asked_during_a_status_read_waits_for_the_next);
+    RUN(without_notifications_every_snapshot_reads_the_blob);
+    RUN(write_as_read_commands_mark_the_cache_stale);
+    RUN(an_answer_for_an_abandoned_snapshot_read_is_ignored);
     RUN(a_lock_keeps_other_sessions_out);
     RUN(the_hub_can_be_renamed);
     RUN(with_the_pin_on_hello_asks_for_it);
@@ -1428,4 +1847,16 @@ void test_hub(void)
     RUN(one_session_cannot_fill_the_snapshot_queue);
     RUN(failures_the_io_reports_are_errors);
     RUN(a_failed_hash_keeps_the_pin_off);
+    RUN(a_refused_write_claims_no_notification);
+    RUN(write_as_read_commands_are_attributed);
+    RUN(a_write_queued_behind_a_slow_one_keeps_its_window);
+    RUN(the_poll_budget_is_shared_by_every_session);
+    RUN(client_names_are_kept_valid_utf8);
+    RUN(an_unreadable_pin_lets_nobody_in_until_it_is_set_again);
+    RUN(one_address_cannot_fill_the_bridge_unauthenticated);
+    RUN(a_client_forgotten_for_room_is_disconnected);
+    RUN(a_connected_client_stays_seen);
+    RUN(viewers_cannot_administer_or_rename);
+    RUN(uptime_survives_the_clock_wrapping);
+    RUN(a_failed_change_puts_the_old_settings_back);
 }

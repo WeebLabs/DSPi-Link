@@ -9,6 +9,8 @@
 
 #include "dspi_frame.h"
 
+#include <string.h>
+
 uint16_t dspi_crc16_update(uint16_t crc, const uint8_t *data, size_t length)
 {
     /* CRC-16/CCITT-FALSE: polynomial 0x1021, most significant bit first, no
@@ -60,8 +62,10 @@ void dspi_parser_reset(dspi_parser_t *parser)
 {
     parser->stage = DSPI_PARSER_WAIT_SYNC;
     parser->length = 0;
-    parser->received = 0;
     parser->crc = DSPI_CRC_INITIAL;
+    parser->stored = 0;
+    parser->rescan_next = 0;
+    parser->rescan_end = 0;
 }
 
 bool dspi_parser_in_frame(const dspi_parser_t *parser)
@@ -75,14 +79,58 @@ static bool is_device_frame_type(uint8_t type)
            type == DSPI_FRAME_TYPE_NOTIFICATION;
 }
 
-/* Adds one byte after the sync byte to the running CRC. */
-static void add_to_crc(dspi_parser_t *parser, uint8_t byte)
+/* The longest payload a frame in the buffer can carry. */
+static size_t max_payload(const dspi_parser_t *parser)
 {
-    parser->crc = dspi_crc16_update(parser->crc, &byte, 1);
+    return parser->capacity > DSPI_PARSER_OVERHEAD_BYTES
+               ? parser->capacity - DSPI_PARSER_OVERHEAD_BYTES
+               : 0;
+}
+
+/* Keeps one byte of the current frame. `checked` adds it to the CRC, which
+ * covers everything after the sync byte except the CRC itself. */
+static void store(dspi_parser_t *parser, uint8_t byte, bool checked)
+{
+    parser->buffer[parser->stored++] = byte;
+    if (checked) {
+        parser->crc = dspi_crc16_update(parser->crc, &byte, 1);
+    }
+}
+
+/* Describes the frame in the parser, finished or discarded. Its bytes after
+ * the sync byte are type, status, length (2) and then the payload. */
+static void describe_frame(const dspi_parser_t *parser, dspi_frame_t *frame)
+{
+    frame->type = parser->buffer[0];
+    frame->status = parser->buffer[1];
+    frame->length = parser->length;
+    frame->payload = &parser->buffer[4];
+}
+
+/*
+ * Drops the current frame and queues its bytes for rescanning, ahead of any
+ * bytes still waiting from an earlier rescan. The type byte is left out: it
+ * followed the sync byte that turned out to be false, and is never 0xA5.
+ *
+ * Both moves go towards the start of the buffer. A frame found while
+ * rescanning is stored behind the byte being read, so its bytes always end
+ * before the bytes still waiting.
+ */
+static void keep_for_rescan(dspi_parser_t *parser)
+{
+    const size_t skip = parser->stored > 0 ? 1 : 0;
+    const size_t kept = parser->stored - skip;
+    const size_t waiting = parser->rescan_end - parser->rescan_next;
+    memmove(parser->buffer, parser->buffer + skip, kept);
+    memmove(parser->buffer + kept, parser->buffer + parser->rescan_next, waiting);
+    parser->rescan_next = 0;
+    parser->rescan_end = kept + waiting;
+    parser->stored = 0;
+    parser->stage = DSPI_PARSER_WAIT_SYNC;
 }
 
 /* Handles the bytes before the payload: type, status and length. */
-static dspi_parse_result_t feed_header(dspi_parser_t *parser, uint8_t byte)
+static dspi_parse_result_t parse_header(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame)
 {
     switch (parser->stage) {
     case DSPI_PARSER_WAIT_TYPE:
@@ -92,45 +140,39 @@ static dspi_parse_result_t feed_header(dspi_parser_t *parser, uint8_t byte)
                 (byte == DSPI_FRAME_SYNC) ? DSPI_PARSER_WAIT_TYPE : DSPI_PARSER_WAIT_SYNC;
             return DSPI_PARSE_NOTHING;
         }
-        parser->type = byte;
+        store(parser, byte, true);
         parser->stage = DSPI_PARSER_WAIT_STATUS;
-        break;
+        return DSPI_PARSE_NOTHING;
     case DSPI_PARSER_WAIT_STATUS:
-        parser->status = byte;
+        store(parser, byte, true);
         parser->stage = DSPI_PARSER_WAIT_LENGTH_LOW;
-        break;
+        return DSPI_PARSE_NOTHING;
     case DSPI_PARSER_WAIT_LENGTH_LOW:
-        parser->length = byte;
+        store(parser, byte, true);
         parser->stage = DSPI_PARSER_WAIT_LENGTH_HIGH;
-        break;
+        return DSPI_PARSE_NOTHING;
     default: /* DSPI_PARSER_WAIT_LENGTH_HIGH */
-        parser->length |= (uint16_t)(byte << 8);
-        if (parser->length > parser->capacity) {
+        store(parser, byte, true);
+        parser->length = (uint16_t)(parser->buffer[2] | (parser->buffer[3] << 8));
+        if (parser->length > max_payload(parser)) {
+            describe_frame(parser, frame);
+            frame->payload = NULL;
+            keep_for_rescan(parser);
             return DSPI_PARSE_TOO_LONG;
         }
-        parser->received = 0;
         parser->stage = parser->length > 0 ? DSPI_PARSER_WAIT_PAYLOAD : DSPI_PARSER_WAIT_CRC_LOW;
-        break;
+        return DSPI_PARSE_NOTHING;
     }
-    add_to_crc(parser, byte);
-    return DSPI_PARSE_NOTHING;
 }
 
-/* Describes the frame in the parser, finished or discarded. */
-static void describe_frame(const dspi_parser_t *parser, dspi_frame_t *frame)
-{
-    frame->type = parser->type;
-    frame->status = parser->status;
-    frame->length = parser->length;
-    frame->payload = parser->buffer;
-}
-
-dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame)
+/* Parses one byte, received or rescanned. */
+static dspi_parse_result_t parse(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame)
 {
     switch (parser->stage) {
     case DSPI_PARSER_WAIT_SYNC:
         if (byte == DSPI_FRAME_SYNC) {
             parser->crc = DSPI_CRC_INITIAL;
+            parser->stored = 0;
             parser->stage = DSPI_PARSER_WAIT_TYPE;
         }
         return DSPI_PARSE_NOTHING;
@@ -139,35 +181,31 @@ dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_f
     case DSPI_PARSER_WAIT_STATUS:
     case DSPI_PARSER_WAIT_LENGTH_LOW:
     case DSPI_PARSER_WAIT_LENGTH_HIGH:
-        if (feed_header(parser, byte) == DSPI_PARSE_TOO_LONG) {
-            describe_frame(parser, frame);
-            frame->payload = NULL;
-            dspi_parser_reset(parser);
-            return DSPI_PARSE_TOO_LONG;
-        }
-        return DSPI_PARSE_NOTHING;
+        return parse_header(parser, byte, frame);
 
     case DSPI_PARSER_WAIT_PAYLOAD:
-        parser->buffer[parser->received++] = byte;
-        add_to_crc(parser, byte);
-        if (parser->received == parser->length) {
+        store(parser, byte, true);
+        if (parser->stored == 4u + parser->length) {
             parser->stage = DSPI_PARSER_WAIT_CRC_LOW;
         }
         return DSPI_PARSE_NOTHING;
 
     case DSPI_PARSER_WAIT_CRC_LOW:
-        parser->crc_low = byte;
+        store(parser, byte, false);
         parser->stage = DSPI_PARSER_WAIT_CRC_HIGH;
         return DSPI_PARSE_NOTHING;
 
     case DSPI_PARSER_WAIT_CRC_HIGH: {
-        const uint16_t received_crc = (uint16_t)(parser->crc_low | (byte << 8));
-        parser->stage = DSPI_PARSER_WAIT_SYNC;
+        store(parser, byte, false);
+        const uint8_t *crc = &parser->buffer[parser->stored - DSPI_FRAME_CRC_BYTES];
+        const uint16_t received_crc = (uint16_t)(crc[0] | (crc[1] << 8));
         describe_frame(parser, frame);
         if (received_crc != parser->crc) {
             frame->payload = NULL;
+            keep_for_rescan(parser);
             return DSPI_PARSE_BAD_CRC;
         }
+        parser->stage = DSPI_PARSER_WAIT_SYNC;
         return DSPI_PARSE_FRAME;
     }
     }
@@ -175,4 +213,35 @@ dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_f
     /* Unreachable with a valid stage; recover rather than trust bad state. */
     dspi_parser_reset(parser);
     return DSPI_PARSE_NOTHING;
+}
+
+dspi_parse_result_t dspi_parser_feed(dspi_parser_t *parser, uint8_t byte, dspi_frame_t *frame)
+{
+    /* A caller that feeds while bytes wait to be rescanned has broken the
+     * order of the stream; drop them rather than let the new frame overwrite
+     * them half read. */
+    parser->rescan_next = parser->rescan_end;
+    return parse(parser, byte, frame);
+}
+
+bool dspi_parser_rescan(dspi_parser_t *parser, dspi_parse_result_t *result, dspi_frame_t *frame)
+{
+    if (!dspi_parser_rescan_pending(parser)) {
+        return false;
+    }
+    const uint8_t byte = parser->buffer[parser->rescan_next++];
+    *result = parse(parser, byte, frame);
+    return true;
+}
+
+bool dspi_parser_rescan_pending(const dspi_parser_t *parser)
+{
+    return parser->rescan_next != parser->rescan_end;
+}
+
+void dspi_parser_abandon(dspi_parser_t *parser)
+{
+    if (dspi_parser_in_frame(parser)) {
+        keep_for_rescan(parser);
+    }
 }

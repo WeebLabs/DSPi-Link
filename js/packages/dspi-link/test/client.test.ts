@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { LinkClient, closeReasonFor } from "../src/client.js";
 import { LINK_SUBPROTOCOL } from "../src/constants.js";
 import { LinkCommandError, LinkProtocolError } from "../src/errors.js";
-import { LinkStatus } from "../src/frames.js";
+import { LinkStatus, ResyncReason, type LinkFrame } from "../src/frames.js";
 import { bytesToBase64 } from "../src/base64.js";
 import type { DeviceInfo } from "../src/messages.js";
 import { FakeHub, settle, waitFor, type FakeHubConfig } from "./fakeHub.js";
@@ -33,6 +33,16 @@ const DEVICE: DeviceInfo = {
 function newClient(hub: FakeHub): LinkClient {
   // Pings and reconnects are off so a test never depends on a timer.
   return new LinkClient({ webSocket: hub.webSocket, pingIntervalMs: 0, reconnect: false });
+}
+
+/** A client that reconnects at once, for the tests that drop the socket. */
+function newReconnectingClient(hub: FakeHub): LinkClient {
+  return new LinkClient({
+    webSocket: hub.webSocket,
+    pingIntervalMs: 0,
+    reconnect: true,
+    reconnectMaxMs: 5,
+  });
 }
 
 describe("handshake", () => {
@@ -671,6 +681,280 @@ describe("sessions that go wrong", () => {
     await settle();
     expect(info).toMatchObject({ willReconnect: false });
     expect(client.state).toBe("closed");
+  });
+});
+
+describe("missed notifications (spec 8.3)", () => {
+  /** A NOTIFY frame carrying a v2 packet with firmware `seq`. */
+  function notify(tag: number, handle: number, seq: number): LinkFrame {
+    return { type: "notify", tag, handle, origin: 0, packet: new Uint8Array([2, 0x02, 0, seq, 0]) };
+  }
+
+  async function watch(devices: DeviceInfo[]) {
+    const hub = new FakeHub({ auth: "none", devices });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const resyncs: Array<{ handle: number; reason: number }> = [];
+    client.on("resync", (frame) => resyncs.push({ handle: frame.handle, reason: frame.reason }));
+    return { hub, client, resyncs };
+  }
+
+  it("stays quiet while both sequences run on", async () => {
+    const { hub, client, resyncs } = await watch([DEVICE]);
+    for (const [tag, seq] of [[7, 254], [8, 255], [9, 0], [10, 1]]) {
+      hub.socket.deliverFrame(notify(tag, 0, seq));
+    }
+    await settle();
+    expect(resyncs).toEqual([]);
+    client.disconnect();
+  });
+
+  it("re-reads every device after a gap in the NOTIFY tags, which count them all", async () => {
+    const { hub, client, resyncs } = await watch([DEVICE, { ...DEVICE, handle: 1 }]);
+    hub.socket.deliverFrame(notify(0xfffe, 0, 1));
+    hub.socket.deliverFrame(notify(0xffff, 0, 2));
+    hub.socket.deliverFrame(notify(0, 0, 3)); // the tag wraps: no gap
+    hub.socket.deliverFrame(notify(2, 1, 9)); // tag 1 went missing
+    await settle();
+    expect(resyncs).toEqual([
+      { handle: 0, reason: ResyncReason.NOTIFY_DROPPED },
+      { handle: 1, reason: ResyncReason.NOTIFY_DROPPED },
+    ]);
+    client.disconnect();
+  });
+
+  it("re-reads one device after a gap in its firmware seq", async () => {
+    const { hub, client, resyncs } = await watch([DEVICE, { ...DEVICE, handle: 1 }]);
+    hub.socket.deliverFrame(notify(1, 0, 10));
+    hub.socket.deliverFrame(notify(2, 1, 50));
+    hub.socket.deliverFrame(notify(3, 0, 12)); // seq 11 never reached the hub
+    hub.socket.deliverFrame(notify(4, 1, 51));
+    await settle();
+    expect(resyncs).toEqual([{ handle: 0, reason: ResyncReason.NOTIFY_DROPPED }]);
+    client.disconnect();
+  });
+
+  it("starts the firmware seq afresh when a device comes back", async () => {
+    const { hub, client, resyncs } = await watch([DEVICE]);
+    hub.socket.deliverFrame(notify(1, 0, 40));
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "offline" } });
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "online" } });
+    hub.socket.deliverFrame(notify(2, 0, 0));
+    await settle();
+    expect(resyncs).toEqual([]);
+    client.disconnect();
+  });
+
+  it("starts the NOTIFY tags afresh on a new session", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newReconnectingClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const resyncs: number[] = [];
+    client.on("resync", (frame) => resyncs.push(frame.handle));
+    hub.socket.deliverFrame(notify(500, 0, 1));
+    await settle();
+    hub.socket.serverClose(4003);
+    await waitFor(() => hub.sockets.length === 2 && client.state === "ready");
+    hub.socket.deliverFrame(notify(0, 0, 2));
+    await settle();
+    expect(resyncs).toEqual([]);
+    client.disconnect();
+  });
+});
+
+describe("restoring polls on a new session", () => {
+  const POLL = { slot: 0, req: 0x50, val: 9, idx: 2, len: 41, hz: 10 };
+
+  /** Drops the socket and returns the poll.subscribe messages of the new session. */
+  async function reconnect(
+    hub: FakeHub,
+    client: LinkClient,
+  ): Promise<Array<Record<string, unknown>>> {
+    const before = hub.received.length;
+    const sockets = hub.sockets.length;
+    hub.socket.serverClose(4003);
+    await waitFor(() => hub.sockets.length === sockets + 1 && client.state === "ready");
+    await settle();
+    return hub.received.slice(before).filter((message) => message.t === "poll.subscribe");
+  }
+
+  it("forgets a device removed while disconnected, and still restores the others", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE, { ...DEVICE, handle: 1 }] });
+    const client = newReconnectingClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.subscribePolls(0, [POLL]);
+    await client.subscribePolls(1, [POLL]);
+
+    hub.config.devices = [{ ...DEVICE, handle: 1 }];
+    hub.config.noDevice = [0];
+    expect((await reconnect(hub, client)).map((message) => message.handle)).toEqual([1]);
+    expect((await reconnect(hub, client)).map((message) => message.handle)).toEqual([1]);
+    client.disconnect();
+  });
+
+  it("restores the others when one device refuses, and keeps that one for later", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE, { ...DEVICE, handle: 1 }] });
+    const client = newReconnectingClient(hub);
+    const errors: Error[] = [];
+    client.on("error", (error) => errors.push(error));
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.subscribePolls(0, [POLL]);
+    await client.subscribePolls(1, [POLL]);
+
+    hub.config.noDevice = [0];
+    expect((await reconnect(hub, client)).map((message) => message.handle)).toEqual([0, 1]);
+    expect(errors.some((error) => error instanceof LinkProtocolError)).toBe(true);
+    hub.config.noDevice = [];
+    expect((await reconnect(hub, client)).map((message) => message.handle)).toEqual([0, 1]);
+    client.disconnect();
+  });
+
+  it("leaves an offline device's polls until it comes back online", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newReconnectingClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.subscribePolls(0, [POLL]);
+
+    hub.config.devices = [{ ...DEVICE, state: "offline" }];
+    expect(await reconnect(hub, client)).toEqual([]);
+    hub.socket.deliverText({ t: "device.changed", device: DEVICE });
+    await settle();
+    expect(hub.received.at(-1)).toMatchObject({ t: "poll.subscribe", handle: 0 });
+    client.disconnect();
+  });
+});
+
+describe("tokens and hub ids (spec 6.2)", () => {
+  const HUB_A = "hub-a";
+  const HUB_B = "hub-b";
+
+  it("looks the token up by the id in the hub's hello", async () => {
+    const hub = new FakeHub({
+      auth: "pin",
+      validToken: "TOKEN-A",
+      hubId: HUB_A,
+      devices: [DEVICE],
+    });
+    const client = newClient(hub);
+    const asked: string[] = [];
+    await client.connect("ws://hub/dspi/v1", {
+      clientName: "Test",
+      tokenFor: (hubId) => (asked.push(hubId), hubId === HUB_A ? "TOKEN-A" : null),
+    });
+    expect(asked).toEqual([HUB_A]);
+    expect(client.state).toBe("ready");
+    client.disconnect();
+  });
+
+  it("never offers a token to another hub that answers at the same address", async () => {
+    const hub = new FakeHub({
+      auth: "pin",
+      validToken: "TOKEN-A",
+      hubId: HUB_A,
+      devices: [DEVICE],
+    });
+    const client = newReconnectingClient(hub);
+    await client.connect("ws://192.168.1.50:11915/dspi/v1", {
+      clientName: "Test",
+      token: "TOKEN-A",
+    });
+    expect(client.state).toBe("ready");
+
+    hub.config.hubId = HUB_B;
+    hub.socket.serverClose(1006);
+    await waitFor(() => hub.sockets.length === 2 && client.state === "awaiting_pairing");
+    expect(hub.received.filter((message) => message.t === "auth.token")).toHaveLength(1);
+    expect(client.token).toBeNull();
+    client.disconnect();
+  });
+
+  it("asks tokenFor again when another hub answers", async () => {
+    const hub = new FakeHub({
+      auth: "pin",
+      validToken: "TOKEN-A",
+      hubId: HUB_A,
+      devices: [DEVICE],
+    });
+    const client = newReconnectingClient(hub);
+    const stored: Record<string, string> = { [HUB_A]: "TOKEN-A", [HUB_B]: "TOKEN-B" };
+    await client.connect("ws://hub/dspi/v1", {
+      clientName: "Test",
+      tokenFor: (hubId) => stored[hubId],
+    });
+
+    hub.config.hubId = HUB_B;
+    hub.config.validToken = "TOKEN-B";
+    hub.socket.serverClose(1006);
+    await waitFor(() => hub.sockets.length === 2 && client.state === "ready");
+    const tokens = hub.received.filter((message) => message.t === "auth.token").map((m) => m.token);
+    expect(tokens).toEqual(["TOKEN-A", "TOKEN-B"]);
+    client.disconnect();
+  });
+
+  it("reports a refused token, with the hub it belonged to", async () => {
+    const hub = new FakeHub({ auth: "pin", validToken: "GOOD", hubId: HUB_A });
+    const client = newClient(hub);
+    const rejected: string[] = [];
+    client.on("tokenRejected", ({ hubId }) => rejected.push(hubId));
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test", tokenFor: () => "STALE" });
+    expect(client.state).toBe("awaiting_pairing");
+    expect(rejected).toEqual([HUB_A]);
+    client.disconnect();
+  });
+
+  it("reports a revoked token", async () => {
+    const hub = new FakeHub({ auth: "pin", validToken: "GOOD", hubId: HUB_A, devices: [DEVICE] });
+    const client = newClient(hub);
+    const rejected: string[] = [];
+    client.on("tokenRejected", ({ hubId }) => rejected.push(hubId));
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test", tokenFor: () => "GOOD" });
+    hub.socket.serverClose(4002);
+    await settle();
+    expect(rejected).toEqual([HUB_A]);
+    expect(client.token).toBeNull();
+  });
+});
+
+describe("open access without a session id", () => {
+  it("goes on as admin when the courtesy auth.pair gets no answer", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE], ignore: ["auth.pair"] });
+    const client = new LinkClient({
+      webSocket: hub.webSocket,
+      pingIntervalMs: 0,
+      requestTimeoutMs: 30,
+    });
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    expect(client.state).toBe("ready");
+    expect(client.role).toBe("admin");
+    expect(client.session).toBeNull();
+    expect(client.deviceList).toEqual([DEVICE]);
+    client.disconnect();
+  });
+});
+
+describe("hub.auth.set and the hello", () => {
+  it("keeps hub.auth and pin_source in step with the change", async () => {
+    const hub = new FakeHub({
+      auth: "none",
+      onRequest: (message) =>
+        message.t === "hub.auth.set"
+          ? message.mode === "pin"
+            ? { t: "ok", token: "FRESH" }
+            : { t: "ok" }
+          : null,
+    });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    expect(client.hub?.auth).toBe("none");
+
+    await client.setAuth("pin", "123456");
+    expect(client.hub?.auth).toBe("pin");
+    expect(client.hub?.pin_source).toBe("fixed");
+
+    await client.setAuth("none");
+    expect(client.hub?.auth).toBe("none");
+    expect(client.hub?.pin_source).toBeUndefined();
+    client.disconnect();
   });
 });
 
