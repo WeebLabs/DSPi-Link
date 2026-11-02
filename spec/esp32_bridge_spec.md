@@ -3,7 +3,7 @@
 *Version: 1.0 (draft)*
 *Implements: DSPi Link protocol 1.2 (`spec/dspi_link_protocol_spec.md`)*
 *Status: draft; no implementation yet. `bridge/esp32/PLAN.md` gives the build order.*
-*Last updated: 2026-10-18*
+*Last updated: 2026-11-01*
 
 The ESP32 bridge is the reference implementation of a DSPi Link bridge hub.
 It is a firmware image for common ESP32 boards. Wired to a DSPi's UART
@@ -525,9 +525,13 @@ reports into Link events.
 
 - **Finding.** While no device is known, the uart task probes every 2 s
   (section 7.5). On an answer it reads, in order, `REQ_GET_SERIAL` (0x7E),
-  `REQ_GET_PLATFORM` (0x7F, 7 bytes), `REQ_GET_CTRL_IFACE_STATUS` (0xF9) and
-  `REQ_GET_UART_CONFIG` (0xF6), then reports the device found with those
-  values. The hub assigns handle 0 and sends `device.added`.
+  `REQ_GET_PLATFORM` (0x7F, 7 bytes), `REQ_GET_CTRL_IFACE_STATUS` (0xF9),
+  `REQ_GET_UART_CONFIG` (0xF6) and `REQ_GET_DEVICE_NAME` (0x57, 32 bytes),
+  then reports the device found with those values. Only a full 32-byte OK
+  answer to 0x57 marks the board as keeping its own name (section 8.7).
+  Older firmware STALLs it or answers one byte, so a miss is read once
+  more before the board counts as old firmware for the attachment. The
+  hub assigns handle 0 and sends `device.added`.
 - **Watching.** When the link has carried no traffic for 1 s, the uart task
   sends `REQ_GET_SERIAL` (0x7E) as a heartbeat. An answer with a different
   serial means another DSPi was plugged in: the uart task reports the device
@@ -656,7 +660,12 @@ such as `REQ_RTA_CONTROL`). An entry's 1 s lifetime counts from when the
 uart task takes the write up, not from when it was queued, and a write the
 DSPi refuses leaves the queue at once, since it will cause no notification.
 A notification whose source byte is `HOST_SET`, `BULK_SET` or `UART` takes
-the oldest entry.
+the oldest entry. The source byte is byte 8 of `PARAM_CHANGED`, byte 4 of
+`BULK_INVALIDATED`, and byte 5 of the two name events,
+`NOTIFY_EVT_INPUT_SOURCE_NAME` (0x0F) and `NOTIFY_EVT_DEVICE_NAME` (0x10), so
+a name write claims its own echo. The hub's own name writes (section 8.7)
+join the queue too: a rename as the session that asked, an adoption as
+session 0.
 
 The hub also watches the notification `seq` byte. On a gap it sends RESYNC
 with reason 0 to every session and marks the snapshot cache stale.
@@ -689,9 +698,45 @@ found, which gives `wire_version` for the device object.
 ### 8.7 Locks, names and stats
 
 - Locks follow Link spec 7.7.
-- Device names (`device.rename`) are saved by serial, for up to 8 devices.
-  The default name is `DSPi` followed by the last 4 characters of the
-  serial.
+- Device names follow the firmware's `Documentation/Features/device_name_spec.md`
+  section 5.
+  - **Where the name lives.** Firmware that answers `REQ_GET_DEVICE_NAME`
+    (0x57) in full stores the board's own name, and the board is the only
+    authority for it. For older firmware the bridge saves names by serial,
+    for up to 8 devices. The default name is `DSPi` followed by the last 4
+    characters of the serial.
+  - **The name shown.** Each time the device is found, new or returning, the
+    `name` in the device object is the board's name if it is set, else the
+    saved name, else the default. A non-empty board name deletes the saved
+    entry.
+  - **Notifications set it.** On every `NOTIFY_EVT_DEVICE_NAME` (0x10, 40
+    bytes, the name at bytes 8 to 39) the hub takes the board's name, deletes
+    the saved entry, and shows the board's name or, when it was cleared, the
+    default. It sends `device.changed` and refreshes DNS-SD when that changes
+    the name. This is the only way the shown name of a name-keeping board
+    changes, so a rename from any source is seen: `device.rename`, a raw
+    0x56 through CMD, the front panel or USB. The packet is relayed to
+    clients as usual.
+  - **`device.rename` on a name-keeping board.** The board must be online,
+    else `no_device`, because its own name would override a saved one when
+    it returns. A lock held by another session answers `locked`. The name is
+    reduced to what the board stores: printable ASCII (32 to 126) only, runs
+    of spaces closed to one, no space at either end, at most 31 characters,
+    so "Café ♫ Rack" becomes "Caf Rack". An empty result clears the name.
+    The hub sends `REQ_SET_DEVICE_NAME` (0x56) with the name zero-padded to
+    32 bytes as the requesting session, and replies `ok` once the board
+    answers OK. No answer or a busy board answers `busy`, an absent device
+    `no_device`, any other status `internal`. The reply does not change the
+    shown name; the 0x10 that follows does.
+  - **`device.rename` on older firmware** saves the name (1 to 63 bytes of
+    UTF-8) by serial, replies `ok` and sends `device.changed` itself.
+  - **Adoption.** When a name-keeping board reports an empty name and the
+    bridge has a saved name for it that is non-empty once reduced as above,
+    the hub writes it to the board with 0x56 at attach. The saved entry is
+    deleted as soon as the board accepts that write, so adoption runs at
+    most once even if the confirming 0x10 is lost, and a later deliberate
+    clear is never undone. The write restarts the board's outputs briefly,
+    and only boards already named on this bridge get it.
 - `hub.stats` adds a `bridge` object:
 
 ```json
@@ -1014,7 +1059,7 @@ default.
 | `bridge` | `schema` (u8), `hid`, `name`, `hostname`, `uart_tx`, `uart_rx`, `uart_baud`, `uart_detect`, `led_type`, `led_pin` | factory reset |
 | `wifi` | `network` (one blob: the name and password, always written together; the older separate `ssid` and `password` keys are read only when it is missing, and erased at the next save) | network or factory reset |
 | `auth` | `store` (one blob: a layout number, then whether the PIN is on, its hash and salt, and up to 16 records of token hash, name, created and last seen) | factory reset |
-| `devices` | `names` (blob: up to 8 records of serial and name) | factory reset |
+| `devices` | `names` (blob: up to 8 records of serial and name, for boards whose firmware keeps no name of its own; an entry is deleted once its board holds a name, section 8.7) | factory reset |
 
 - The bridge stores Wi-Fi credentials itself and keeps ESP-IDF's own copy in
   RAM only (`WIFI_STORAGE_RAM`), so forgetting a network is one explicit

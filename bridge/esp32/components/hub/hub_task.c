@@ -814,6 +814,15 @@ static bool io_load_device_name(void *context, const char *serial, char *name, s
     return settings_load_device_name(serial, name, size) == ESP_OK;
 }
 
+static void io_forget_device_name(void *context, const char *serial)
+{
+    (void)context;
+    const esp_err_t err = settings_forget_device_name(serial);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not forget the name of %s: %s", serial, esp_err_to_name(err));
+    }
+}
+
 /* Refreshes the DNS-SD record and the info document (Link spec 3.1, 3.2). */
 static void io_advertise(void *context)
 {
@@ -1081,6 +1090,7 @@ static hub_io_t hub_io_functions(void)
         .restart = io_restart,
         .save_device_name = io_save_device_name,
         .load_device_name = io_load_device_name,
+        .forget_device_name = io_forget_device_name,
         .advertise = io_advertise,
         .describe_bridge = io_describe_bridge,
         .update_capacity = io_update_capacity,

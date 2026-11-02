@@ -91,6 +91,7 @@ typedef enum {
     HUB_WORK_POLL,
     HUB_WORK_SNAPSHOT_BULK,
     HUB_WORK_SNAPSHOT_STATUS,
+    HUB_WORK_DEVICE_NAME, /* REQ_SET_DEVICE_NAME, for device.rename or adoption */
 } hub_work_kind_t;
 
 /* One request waiting for the uart task. The uart task answers in order,
@@ -98,15 +99,16 @@ typedef enum {
 typedef struct {
     uint32_t tag;
     hub_work_kind_t kind;
-    int slot;            /* Client command: who sent it */
-    uint16_t session_id; /* Client command: detects a slot reused meanwhile */
+    int slot;            /* Client command or name write: who sent it; -1 for the hub */
+    uint16_t session_id; /* Client command or name write: detects a slot reused meanwhile */
     uint16_t client_tag; /* Client command: the CMD frame's tag */
+    int request_id;      /* Name write: the device.rename to answer */
     bool writes;         /* Client command: a SET, or a GET that changes the device
                             (classed other than read), for origins and the cache */
     bool is_bulk_set;    /* Client command: its payload is in bulk_set_buffer */
     hub_poll_key_t poll; /* Poll: which one */
     uint32_t submitted_ms;
-    uint8_t payload[DSPI_UART_MAX_SET_PAYLOAD_BYTES]; /* A small SET's payload */
+    uint8_t payload[DSPI_UART_MAX_SET_PAYLOAD_BYTES]; /* A small SET's payload, the hub's too */
 } hub_pending_t;
 
 typedef struct {
@@ -136,6 +138,7 @@ typedef struct {
     uint8_t last_seq;   /* Of the last notification, to spot gaps */
     uint16_t locked_by; /* Session id, or 0 */
     uint32_t lock_expires_ms;
+    uint32_t adoption_tag; /* The stored name's write to the board in flight, or 0 */
     uint32_t commands;
     uint32_t errors;
     uint32_t average_rtt_ms;

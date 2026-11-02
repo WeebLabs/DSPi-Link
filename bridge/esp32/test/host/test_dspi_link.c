@@ -499,6 +499,72 @@ static void a_short_serial_stops_at_its_padding(void)
     CHECK(strcmp(identity.serial, "ABC") == 0);
 }
 
+/* How many times the fake was asked REQ_GET_DEVICE_NAME (0x57). */
+static unsigned name_reads(void)
+{
+    unsigned count = 0;
+    for (size_t i = 0; i < fake.record_count; i++) {
+        count += fake.records[i].request == 0x57 ? 1 : 0;
+    }
+    return count;
+}
+
+static void a_board_that_keeps_a_name_reports_it(void)
+{
+    start(BAUD, BAUD);
+    uint8_t name[32] = "Rack left";
+    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    dspi_identity_t identity;
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(identity.has_board_name);
+    CHECK(strcmp(identity.board_name, "Rack left") == 0);
+    CHECK(name_reads() == 1);
+
+    /* Unnamed is all zeros, and still counts as support. */
+    memset(name, 0, sizeof(name));
+    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(identity.has_board_name && identity.board_name[0] == '\0');
+
+    /* A name without its NUL is cut to 31 characters. */
+    memset(name, 'A', sizeof(name));
+    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(strlen(identity.board_name) == 31);
+}
+
+static void older_firmware_has_no_board_name(void)
+{
+    /* No 0x57 at all: the fake answers ERROR, as a STALL arrives over UART. */
+    start(BAUD, BAUD);
+    dspi_identity_t identity;
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(!identity.has_board_name && identity.board_name[0] == '\0');
+    CHECK(name_reads() == 2); /* Retried once */
+
+    /* The legacy channel mute answers 0x57 with one byte. */
+    start(BAUD, BAUD);
+    fake_dspi_can(&fake, 0x57, (const uint8_t[]){1}, 1);
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(!identity.has_board_name);
+}
+
+static void a_missed_name_read_is_tried_again(void)
+{
+    start(BAUD, BAUD);
+    const uint8_t name[32] = "Studio";
+    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    for (int i = 0; i < 4; i++) { /* Serial, platform, interface status, UART config */
+        fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_NORMALLY});
+    }
+    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = 0x01});
+    dspi_identity_t identity;
+    CHECK(dspi_link_read_identity(&link, &identity));
+    CHECK(identity.has_board_name);
+    CHECK(strcmp(identity.board_name, "Studio") == 0);
+    CHECK(name_reads() == 2);
+}
+
 void test_dspi_link(void)
 {
     RUN(a_get_returns_its_payload);
@@ -528,4 +594,7 @@ void test_dspi_link(void)
     RUN(a_missing_device_leaves_the_first_rate);
     RUN(the_identity_is_read);
     RUN(a_short_serial_stops_at_its_padding);
+    RUN(a_board_that_keeps_a_name_reports_it);
+    RUN(older_firmware_has_no_board_name);
+    RUN(a_missed_name_read_is_tried_again);
 }

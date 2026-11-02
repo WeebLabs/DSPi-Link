@@ -105,6 +105,35 @@ uint32_t hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *
     return tag;
 }
 
+static void remember_write(hub_t *hub, uint16_t session_id, uint32_t tag);
+
+uint32_t hub_submit_own_write(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request,
+                              int slot, uint16_t session_id, int request_id)
+{
+    if (request->length > sizeof(((hub_pending_t *)0)->payload)) {
+        return 0;
+    }
+    hub_pending_t *entry = reserve_pending(hub);
+    if (entry == NULL) {
+        return 0;
+    }
+    entry->kind = kind;
+    entry->slot = slot;
+    entry->session_id = session_id;
+    entry->request_id = request_id;
+    entry->writes = true;
+    memcpy(entry->payload, request->payload, request->length);
+    dspi_request_t stored = *request;
+    stored.payload = entry->payload; /* Stays valid until the uart task has sent it */
+    const uint32_t tag = entry->tag;
+    if (!hub->io.submit(hub->io.context, &stored, false, tag)) {
+        return 0;
+    }
+    remember_write(hub, session_id, tag); /* Before it can become the head */
+    commit_pending(hub);
+    return tag;
+}
+
 /* ---------------------------------------------------------------------------
  * Origin attribution (Link spec 8.3)
  * ------------------------------------------------------------------------- */
@@ -359,6 +388,12 @@ static void complete_work(hub_t *hub, const hub_pending_t *work, const dspi_repl
     case HUB_WORK_SNAPSHOT_BULK:
     case HUB_WORK_SNAPSHOT_STATUS:
         hub_snapshot_on_reply(hub, work, reply);
+        break;
+    case HUB_WORK_DEVICE_NAME:
+        if (reply->kind != DSPI_REPLY_ANSWERED || reply->status != DSPI_STATUS_OK) {
+            forget_write(hub, work->tag);
+        }
+        hub_device_name_on_reply(hub, work, reply);
         break;
     }
 }

@@ -176,6 +176,9 @@ bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t 
 /* Characters in a DSPi serial number: REQ_GET_SERIAL returns 16 bytes. */
 #define DSPI_SERIAL_MAX_CHARS 16
 
+/* REQ_GET_DEVICE_NAME's reply: up to 31 characters and a NUL. */
+#define DSPI_DEVICE_NAME_BYTES 32
+
 /* What the bridge reads from a device when it appears (bridge spec 7.6). */
 typedef struct {
     char serial[DSPI_SERIAL_MAX_CHARS + 1]; /* REQ_GET_SERIAL (0x7E), NUL-terminated */
@@ -185,10 +188,13 @@ typedef struct {
     bool notify_enabled;                    /* REQ_GET_UART_CONFIG (0xF6) byte 3 */
     uint32_t configured_baud;               /* REQ_GET_UART_CONFIG bytes 4 to 7 */
     bool has_uart_config; /* False if 0xF6 failed; the two fields above are then unknown */
+    bool has_board_name;  /* REQ_GET_DEVICE_NAME (0x57) answered in full: the board keeps a name */
+    char board_name[DSPI_DEVICE_NAME_BYTES]; /* That name, NUL-terminated; empty when unnamed */
 } dspi_identity_t;
 
-/* Reads the serial, platform, interface status and UART configuration.
- * Returns false if the serial or platform could not be read. */
+/* Reads the serial, platform, interface status, UART configuration and the
+ * board's own name. Returns false if the serial or platform could not be
+ * read. */
 bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity);
 
 #endif /* DSPI_LINK_H */

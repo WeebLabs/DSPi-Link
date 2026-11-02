@@ -462,6 +462,46 @@ esp_err_t settings_save_device_name(const char *serial, const char *name)
     return err;
 }
 
+esp_err_t settings_forget_device_name(const char *serial)
+{
+    /* Checked read-only first, since opening for writing creates the
+     * namespace and this runs on every attach. */
+    char unused[SETTINGS_NAME_MAX_BYTES + 1];
+    esp_err_t err = settings_load_device_name(serial, unused, sizeof(unused));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    nvs_handle_t nvs;
+    err = nvs_open(DEVICES_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    saved_device_name_t names[LINK_MAX_DEVICE_NAMES];
+    size_t count = 0;
+    err = read_device_names(nvs, names, &count);
+    size_t kept = 0;
+    for (size_t i = 0; err == ESP_OK && i < count; i++) {
+        if (strncmp(names[i].serial, serial, sizeof(names[i].serial)) != 0) {
+            names[kept++] = names[i];
+        }
+    }
+    if (err == ESP_OK && kept != count) {
+        /* An empty list is no key, as before the first save. */
+        err = kept > 0
+                  ? nvs_set_blob(nvs, KEY_DEVICE_NAMES, names, kept * sizeof(saved_device_name_t))
+                  : nvs_erase_key(nvs, KEY_DEVICE_NAMES);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+    }
+    nvs_close(nvs);
+    return err;
+}
+
 /* ---------------------------------------------------------------------------
  * The home network (namespace `wifi`)
  * ------------------------------------------------------------------------- */

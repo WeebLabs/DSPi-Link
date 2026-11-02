@@ -16,6 +16,7 @@
 /* Commands the bridge sends on its own behalf (firmware commands.md). */
 #define REQ_GET_SERIAL 0x7E
 #define REQ_GET_PLATFORM 0x7F
+#define REQ_GET_DEVICE_NAME 0x57
 #define REQ_GET_UART_CONFIG 0xF6
 #define REQ_GET_CTRL_IFACE_STATUS 0xF9
 
@@ -555,6 +556,18 @@ bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)
         identity->notify_enabled = config[3] != 0;
         identity->configured_baud = (uint32_t)config[4] | ((uint32_t)config[5] << 8) |
                                     ((uint32_t)config[6] << 16) | ((uint32_t)config[7] << 24);
+    }
+
+    /* Older firmware STALLs 0x57 or answers it with one byte (device_name_spec
+     * 2). One more try, so a transient miss does not pass for old firmware for
+     * the whole attachment. */
+    uint8_t name[DSPI_DEVICE_NAME_BYTES];
+    for (int tries = 0; tries < 2 && !identity->has_board_name; tries++) {
+        if (read_get(link, REQ_GET_DEVICE_NAME, name, sizeof(name)) == DSPI_DEVICE_NAME_BYTES) {
+            identity->has_board_name = true;
+            memcpy(identity->board_name, name, sizeof(name));
+            identity->board_name[sizeof(identity->board_name) - 1] = '\0';
+        }
     }
     return true;
 }

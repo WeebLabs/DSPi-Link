@@ -51,6 +51,10 @@ esp_err_t settings_load_device_name(const char *serial, char *name, size_t size)
  * ESP_ERR_INVALID_ARG if the name breaks settings_name_is_valid(). */
 esp_err_t settings_save_device_name(const char *serial, const char *name);
 
+/* Deletes the saved name for `serial`. ESP_OK, writing nothing, if there is
+ * none: a board that keeps its own name is checked on every attach. */
+esp_err_t settings_forget_device_name(const char *serial);
+
 /*
  * The home network, in the `wifi` namespace (bridge spec 11). The bridge
  * keeps Wi-Fi credentials itself rather than in the Wi-Fi driver, so

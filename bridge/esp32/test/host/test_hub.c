@@ -411,10 +411,404 @@ static void devices_can_be_renamed(void)
     attach_device();
     send_json(0, "{\"t\":\"device.rename\",\"id\":4,\"handle\":0,\"name\":\"Living room\"}");
     CHECK(strcmp(io_record.saved_device_name, "Living room") == 0);
+    CHECK(io_record.submission_count == 0); /* Old firmware: nothing goes to the board */
     cJSON *changed = last_json(0, "device.changed");
     CHECK(strcmp(json_string(cJSON_GetObjectItemCaseSensitive(changed, "device"), "name"),
                  "Living room") == 0);
     cJSON_Delete(changed);
+}
+
+/* ---------------------------------------------------------------------------
+ * Names kept on the board (firmware device_name_spec.md section 5)
+ * ------------------------------------------------------------------------- */
+
+static uint16_t last_notify_origin(int slot);
+
+/* IDENTITY on firmware that keeps its own name, currently `name`. */
+static dspi_identity_t capable_identity(const char *name)
+{
+    dspi_identity_t identity = IDENTITY;
+    identity.has_board_name = true;
+    snprintf(identity.board_name, sizeof(identity.board_name), "%s", name);
+    return identity;
+}
+
+static void store_name(const char *name)
+{
+    snprintf(io_record.saved_device_serial, sizeof(io_record.saved_device_serial), "%s",
+             IDENTITY.serial);
+    snprintf(io_record.saved_device_name, sizeof(io_record.saved_device_name), "%s", name);
+}
+
+/* The last submission of `request`, or NULL. */
+static const fake_submission_t *submission_of(uint8_t request)
+{
+    for (size_t i = io_record.submission_count; i > 0; i--) {
+        if (io_record.submissions[i - 1].request.request == request) {
+            return &io_record.submissions[i - 1];
+        }
+    }
+    return NULL;
+}
+
+/* Answers the request submitted with `tag`. */
+static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uint16_t length)
+{
+    const dspi_reply_t reply = {
+        .kind = DSPI_REPLY_ANSWERED, .status = status, .payload = payload, .length = length};
+    hub_reply(&hub, tag, &reply);
+}
+
+/* Brings `identity` online and answers the snapshot read. With a name to
+ * adopt, the 0x56 is answered `adoption_status` in queue order. */
+static void attach_identity(const dspi_identity_t *identity, uint8_t adoption_status)
+{
+    hub_device_found(&hub, identity, 1000000);
+    static uint8_t bulk[6136] = {32, 0, 17, 0, 8};
+    answer_tag(submission_of(0xA0)->tag, 0, bulk, sizeof(bulk));
+    const fake_submission_t *adoption = submission_of(0x56);
+    if (adoption != NULL) {
+        answer_tag(adoption->tag, adoption_status, NULL, 0);
+    }
+    static const uint8_t status[41] = {1, 2, 3};
+    answer_tag(submission_of(0x50)->tag, 0, status, sizeof(status));
+}
+
+/* A NOTIFY_EVT_DEVICE_NAME (0x10) packet carrying `name` from `source`. */
+static void notify_name(uint8_t seq, uint8_t source, const char *name)
+{
+    uint8_t packet[40] = {0x02, 0x10, 0x00, seq, 0x00, source};
+    memcpy(&packet[8], name, strlen(name));
+    hub_notification(&hub, packet, sizeof(packet));
+}
+
+static const char *shown_name(int slot, const char *event)
+{
+    static char name[64];
+    cJSON *message = last_json(slot, event);
+    snprintf(name, sizeof(name), "%s",
+             json_string(cJSON_GetObjectItemCaseSensitive(message, "device"), "name"));
+    cJSON_Delete(message);
+    return name;
+}
+
+/* The id of the last "ok" or "err" to `slot`, or -1. */
+static int last_answer_id(int slot, const char *type)
+{
+    cJSON *message = last_json(slot, type);
+    const int id = json_number(message, "id");
+    cJSON_Delete(message);
+    return id;
+}
+
+static void the_board_name_wins_over_the_stored_one(void)
+{
+    start();
+    open_session(0);
+    store_name("Kitchen");
+    const dspi_identity_t identity = capable_identity("Rack left");
+    hub_device_found(&hub, &identity, 1000000);
+    CHECK(strcmp(shown_name(0, "device.added"), "Rack left") == 0);
+    CHECK(io_record.saved_device_name[0] == '\0' && io_record.forget_count == 1);
+    CHECK(submission_of(0x56) == NULL);
+
+    /* Back again after a rename elsewhere: the board decides again. */
+    hub_device_lost(&hub);
+    const dspi_identity_t renamed = capable_identity("Rack right");
+    hub_device_found(&hub, &renamed, 1000000);
+    CHECK(strcmp(shown_name(0, "device.changed"), "Rack right") == 0);
+}
+
+static void a_stored_name_is_adopted_by_an_unnamed_board_once(void)
+{
+    start();
+    open_session(0);
+    store_name("Caf\xC3\xA9 \xE2\x80\x93 Rack");
+    const dspi_identity_t identity = capable_identity("");
+    hub_device_found(&hub, &identity, 1000000);
+    CHECK(strcmp(shown_name(0, "device.added"), "Caf\xC3\xA9 \xE2\x80\x93 Rack") == 0);
+
+    const fake_submission_t *write = submission_of(0x56);
+    CHECK(write != NULL);
+    CHECK(!write->request.is_get && write->request.length == 32 && !write->may_retry);
+    uint8_t expected[32] = "Caf Rack";
+    CHECK(memcmp(write->payload, expected, sizeof(expected)) == 0);
+
+    /* Refused: the stored name stays, for the next attach. */
+    static uint8_t bulk[6136] = {32, 0, 17, 0, 8};
+    answer_tag(submission_of(0xA0)->tag, 0, bulk, sizeof(bulk));
+    answer_tag(write->tag, DSPI_STATUS_ERROR, NULL, 0);
+    CHECK(io_record.forget_count == 0 && io_record.saved_device_name[0] != '\0');
+    answer_tag(submission_of(0x50)->tag, 0, (const uint8_t[41]){0}, 41);
+
+    /* Accepted: forgotten at once, even with no 0x10 to follow. */
+    hub_device_lost(&hub);
+    forget_submissions();
+    attach_identity(&identity, DSPI_STATUS_OK);
+    CHECK(io_record.forget_count == 1 && io_record.saved_device_name[0] == '\0');
+
+    hub_device_lost(&hub);
+    forget_submissions();
+    hub_device_found(&hub, &identity, 1000000);
+    CHECK(submission_of(0x56) == NULL);
+    CHECK(strcmp(hub.device.name, "DSPi 2E2C") == 0);
+}
+
+static void old_firmware_keeps_the_stored_name(void)
+{
+    start();
+    open_session(0);
+    store_name("Kitchen");
+    hub_device_found(&hub, &IDENTITY, 1000000);
+    CHECK(strcmp(shown_name(0, "device.added"), "Kitchen") == 0);
+    CHECK(submission_of(0x56) == NULL);
+    CHECK(strcmp(io_record.saved_device_name, "Kitchen") == 0);
+}
+
+static void a_name_notification_sets_the_name(void)
+{
+    start();
+    open_session(0);
+    const dspi_identity_t identity = capable_identity("");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    CHECK(strcmp(hub.device.name, "DSPi 2E2C") == 0);
+
+    forget_messages();
+    const unsigned adverts = io_record.advertise_count;
+    notify_name(1, 6 /* front panel */, "Studio");
+    CHECK(strcmp(shown_name(0, "device.changed"), "Studio") == 0);
+    CHECK(io_record.advertise_count == adverts + 1);
+    CHECK(last_frame(0, LINK_FRAME_NOTIFY) != NULL); /* Still relayed */
+
+    /* The same name again changes nothing. */
+    forget_messages();
+    notify_name(2, 6, "Studio");
+    CHECK(last_json(0, "device.changed") == NULL);
+
+    /* Cleared on the board: the default, not a stored name. */
+    notify_name(3, 6, "");
+    CHECK(strcmp(shown_name(0, "device.changed"), "DSPi 2E2C") == 0);
+}
+
+static void a_name_notification_retires_the_stored_name(void)
+{
+    /* An old-firmware identity can still hear 0x10: the board was updated
+     * meanwhile, or both probes missed. */
+    start();
+    open_session(0);
+    store_name("Kitchen");
+    attach_device();
+    notify_name(1, 6, "Studio");
+    CHECK(io_record.forget_count == 1);
+    CHECK(hub.device.identity.has_board_name);
+    CHECK(strcmp(hub.device.name, "Studio") == 0);
+}
+
+static void a_rename_writes_the_board_and_waits_for_the_notification(void)
+{
+    start();
+    const int renamer = open_session(0);
+    open_session(1);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    forget_submissions();
+    forget_messages();
+
+    send_json(0, "{\"t\":\"device.rename\",\"id\":7,\"handle\":0,"
+                 "\"name\":\"  Caf\xC3\xA9  \xE2\x80\x93 Rack\\u0007 \"}");
+    CHECK(io_record.submission_count == 1);
+    const fake_submission_t *write = &io_record.submissions[0];
+    CHECK(write->request.request == 0x56 && write->request.length == 32 && !write->may_retry);
+    uint8_t expected[32] = "Caf Rack";
+    CHECK(memcmp(write->payload, expected, sizeof(expected)) == 0);
+    CHECK(last_answer_id(0, "ok") != 7);
+    CHECK(strcmp(io_record.saved_device_name, "") == 0); /* Never stored on the bridge */
+
+    answer_last(DSPI_STATUS_OK, NULL, 0);
+    CHECK(last_answer_id(0, "ok") == 7);
+    CHECK(last_json(1, "device.changed") == NULL);
+    CHECK(strcmp(hub.device.name, "Old") == 0);
+
+    notify_name(1, 8 /* UART */, "Caf Rack");
+    CHECK(strcmp(shown_name(1, "device.changed"), "Caf Rack") == 0);
+    CHECK(last_notify_origin(1) == renamer);
+
+    /* An empty name clears it. */
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.rename\",\"id\":8,\"handle\":0,\"name\":\" \"}");
+    const uint8_t zeros[32] = {0};
+    CHECK(io_record.submission_count == 1);
+    CHECK(memcmp(io_record.submissions[0].payload, zeros, sizeof(zeros)) == 0);
+}
+
+static void a_failed_rename_answers_an_error_and_claims_nothing(void)
+{
+    start();
+    open_session(0);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+
+    send_json(0, "{\"t\":\"device.rename\",\"id\":3,\"handle\":0,\"name\":\"New\"}");
+    answer_last(DSPI_STATUS_ERROR, NULL, 0);
+    cJSON *err = last_json(0, "err");
+    CHECK(json_number(err, "id") == 3 && strcmp(json_string(err, "code"), "internal") == 0);
+    cJSON_Delete(err);
+    notify(1, 8 /* UART */);
+    CHECK(last_notify_origin(0) == 0); /* The refused write left the origin queue */
+
+    send_json(0, "{\"t\":\"device.rename\",\"id\":4,\"handle\":0,\"name\":\"New\"}");
+    hub_reply(&hub, io_record.submissions[io_record.submission_count - 1].tag,
+              &(dspi_reply_t){.kind = DSPI_REPLY_TIMEOUT});
+    err = last_json(0, "err");
+    CHECK(json_number(err, "id") == 4 && strcmp(json_string(err, "code"), "busy") == 0);
+    cJSON_Delete(err);
+
+    send_json(0, "{\"t\":\"device.rename\",\"id\":5,\"handle\":0,\"name\":\"New\"}");
+    hub_reply(&hub, io_record.submissions[io_record.submission_count - 1].tag,
+              &(dspi_reply_t){.kind = DSPI_REPLY_NO_DEVICE});
+    err = last_json(0, "err");
+    CHECK(json_number(err, "id") == 5 && strcmp(json_string(err, "code"), "no_device") == 0);
+    cJSON_Delete(err);
+
+    /* No room to queue it. */
+    io_record.submission_count = FAKE_IO_MAX_SUBMISSIONS;
+    send_json(0, "{\"t\":\"device.rename\",\"id\":6,\"handle\":0,\"name\":\"New\"}");
+    err = last_json(0, "err");
+    CHECK(json_number(err, "id") == 6 && strcmp(json_string(err, "code"), "busy") == 0);
+    cJSON_Delete(err);
+    CHECK(strcmp(hub.device.name, "Old") == 0);
+}
+
+static void a_capable_board_away_cannot_be_renamed(void)
+{
+    start();
+    open_session(0);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    hub_device_lost(&hub);
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.rename\",\"id\":9,\"handle\":0,\"name\":\"New\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "no_device") == 0);
+    cJSON_Delete(err);
+    CHECK(io_record.submission_count == 0 && io_record.saved_device_name[0] == '\0');
+}
+
+static void a_locked_board_cannot_be_renamed_by_another_session(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    forget_submissions();
+    send_json(1, "{\"t\":\"lock.acquire\",\"id\":2,\"handle\":0}");
+    send_json(0, "{\"t\":\"device.rename\",\"id\":3,\"handle\":0,\"name\":\"New\"}");
+    cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "locked") == 0);
+    cJSON_Delete(err);
+    CHECK(io_record.submission_count == 0);
+}
+
+/* How many 0x56 writes the hub has submitted. */
+static size_t name_writes(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < io_record.submission_count; i++) {
+        count += io_record.submissions[i].request.request == 0x56;
+    }
+    return count;
+}
+
+static void renames_count_toward_the_in_flight_limit(void)
+{
+    start();
+    open_session(0);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    forget_submissions();
+    for (int id = 1; id <= LINK_MAX_INFLIGHT; id++) {
+        send_json(0, "{\"t\":\"device.rename\",\"id\":%d,\"handle\":0,\"name\":\"N%d\"}", id, id);
+    }
+    CHECK(name_writes() == LINK_MAX_INFLIGHT);
+
+    send_json(0, "{\"t\":\"device.rename\",\"id\":99,\"handle\":0,\"name\":\"Late\"}");
+    CHECK(name_writes() == LINK_MAX_INFLIGHT);
+    CHECK(last_answer_id(0, "err") == 99);
+
+    answer_tag(io_record.submissions[0].tag, DSPI_STATUS_OK, NULL, 0);
+    send_json(0, "{\"t\":\"device.rename\",\"id\":100,\"handle\":0,\"name\":\"Now\"}");
+    CHECK(name_writes() == LINK_MAX_INFLIGHT + 1);
+}
+
+static void a_rename_answer_for_a_closed_session_goes_nowhere(void)
+{
+    start();
+    open_session(0);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.rename\",\"id\":5,\"handle\":0,\"name\":\"Den\"}");
+    const uint32_t tag = submission_of(0x56)->tag;
+
+    hub_session_closed(&hub, 0);
+    open_session(0); /* The slot is reused by a new session */
+    forget_messages();
+    answer_tag(tag, DSPI_STATUS_OK, NULL, 0);
+    CHECK(last_json(0, "ok") == NULL);
+    CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+static void a_pending_adoption_is_not_repeated_on_reattach(void)
+{
+    start();
+    open_session(0);
+    store_name("Kitchen");
+    const dspi_identity_t identity = capable_identity("");
+    hub_device_found(&hub, &identity, 1000000);
+    const uint32_t tag = submission_of(0x56)->tag;
+
+    hub_device_lost(&hub);
+    hub_device_found(&hub, &identity, 1000000);
+    CHECK(name_writes() == 1);
+
+    answer_tag(tag, DSPI_STATUS_OK, NULL, 0);
+    CHECK(io_record.forget_count == 1 && io_record.saved_device_name[0] == '\0');
+}
+
+static void an_adoption_answer_after_a_board_swap_is_ignored(void)
+{
+    start();
+    open_session(0);
+    store_name("Kitchen");
+    const dspi_identity_t identity = capable_identity("");
+    hub_device_found(&hub, &identity, 1000000);
+    const uint32_t tag = submission_of(0x56)->tag;
+
+    dspi_identity_t other = capable_identity("Desk");
+    snprintf(other.serial, sizeof(other.serial), "%s", "0000000000000001");
+    hub_device_found(&hub, &other, 1000000);
+    answer_tag(tag, DSPI_STATUS_OK, NULL, 0);
+    /* The first board's name stays stored: its write was never confirmed. */
+    CHECK(io_record.forget_count == 0 && strcmp(io_record.saved_device_name, "Kitchen") == 0);
+    CHECK(strcmp(hub.device.name, "Desk") == 0);
+}
+
+static void a_raw_name_write_claims_its_own_notification(void)
+{
+    start();
+    const int writer = open_session(0);
+    attach_device();
+    uint8_t name[32] = "Desk";
+    send_cmd(0, 1, false, 0x56, sizeof(name), name);
+    answer_last(DSPI_STATUS_OK, NULL, 0);
+    notify_name(1, 8 /* UART */, "Desk");
+    CHECK(last_notify_origin(0) == writer);
+    CHECK(strcmp(hub.device.name, "Desk") == 0);
+
+    /* The write was used up, so a later change by nobody here is nobody's. */
+    notify(2, 8);
+    CHECK(last_notify_origin(0) == 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1247,14 +1641,6 @@ static void a_stalled_or_orphaned_update_is_abandoned(void)
  * and failures the I/O reports
  * ------------------------------------------------------------------------- */
 
-/* Answers the request submitted with `tag`. */
-static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uint16_t length)
-{
-    const dspi_reply_t reply = {
-        .kind = DSPI_REPLY_ANSWERED, .status = status, .payload = payload, .length = length};
-    hub_reply(&hub, tag, &reply);
-}
-
 static void a_lost_answer_times_out_and_a_late_one_is_ignored(void)
 {
     start();
@@ -1842,6 +2228,20 @@ void test_hub(void)
     RUN(a_lost_device_goes_offline_then_away);
     RUN(a_returning_device_triggers_resync);
     RUN(devices_can_be_renamed);
+    RUN(the_board_name_wins_over_the_stored_one);
+    RUN(a_stored_name_is_adopted_by_an_unnamed_board_once);
+    RUN(old_firmware_keeps_the_stored_name);
+    RUN(a_name_notification_sets_the_name);
+    RUN(a_name_notification_retires_the_stored_name);
+    RUN(a_rename_writes_the_board_and_waits_for_the_notification);
+    RUN(a_failed_rename_answers_an_error_and_claims_nothing);
+    RUN(a_capable_board_away_cannot_be_renamed);
+    RUN(a_locked_board_cannot_be_renamed_by_another_session);
+    RUN(a_raw_name_write_claims_its_own_notification);
+    RUN(renames_count_toward_the_in_flight_limit);
+    RUN(a_rename_answer_for_a_closed_session_goes_nowhere);
+    RUN(a_pending_adoption_is_not_repeated_on_reattach);
+    RUN(an_adoption_answer_after_a_board_swap_is_ignored);
     RUN(a_get_goes_to_the_dspi_and_back);
     RUN(write_as_read_commands_are_never_retried);
     RUN(commands_without_a_device_are_refused);

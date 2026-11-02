@@ -2,7 +2,7 @@
 
 *Version: 1.2 (draft)*
 *Status: draft; dspi-link-js and the DSPi Console `feature/dspi-link` branch implement 1.1, and the ESP32 bridge (`spec/esp32_bridge_spec.md`) will implement 1.2*
-*Last updated: 2026-10-18 (the change history is in section 13)*
+*Last updated: 2026-11-01 (the change history is in section 13)*
 
 DSPi Link is the local-network protocol through which a **hub** (DSPi Console
 in gateway mode, or a standalone bridge such as an ESP32 wired to a DSPi over
@@ -383,7 +383,7 @@ Hub to client, in reply (no `id`):
 | `lock` | Exclusive device locks. |
 | `fw_install` | Firmware installation through the hub (Console hubs only; a bridge cannot reach the UF2 bootloader). |
 | `web` | Browser UI on `/`. |
-| `rename` | Hub-stored device names (`device.rename`). |
+| `rename` | Device names (`device.rename`), stored on the board where its firmware supports it (section 7.4). |
 | `hub_config` | Hub settings messages, section 7.10. Added in 1.2. |
 | `wifi` | Wi-Fi scan and join, section 7.11, for hubs that manage their own network connection. Added in 1.2. |
 | `auth_config` | Changing the auth mode and fixed PIN remotely, section 7.12. Added in 1.2. |
@@ -435,7 +435,7 @@ can be granted less while others poll.
 |-------|--------|
 | `handle` | Hub-assigned, section 2. Stable until `device.removed`. |
 | `serial` | `REQ_GET_SERIAL` (0x7E). |
-| `name` | Hub-stored friendly name, or a default derived from the serial. |
+| `name` | The board's own name (`REQ_GET_DEVICE_NAME` 0x57) when its firmware stores one and it is set. Otherwise the hub-stored name, and failing that a default derived from the serial. The hub applies this order each time the device comes online. |
 | `platform`, `fw`, `outputs` | `REQ_GET_PLATFORM` (0x7F), 7-byte read. `fw` is `major.minor.patch` from bytes 1, 4 and 5, or from the byte 2 nibbles on firmware that returns only 4 bytes. |
 | `fw_beta` | Byte 6 of the same read: the beta number, 0 for a final release. Betas of one patch share its `fw` string, so this is the only field that tells them apart. A hub omits it when the device returns fewer than 7 bytes, and a client treats a missing field as unknown, not as 0. Added in 1.1. |
 | `inputs` | Compile-time input count if the hub knows it; else omitted. A client that needs the channel layout and finds `inputs` missing reads it from the bulk header (`REQ_GET_ALL_PARAMS`). |
@@ -452,9 +452,29 @@ Events, sent to every session:
 {"t": "device.changed", "device": { ...same object... }}
 ```
 
-`device.rename {handle, name}` (control or admin) changes the hub-stored name
-and emits `device.changed`. If the firmware later gains a device-name
-command, hubs should prefer it so the name travels with the board.
+`device.rename {handle, name}` (control or admin) renames the device. When
+the attached board's firmware stores names (a 32-byte `REQ_GET_DEVICE_NAME`
+reply), the hub writes `REQ_SET_DEVICE_NAME` (0x56) as the requesting
+session, replies `ok` once the board accepts the write, and emits
+`device.changed` when the board's `NOTIFY_EVT_DEVICE_NAME` (0x10) arrives.
+That notification is the only thing that sets the name of such a board, so a
+rename from any source is seen, including a raw 0x56 through `cmd`. The hub
+reduces the name to what the board can store: printable ASCII, gaps left by
+dropped characters closed, ends trimmed, at most 31 characters. An empty
+name clears it. Like a `cmd`, the write honours locks and the session's
+in-flight limit: while another session holds the device's lock (section 7.7)
+the rename answers `locked`, and past the limit it answers `busy`. A name-capable board that is not attached, or an
+unknown handle, answers `no_device`. On older firmware the hub changes its
+stored name and emits `device.changed` itself. Names stored on the board
+travel with it, so it keeps its name on any hub or computer. A board rename
+restarts the board's outputs briefly.
+
+A hub that holds a stored name for a name-capable board reporting an empty
+name writes the stored name to the board once at attach. It deletes its
+stored entry when the board accepts that write, when it reads a non-empty
+board name, and on any `NOTIFY_EVT_DEVICE_NAME` for that board, so a later
+clear is never undone. The full rules are in the firmware repo's
+`Documentation/Features/device_name_spec.md`.
 
 ### 7.5 Snapshot
 
@@ -957,7 +977,8 @@ none of which are visible to clients:
 - Omits `fw_install`. Firmware updates for a bridged device need physical USB
   access until the firmware gains a UART-side update path.
 - Stores tokens, the hub id, the hub name and device names in non-volatile
-  storage.
+  storage. Stored device names follow the order and adoption rules of section
+  7.4; for name-capable firmware they are only a fallback.
 - Joins its first network through a setup procedure outside this protocol,
   and is administered afterwards through sections 7.10 to 7.14.
 - Uses a fixed PIN (`pin_source: "fixed"`) when `pin` mode is on, because it
@@ -1124,6 +1145,16 @@ with a window PIN, and only its prompt wording may read oddly.
   mistake.
 - Section 9.2 recommends 1 Mbaud, notes that a bridge cannot enable its own
   UART link, and points to the new `esp32_bridge_spec.md`.
+- Device names can live on the board (section 7.4). `name` prefers the
+  board's own name, `device.rename` writes it to name-capable firmware, and
+  `NOTIFY_EVT_DEVICE_NAME` (0x10) keeps every hub's inventory current. A
+  hub's stored name is copied onto an unnamed board once. `device.rename` for
+  an unknown handle answers `no_device`. Hub behaviour only; no message
+  changes.
+- The policy table classes `REQ_SET_DEVICE_NAME` (0x56) as *control*, like
+  `device.rename`, and `REQ_GET_DEVICE_NAME` (0x57) as *read*. It renames
+  0x54/0x55 to the input source name commands, also *control* / *read*, and
+  drops the retired channel gain and mute rows they replace.
 
 ### 13.2 Changes from 1.0
 

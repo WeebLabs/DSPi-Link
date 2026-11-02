@@ -4,7 +4,8 @@
  *
  * Implements Link spec 7.4 (inventory), 7.5 (snapshot), 7.7 (locks) and the
  * relay of 8.3, as bridge spec 7.6 and 8.4 to 8.7 describe. The bridge has
- * one device, always at handle 0.
+ * one device, always at handle 0. Names on the board follow the firmware's
+ * device_name_spec.md section 5.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -19,6 +20,7 @@
 /* Commands the hub sends for itself (firmware commands.md). */
 #define REQ_GET_STATUS 0x50
 #define REQ_GET_ALL_PARAMS 0xA0
+#define REQ_SET_DEVICE_NAME 0x56
 #define STATUS_COMBINED_FRAME 9 /* REQ_GET_STATUS wValue for the meter frame */
 
 /* The v2 notification packet (notification_protocol_v2_spec.md). */
@@ -26,8 +28,13 @@
 #define PACKET_HEADER_BYTES 4 /* version, event, flags, seq */
 #define EVENT_PARAM_CHANGED 0x02
 #define EVENT_BULK_INVALIDATED 0x03
+#define EVENT_INPUT_SOURCE_NAME 0x0F
+#define EVENT_DEVICE_NAME 0x10
 #define PARAM_CHANGED_SOURCE_OFFSET 8
 #define BULK_INVALIDATED_SOURCE_OFFSET 4
+#define NAME_EVENT_SOURCE_OFFSET 5 /* 0x0F and 0x10 share one 40-byte layout */
+#define NAME_EVENT_NAME_OFFSET 8
+#define NAME_EVENT_BYTES (NAME_EVENT_NAME_OFFSET + DSPI_DEVICE_NAME_BYTES)
 
 /* The bulk header (WireHeader), stable across wire formats. */
 #define BULK_HEADER_BYTES 16
@@ -170,6 +177,106 @@ static void forget_device(hub_t *hub)
  * its wire_version and inputs. */
 static void start_snapshot_read(hub_t *hub);
 
+/* "DSPi" and the serial's last four characters (bridge spec 8.7). */
+static void default_name(const hub_t *hub, char *out, size_t size)
+{
+    const char *serial = hub->device.identity.serial;
+    const size_t serial_length = strlen(serial);
+    const char *tail = serial + (serial_length > 4 ? serial_length - 4 : 0);
+    snprintf(out, size, "DSPi %s", tail);
+}
+
+/* The board's own name, or the default when it has none. A raw 0x56 can
+ * store any bytes, so the copy is made valid UTF-8 for JSON. */
+static void board_or_default_name(const hub_t *hub, char *out, size_t size)
+{
+    const dspi_identity_t *identity = &hub->device.identity;
+    if (identity->board_name[0] != '\0') {
+        hub_auth_copy_name(out, size, identity->board_name);
+    } else {
+        default_name(hub, out, size);
+    }
+}
+
+/* The board's name when it has one, which retires the stored entry, else
+ * the stored name, else the default. Applied every time the board comes
+ * online, since it may have been renamed elsewhere meanwhile. */
+static void resolve_name(hub_t *hub, char *out, size_t size)
+{
+    const dspi_identity_t *identity = &hub->device.identity;
+    if (identity->has_board_name && identity->board_name[0] != '\0') {
+        hub->io.forget_device_name(hub->io.context, identity->serial);
+        board_or_default_name(hub, out, size);
+    } else if (!hub->io.load_device_name(hub->io.context, identity->serial, out, size)) {
+        default_name(hub, out, size);
+    }
+}
+
+/* Reduces `name` to what the board stores, as DSPi Console does: printable
+ * ASCII only, runs of spaces (including those left by dropped characters)
+ * closed to one, no space at either end, at most 31 characters. */
+static void clean_board_name(const char *name, char out[DSPI_DEVICE_NAME_BYTES])
+{
+    size_t length = 0;
+    bool space_owed = false;
+    for (const unsigned char *c = (const unsigned char *)name; *c != '\0'; c++) {
+        if (*c < 0x20 || *c > 0x7E) {
+            continue;
+        }
+        if (*c == ' ') {
+            space_owed = length > 0;
+            continue;
+        }
+        if (length + (space_owed ? 1 : 0) >= DSPI_DEVICE_NAME_BYTES - 1) {
+            break;
+        }
+        if (space_owed) {
+            out[length++] = ' ';
+            space_owed = false;
+        }
+        out[length++] = (char)*c;
+    }
+    out[length] = '\0';
+}
+
+/* Queues REQ_SET_DEVICE_NAME with `name` zero-padded to the full field, for
+ * the session on `slot` (-1 for the hub). Returns its tag, or 0. */
+static uint32_t submit_name_write(hub_t *hub, const char name[DSPI_DEVICE_NAME_BYTES], int slot,
+                                  uint16_t session_id, int request_id)
+{
+    uint8_t payload[DSPI_DEVICE_NAME_BYTES] = {0};
+    memcpy(payload, name, strlen(name));
+    const dspi_request_t write = {
+        .is_get = false,
+        .request = REQ_SET_DEVICE_NAME,
+        .length = sizeof(payload),
+        .payload = payload,
+    };
+    return hub_submit_own_write(hub, HUB_WORK_DEVICE_NAME, &write, slot, session_id, request_id);
+}
+
+/* Writes the stored name to a name-capable board that reports none, once
+ * (device_name_spec 5). It is an unrequested flash write with a brief
+ * output restart, so only boards already named on this hub get it. */
+static void adopt_stored_name(hub_t *hub)
+{
+    hub_device_t *device = &hub->device;
+    if (!device->identity.has_board_name || device->identity.board_name[0] != '\0' ||
+        device->adoption_tag != 0) {
+        return; /* Named already, old firmware, or the last attach's write is still out */
+    }
+    char stored[SETTINGS_NAME_MAX_BYTES + 1];
+    if (!hub->io.load_device_name(hub->io.context, device->identity.serial, stored,
+                                  sizeof(stored))) {
+        return;
+    }
+    char name[DSPI_DEVICE_NAME_BYTES];
+    clean_board_name(stored, name);
+    if (name[0] != '\0') {
+        device->adoption_tag = submit_name_write(hub, name, -1, 0, 0);
+    }
+}
+
 void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud)
 {
     hub_device_t *device = &hub->device;
@@ -184,18 +291,12 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
     device->baud = baud;
     device->state = HUB_DEVICE_ONLINE;
     device->seq_known = false;
+    resolve_name(hub, device->name, sizeof(device->name));
 
     if (same_device) {
         broadcast_device(hub, "device.changed");
         broadcast_resync(hub, LINK_RESYNC_REATTACHED);
     } else {
-        if (!hub->io.load_device_name(hub->io.context, identity->serial, device->name,
-                                      sizeof(device->name))) {
-            /* "DSPi" and the serial's last four characters (bridge spec 8.7). */
-            const size_t serial_length = strlen(identity->serial);
-            const char *tail = identity->serial + (serial_length > 4 ? serial_length - 4 : 0);
-            snprintf(device->name, sizeof(device->name), "DSPi %s", tail);
-        }
         broadcast_device(hub, "device.added");
     }
     hub->io.advertise(hub->io.context);
@@ -215,6 +316,7 @@ void hub_device_found(hub_t *hub, const dspi_identity_t *identity, uint32_t baud
     hub->snapshot.valid = false;
     hub->snapshot.read_tag = 0;
     start_snapshot_read(hub);
+    adopt_stored_name(hub);
 }
 
 void hub_device_lost(hub_t *hub)
@@ -260,7 +362,31 @@ static int packet_source(const uint8_t *packet, size_t length)
     if (event == EVENT_BULK_INVALIDATED && length > BULK_INVALIDATED_SOURCE_OFFSET) {
         return packet[BULK_INVALIDATED_SOURCE_OFFSET];
     }
+    if ((event == EVENT_INPUT_SOURCE_NAME || event == EVENT_DEVICE_NAME) &&
+        length > NAME_EVENT_SOURCE_OFFSET) {
+        return packet[NAME_EVENT_SOURCE_OFFSET];
+    }
     return -1;
+}
+
+/* The board stored a name, whoever set it. On name-capable firmware this is
+ * the only thing that sets the shown name, and it retires the stored entry
+ * so a later clear is never undone by adoption. */
+static void note_board_name(hub_t *hub, const uint8_t *name)
+{
+    hub_device_t *device = &hub->device;
+    device->identity.has_board_name = true;
+    memcpy(device->identity.board_name, name, DSPI_DEVICE_NAME_BYTES);
+    device->identity.board_name[DSPI_DEVICE_NAME_BYTES - 1] = '\0';
+    hub->io.forget_device_name(hub->io.context, device->identity.serial);
+
+    char shown[sizeof(device->name)];
+    board_or_default_name(hub, shown, sizeof(shown));
+    if (strcmp(shown, device->name) != 0) {
+        memcpy(device->name, shown, sizeof(device->name));
+        broadcast_device(hub, "device.changed");
+        hub->io.advertise(hub->io.context);
+    }
 }
 
 void hub_notification(hub_t *hub, const uint8_t *packet, size_t length)
@@ -284,6 +410,10 @@ void hub_notification(hub_t *hub, const uint8_t *packet, size_t length)
 
     const int source = packet_source(packet, length);
     const uint16_t origin = source >= 0 ? hub_take_origin(hub, (uint8_t)source) : 0;
+    if (packet[1] == EVENT_DEVICE_NAME && length >= NAME_EVENT_BYTES &&
+        device->state != HUB_DEVICE_ABSENT) {
+        note_board_name(hub, &packet[NAME_EVENT_NAME_OFFSET]);
+    }
 
     for (size_t i = 0; i < hub->config.max_sessions; i++) {
         hub_session_t *session = &hub->sessions[i];
@@ -525,6 +655,74 @@ void hub_handle_device_list(hub_t *hub, int slot, int id, const cJSON *message)
     hub_reply_ok(hub, slot, id, body);
 }
 
+/* device.rename on name-capable firmware: write the board as the asking
+ * session and answer once it accepts. The 0x10 that follows sets the shown
+ * name. A board away from the bridge answers no_device, because its own
+ * name would override a stored one when it returns. */
+static void rename_board(hub_t *hub, int slot, int id, const cJSON *name)
+{
+    hub_session_t *session = &hub->sessions[slot];
+    if (!hub_device_online(hub)) {
+        hub_reply_error(hub, slot, id, "no_device", NULL);
+        return;
+    }
+    if (!cJSON_IsString(name)) {
+        hub_reply_error(hub, slot, id, "bad_request", "name must be a string");
+        return;
+    }
+    if (hub->device.locked_by != 0 && hub->device.locked_by != session->id) {
+        hub_reply_error(hub, slot, id, "locked", "another session holds the lock");
+        return;
+    }
+    /* Each rename is a flash write on the board, so it counts against the
+     * session's in-flight limit like a CMD (Link spec 8.2). */
+    if (session->commands_in_flight >= LINK_MAX_INFLIGHT) {
+        hub_reply_error(hub, slot, id, "busy", "too many requests in flight");
+        return;
+    }
+    char cleaned[DSPI_DEVICE_NAME_BYTES];
+    clean_board_name(name->valuestring, cleaned); /* Empty clears the name */
+    if (submit_name_write(hub, cleaned, slot, session->id, id) == 0) {
+        hub_reply_error(hub, slot, id, "busy", "the bridge's queue to the DSPi is full");
+        return;
+    }
+    session->commands_in_flight++;
+}
+
+void hub_device_name_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply)
+{
+    const bool accepted = reply->kind == DSPI_REPLY_ANSWERED && reply->status == DSPI_STATUS_OK;
+    if (work->slot < 0) {
+        /* Retired on acceptance, so adoption runs once even if the 0x10 is
+         * lost. The tag is cleared with the record if the board was swapped. */
+        if (work->tag == hub->device.adoption_tag) {
+            hub->device.adoption_tag = 0;
+            if (accepted) {
+                hub->io.forget_device_name(hub->io.context, hub->device.identity.serial);
+            }
+        }
+        return;
+    }
+
+    hub_session_t *session = hub_open_session(hub, work->slot);
+    if (session == NULL || session->id != work->session_id) {
+        return; /* The session closed, and its slot may be reused */
+    }
+    session->commands_in_flight--;
+    if (accepted) {
+        hub_reply_ok(hub, work->slot, work->request_id, NULL);
+    } else if (reply->kind == DSPI_REPLY_NO_DEVICE) {
+        hub_reply_error(hub, work->slot, work->request_id, "no_device", NULL);
+    } else if (reply->kind != DSPI_REPLY_ANSWERED || reply->status == DSPI_STATUS_BUSY ||
+               reply->status == DSPI_STATUS_BULK_LOCKED) {
+        hub_reply_error(hub, work->slot, work->request_id, "busy",
+                        "the DSPi did not take the name; try again");
+    } else {
+        hub_reply_error(hub, work->slot, work->request_id, "internal",
+                        "the DSPi refused the name");
+    }
+}
+
 void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message)
 {
     int handle = -1;
@@ -539,6 +737,11 @@ void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;
     }
+    if (hub->device.identity.has_board_name) {
+        rename_board(hub, slot, id, name);
+        return;
+    }
+    /* Older firmware keeps no name: the bridge stores it. */
     if (!cJSON_IsString(name) || !settings_name_is_valid(name->valuestring)) {
         hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
         return;

@@ -129,6 +129,15 @@ static bool load_device_name(void *context, const char *serial, char *name, size
     return true;
 }
 
+static void forget_device_name(void *context, const char *serial)
+{
+    fake_hub_io_t *fake = context;
+    if (strcmp(serial, fake->saved_device_serial) == 0 && fake->saved_device_name[0] != '\0') {
+        fake->saved_device_name[0] = '\0';
+        fake->forget_count++;
+    }
+}
+
 static void advertise(void *context)
 {
     fake_hub_io_t *fake = context;
@@ -192,6 +201,7 @@ hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
         .restart = restart,
         .save_device_name = save_device_name,
         .load_device_name = load_device_name,
+        .forget_device_name = forget_device_name,
         .advertise = advertise,
         .describe_bridge = NULL,
         .update_capacity = update_capacity,

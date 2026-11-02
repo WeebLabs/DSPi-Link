@@ -133,6 +133,12 @@ void hub_commands_handle_frame(hub_t *hub, int slot, const uint8_t *data, size_t
 uint32_t hub_submit_own(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request,
                         bool may_retry, const hub_poll_key_t *poll);
 
+/* Queues a SET the hub makes for a session (slot -1, session 0: the hub
+ * itself) and enters it in the origin queue as that session's write.
+ * Returns its tag, or 0 if the uart task's queue is full. */
+uint32_t hub_submit_own_write(hub_t *hub, hub_work_kind_t kind, const dspi_request_t *request,
+                              int slot, uint16_t session_id, int request_id);
+
 /* The session that most likely caused a notification from `source`, or 0
  * (Link spec 8.3). */
 uint16_t hub_take_origin(hub_t *hub, uint8_t source);
@@ -170,6 +176,10 @@ void hub_snapshot_mark_stale(hub_t *hub);
 void hub_snapshot_resume(hub_t *hub);
 
 void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
+
+/* The answer to a REQ_SET_DEVICE_NAME: answers its device.rename, or
+ * retires the stored name an adoption wrote. */
+void hub_device_name_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
 void hub_device_session_closed(hub_t *hub, int slot, uint16_t session_id);
 void hub_device_tick(hub_t *hub);
 

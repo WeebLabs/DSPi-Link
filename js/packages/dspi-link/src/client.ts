@@ -1137,7 +1137,9 @@ export class LinkClient {
   }
 
   /**
-   * Changes a device's hub-stored name (Link spec 7.4; capability "rename").
+   * Renames a device (Link spec 7.4; capability "rename"). On firmware that
+   * stores its own name the new name arrives with the next device.changed,
+   * after the board has written it, not with this call's reply.
    *
    * @param handle The device.
    * @param name The new name.

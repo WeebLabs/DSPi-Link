@@ -61,6 +61,7 @@ typedef struct {
     char saved_device_serial[17];
     char saved_device_name[64];
     bool refuse_save_name; /* Make save_device_name fail */
+    unsigned forget_count; /* forget_device_name calls that deleted a saved name */
     unsigned advertise_count;
 
     /* Firmware updates: what the hub asked for. Writes are only recorded;
