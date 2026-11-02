@@ -8,7 +8,7 @@ it answers through `hub_io_t`.
 | File | What it does | Portable |
 |------|--------------|----------|
 | `include/hub.h`, `hub.c` | The hub's state, sessions, hello, the message dispatch table, keepalive, replies, the info document and DNS-SD values. | yes |
-| `hub_commands.c` | CMD frames, the queue of requests to the uart task (an answer lost on the way finishes as a timeout), and which session caused a notification. | yes |
+| `hub_commands.c` | CMD frames, the queue of requests to the uart task (an answer lost on the way finishes as a timeout), which session caused a notification, and the analyser STOP rule. | yes |
 | `hub_device.c` | The device record and its events, notifications, snapshots, locks and device names. | yes |
 | `hub_polls.c` | Poll subscriptions and their schedule. | yes |
 | `hub_admin.c` | Administering the hub: `hub.stats` and `hub.rename`, settings, Wi-Fi, the PIN and paired clients, restart and reset (Link spec 7.9 to 7.13). | yes |

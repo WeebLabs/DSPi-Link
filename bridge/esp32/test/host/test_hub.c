@@ -1968,6 +1968,261 @@ static void subscribe_one(int slot, int poll_slot, int request, int value, int l
               poll_slot, request, value, length, hz);
 }
 
+/* ---------------------------------------------------------------------------
+ * Analyser sharing (Link spec 7.15)
+ * ------------------------------------------------------------------------- */
+
+/* Sends REQ_RTA_CONTROL (0x0E) with `control` as wValue, laid out as
+ * send_cmd() lays out a GET. */
+static void send_rta_control_value(int slot, uint16_t tag, uint8_t control)
+{
+    const uint8_t frame[LINK_CMD_REQUEST_HEADER_BYTES] = {
+        LINK_FRAME_CMD_REQUEST, 0, (uint8_t)(tag & 0xFF), (uint8_t)(tag >> 8), 0, 1, 0x0E, 0,
+        control, 0, 2, 0, 1, 0};
+    hub_session_binary(&hub, slot, frame, sizeof(frame));
+}
+
+/* Whether the last CMD response to `slot` answers `tag` OK with the one-byte
+ * ack, the answer a swallowed STOP gets. */
+static bool answered_ack(int slot, uint16_t tag)
+{
+    const fake_message_t *response = last_frame(slot, LINK_FRAME_CMD_RESPONSE);
+    return response != NULL && response->data[4] == 0 &&
+           (response->data[2] | response->data[3] << 8) == tag &&
+           response->length == LINK_CMD_RESPONSE_HEADER_BYTES + 1 &&
+           response->data[LINK_CMD_RESPONSE_HEADER_BYTES] == 0x01;
+}
+
+static void read_bands(int slot, uint16_t tag)
+{
+    send_cmd(slot, tag, true, 0x0B, 82, NULL);
+    static const uint8_t frame[82] = {0};
+    answer_last(0, frame, sizeof(frame));
+}
+
+static void a_stop_is_kept_from_the_device_while_another_session_watches(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    send_rta_control_value(0, 2, 1 /* START */);
+    answer_last(0, (const uint8_t[]){1}, 1);
+    forget_submissions();
+
+    send_rta_control_value(0, 3, 0 /* STOP */);
+    CHECK(io_record.submission_count == 0);
+    CHECK(answered_ack(0, 3));
+
+    /* The first session stopped watching, so the second one's STOP goes through. */
+    send_rta_control_value(1, 4, 0);
+    CHECK(io_record.submission_count == 1);
+    CHECK(io_record.submissions[0].request.request == 0x0E);
+    CHECK(io_record.submissions[0].request.value == 0);
+}
+
+static void a_stop_goes_through_once_the_other_watch_lapses(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    io_record.now_ms += 5001; /* Past the firmware's own idle timeout */
+    send_rta_control_value(0, 2, 0);
+    CHECK(io_record.submission_count == 1);
+}
+
+static void start_and_reset_always_reach_the_device(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    send_rta_control_value(0, 2, 1 /* START */);
+    send_rta_control_value(0, 3, 2 /* RESET_AVG */);
+    CHECK(io_record.submission_count == 2);
+}
+
+static void an_analyser_poll_counts_as_watching(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    subscribe_one(1, 0, 0x0B, 0, 82, 10);
+    forget_submissions();
+    io_record.now_ms += 10000; /* A poll watches however long ago it began */
+    send_rta_control_value(0, 2, 0);
+    CHECK(io_record.submission_count == 0);
+    CHECK(answered_ack(0, 2));
+
+    send_json(1, "{\"t\":\"poll.unsubscribe\",\"id\":9,\"handle\":0,\"slots\":[0]}");
+    forget_submissions();
+    send_rta_control_value(0, 3, 0);
+    CHECK(io_record.submission_count == 1);
+}
+
+static void a_closed_session_stops_watching_and_sends_nothing(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    hub_session_closed(&hub, 1);
+    CHECK(io_record.submission_count == 0); /* No STOP on its behalf */
+    send_rta_control_value(0, 2, 0);
+    CHECK(io_record.submission_count == 1);
+}
+
+static void a_viewer_cannot_stop_the_analyser(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1); /* A watcher, so a swallow would answer OK */
+    forget_submissions();
+    hub.sessions[0].role = LINK_ROLE_VIEWER;
+    send_rta_control_value(0, 2, 0);
+    CHECK(io_record.submission_count == 0);
+    CHECK(last_status(0) == LINK_STATUS_DENIED);
+}
+
+static void a_bins_read_counts_as_watching(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    send_cmd(1, 1, true, 0x0C /* RTA_GET_BINS */, 64, NULL);
+    static const uint8_t bins[64] = {0};
+    answer_last(0, bins, sizeof(bins));
+    forget_submissions();
+    send_rta_control_value(0, 2, 0);
+    CHECK(io_record.submission_count == 0);
+    CHECK(answered_ack(0, 2));
+}
+
+/* The count of CMD responses to `slot` so far, and the tag of the n-th. */
+static size_t response_count(int slot)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < io_record.message_count; i++) {
+        const fake_message_t *m = &io_record.messages[i];
+        count += m->slot == slot && m->binary && m->data[0] == LINK_FRAME_CMD_RESPONSE;
+    }
+    return count;
+}
+
+static int response_tag(int slot, size_t n)
+{
+    for (size_t i = 0; i < io_record.message_count; i++) {
+        const fake_message_t *m = &io_record.messages[i];
+        if (m->slot == slot && m->binary && m->data[0] == LINK_FRAME_CMD_RESPONSE && n-- == 0) {
+            return m->data[2] | m->data[3] << 8;
+        }
+    }
+    return -1;
+}
+
+static void a_swallowed_stop_is_answered_in_the_order_sent(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    const size_t before = response_count(0);
+    send_cmd(0, 7, true, 0x7F, 7, NULL); /* Still waiting for the DSPi */
+    send_rta_control_value(0, 8, 0);
+    send_rta_control_value(0, 9, 0);
+    CHECK(response_count(0) == before); /* Neither STOP overtakes the read */
+    CHECK(hub.sessions[0].commands_in_flight == 3);
+
+    answer_last(0, (const uint8_t[7]){0}, 7);
+    CHECK(response_count(0) == before + 3);
+    CHECK(response_tag(0, before) == 7);
+    CHECK(response_tag(0, before + 1) == 8);
+    CHECK(response_tag(0, before + 2) == 9);
+    CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+static void a_held_stop_follows_a_lost_command_too(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    const size_t before = response_count(0);
+    send_cmd(0, 7, true, 0x7F, 7, NULL);
+    send_rta_control_value(0, 8, 0);
+    const dspi_reply_t lost = {.kind = DSPI_REPLY_TIMEOUT};
+    hub_reply(&hub, io_record.submissions[0].tag, &lost);
+    CHECK(response_count(0) == before + 2);
+    CHECK(response_tag(0, before + 1) == 8);
+    CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+static void a_pending_rename_does_not_hold_a_stop(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    const dspi_identity_t identity = capable_identity("Old");
+    attach_identity(&identity, DSPI_STATUS_OK);
+    read_bands(1, 1);
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.rename\",\"id\":7,\"handle\":0,\"name\":\"Rack\"}");
+    CHECK(hub.sessions[0].commands_in_flight == 1);
+    /* A rename answers in JSON, so the STOP has no CMD to wait for. */
+    send_rta_control_value(0, 8, 0);
+    CHECK(answered_ack(0, 8));
+    CHECK(hub.sessions[0].commands_in_flight == 1);
+    answer_last(DSPI_STATUS_OK, NULL, 0);
+    CHECK(last_answer_id(0, "ok") == 7);
+    CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+static void analyser_and_aux_events_are_attributed(void)
+{
+    start();
+    open_session(0);
+    const int writer = open_session(1);
+    attach_device();
+
+    send_cmd(1, 1, false, 0x08 /* RTA_SET_CONFIG */, 12, (const uint8_t[12]){0});
+    answer_last(0, NULL, 0);
+    uint8_t rta[17] = {0x02, 0x0D, 0x00, 1};
+    rta[16] = 1; /* HOST_SET */
+    hub_notification(&hub, rta, sizeof(rta));
+    CHECK(last_notify_origin(0) == writer);
+
+    send_cmd(1, 2, false, 0x04 /* CS_AUX_STATE */, 1, (const uint8_t[]){1});
+    answer_last(0, NULL, 0);
+    const uint8_t aux[9] = {0x02, 0x0C, 0x00, 2, 0, 1, 0, 0, 1 /* HOST_SET */};
+    hub_notification(&hub, aux, sizeof(aux));
+    CHECK(last_notify_origin(0) == writer);
+
+    /* A front-panel change is nobody's echo, and leaves the queue alone. */
+    send_cmd(1, 3, false, 0x04, 1, (const uint8_t[]){0});
+    answer_last(0, NULL, 0);
+    const uint8_t gpio[9] = {0x02, 0x0C, 0x00, 3, 0, 0, 0, 0, 5 /* GPIO */};
+    hub_notification(&hub, gpio, sizeof(gpio));
+    CHECK(last_notify_origin(0) == 0);
+    hub_notification(&hub, aux, sizeof(aux)); /* seq repeats; origin is what matters */
+    CHECK(last_notify_origin(0) == writer);
+}
+
 static void the_poll_budget_is_shared_by_every_session(void)
 {
     start();
@@ -2291,6 +2546,17 @@ void test_hub(void)
     RUN(a_refused_write_claims_no_notification);
     RUN(write_as_read_commands_are_attributed);
     RUN(a_write_queued_behind_a_slow_one_keeps_its_window);
+    RUN(a_stop_is_kept_from_the_device_while_another_session_watches);
+    RUN(a_stop_goes_through_once_the_other_watch_lapses);
+    RUN(start_and_reset_always_reach_the_device);
+    RUN(an_analyser_poll_counts_as_watching);
+    RUN(a_closed_session_stops_watching_and_sends_nothing);
+    RUN(a_viewer_cannot_stop_the_analyser);
+    RUN(a_bins_read_counts_as_watching);
+    RUN(a_swallowed_stop_is_answered_in_the_order_sent);
+    RUN(a_held_stop_follows_a_lost_command_too);
+    RUN(a_pending_rename_does_not_hold_a_stop);
+    RUN(analyser_and_aux_events_are_attributed);
     RUN(the_poll_budget_is_shared_by_every_session);
     RUN(client_names_are_kept_valid_utf8);
     RUN(an_unreadable_pin_lets_nobody_in_until_it_is_set_again);

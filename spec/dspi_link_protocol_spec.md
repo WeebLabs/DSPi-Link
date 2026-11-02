@@ -2,7 +2,7 @@
 
 *Version: 1.2 (draft)*
 *Status: draft; dspi-link-js and the DSPi Console `feature/dspi-link` branch implement 1.1, and the ESP32 bridge (`spec/esp32_bridge_spec.md`) will implement 1.2*
-*Last updated: 2026-11-01 (the change history is in section 13)*
+*Last updated: 2026-11-02 (the change history is in section 13)*
 
 DSPi Link is the local-network protocol through which a **hub** (DSPi Console
 in gateway mode, or a standalone bridge such as an ESP32 wired to a DSPi over
@@ -305,10 +305,14 @@ configuration, and an admin who wants control users kept away from the
 wiring leaves the device in independent mode.
 
 A `bRequest` the firmware accepts in both directions can carry a different
-class per direction. `REQ_LIMITER` (0x81) is the case today. Its `SET`
+class per direction. `REQ_LIMITER` (0x81) is one case. Its `SET`
 changes a limiter setting and is *control*, while its `GET` reads a setting,
 the gain-reduction meter or the limiter status and is *read*, so a viewer
-can poll the meter but cannot change the limiter. Section 9.3 gives the table encoding.
+can poll the meter but cannot change the limiter. `REQ_OUTPUT_LATENCY` (0x03)
+is the other: its `SET` selects the output latency, a device-global flash
+write followed by a muted output restart, and is *config*, while its `GET`
+reads the status or the option table and is *read*. Section 9.3 gives the
+table encoding.
 
 ### 6.4 Transport security
 
@@ -549,6 +553,26 @@ one with `bad_request`, and refuses `lock.acquire` from a viewer with
 `denied`, since a viewer cannot write. A hub without the `lock` capability
 serialises commands as usual and clients skip the lock step.
 
+DSPi Console takes the lock for these flows, on its own hub as session 1 and
+on a remote hub through `lock.acquire`, and releases it on every exit:
+
+| Flow | `reason` | `timeout_ms` |
+|------|----------|--------------|
+| Configuration import (`.dspipreset` apply) | `Applying configuration` | 60000 |
+| Preset save (`REQ_PRESET_SAVE`) | `Saving preset` | 5000 |
+| Preset copy (two saves and the wait between them) | `Copying preset` | 10000 |
+| Output configuration save (`REQ_SAVE_OUTPUT_CONFIG`) | `Saving output configuration` | 5000 |
+| Flash save (`REQ_SAVE_PARAMS`) | `Saving to flash` | 5000 |
+| IR learn, from arm until the result, cancel or timeout | `Learning an IR code` | 15000 |
+| Firmware install, from before `REQ_ENTER_BOOTLOADER` until the install ends | `Installing firmware` | 60000 |
+
+If the lock is refused the flow sends nothing and says "Another console is
+applying changes". The same wording appears briefly in the status row when an
+ordinary command is answered `0x85 LOCKED`. The Console's configuration
+import applies its document as individual commands, not `REQ_SET_ALL_PARAMS`.
+A firmware install's lock normally ends with the device: the reboot detaches
+it from the hub.
+
 ### 7.8 Firmware install (Console hubs)
 
 ```json
@@ -709,6 +733,43 @@ and the hub keeps running its current firmware.
 A hub must keep its previous firmware and return to it if the new firmware
 fails to start. A client confirms the outcome from `hub.version` in the
 `hello` it receives after reconnecting.
+
+### 7.15 Analyser sharing
+
+The spectrum analyser (`REQ_RTA_*`, 0x08 to 0x0F) is one engine with one
+configuration shared by every session, and the firmware cannot tell sessions
+apart. The host-side rules (last chooser drives, followers adopt the device's
+configuration, a user action takes control) are in the firmware's
+`spectrum_analyser_spec.md` section 7 and apply to every client. A hub adds
+two things, because only the hub sees every session.
+
+**Watching.** A session is watching the analyser while it has read bands or
+bins (`REQ_RTA_GET_BANDS` 0x0B, `REQ_RTA_GET_BINS` 0x0C,
+`REQ_RTA_GET_BANDS_ALL` 0x0F) or sent `RTA_CTL_START` within the last 5000 ms,
+the firmware's own idle timeout, or while it holds a poll subscription for
+one of those commands. A session that closes stops watching at once.
+
+**STOP is per session.** `REQ_RTA_CONTROL` (0x0E) with `RTA_CTL_STOP` (0)
+means "this session has stopped watching". The hub forwards it to the device
+only when no other session is watching. Otherwise it answers the session
+`OK` with the one-byte acknowledgement the device would have sent (`01`) and
+does not touch the device. `RTA_CTL_START` and `RTA_CTL_RESET_AVG` are always
+forwarded. A hub must never forward a STOP on a session's behalf when that
+session closes: the firmware stops itself 5 s after the last read.
+
+**The configuration event is attributed.** `NOTIFY_EVT_RTA_CONFIG` (0x0D,
+notification spec section 3.9) is a host-sourced event when its source byte,
+at offset 16, is `HOST_SET`, `BULK_SET` or (over a bridge) `UART`, and the hub
+attributes it to the session whose `REQ_RTA_SET_CONFIG` it answers, exactly as
+it attributes `PARAM_CHANGED` (section 8.3). That attribution is how a client
+tells its own echo from another session's change. A hub relays the packet
+verbatim like every other notification.
+
+**Viewers.** `REQ_RTA_SET_CONFIG` and `REQ_RTA_CONTROL` remain classed
+*control*, so a viewer can watch whatever configuration the device holds (band
+reads auto-start the analyser) but cannot choose channels. Letting viewers
+take part is a possible later relaxation and would need the same per-session
+rules above.
 
 ---
 
@@ -957,6 +1018,8 @@ none of which are visible to clients:
   bridge cannot do this step. The bridge reads `REQ_GET_CTRL_IFACE_STATUS`
   (0xF9) and `REQ_GET_UART_CONFIG` (0xF6) when the device appears and reports
   `uart_live` and `notify_enable`.
+- Follows the analyser rules in section 7.15: tracks which sessions are
+  watching and swallows `RTA_CTL_STOP` while another session is.
 - Obeys the one-request-in-flight rule on the UART: the Link router
   serialises per device anyway, so this costs nothing.
 - Forwards the UART `status` byte verbatim; wraps UART timeouts as `TIMEOUT`.
@@ -1098,6 +1161,7 @@ A hub is conformant when it:
 - [ ] defaults to `auth: none`, and when `pin` is on rate-limits failures and stores only hashes of tokens and of any fixed PIN;
 - [ ] implements CMD with per-device ordering, `max_inflight`, and the status table;
 - [ ] relays notifications verbatim with `origin` attribution and sends RESYNC on drop;
+- [ ] tracks analyser watchers per session and swallows `RTA_CTL_STOP` while another session is watching (section 7.15);
 - [ ] implements poll subscriptions with fan-out and stops polling when unsubscribed;
 - [ ] classifies every command it forwards and fails safe on unknown ones;
 - [ ] keeps handles stable, emits `device.added/removed/changed`;
@@ -1155,6 +1219,17 @@ with a window PIN, and only its prompt wording may read oddly.
   `device.rename`, and `REQ_GET_DEVICE_NAME` (0x57) as *read*. It renames
   0x54/0x55 to the input source name commands, also *control* / *read*, and
   drops the retired channel gain and mute rows they replace.
+- Section 7.15 adds analyser sharing: a hub tracks which sessions are
+  watching the analyser, swallows `RTA_CTL_STOP` while another session is,
+  and attributes `NOTIFY_EVT_RTA_CONFIG` (0x0D, source byte at offset 16)
+  like `PARAM_CHANGED`. Hub behaviour only; no message changes.
+- The policy table gains `REQ_OUTPUT_LATENCY` (0x03), added to the firmware
+  after beta5: *config* to set, *read* to get (section 6.3). Additive under
+  section 10; a hub with an older table treats it as *config* both ways.
+- Section 7.7 lists the DSPi Console flows that take the device lock
+  (configuration import, preset save and copy, output configuration and
+  flash saves, IR learn, firmware install). Client behaviour only; no
+  message changes.
 
 ### 13.2 Changes from 1.0
 

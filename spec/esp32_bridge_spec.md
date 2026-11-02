@@ -3,7 +3,7 @@
 *Version: 1.0 (draft)*
 *Implements: DSPi Link protocol 1.2 (`spec/dspi_link_protocol_spec.md`)*
 *Status: draft; no implementation yet. `bridge/esp32/PLAN.md` gives the build order.*
-*Last updated: 2026-11-01*
+*Last updated: 2026-11-02*
 
 The ESP32 bridge is the reference implementation of a DSPi Link bridge hub.
 It is a firmware image for common ESP32 boards. Wired to a DSPi's UART
@@ -650,6 +650,16 @@ that applies:
 Then the command joins the uart task's queue and its response returns to the
 session with the client's `tag`. The hub never interprets payloads.
 
+The one exception is the analyser STOP rule of Link spec 7.15. A session
+watches the analyser for 5 s after it reads bands or bins (0x0B, 0x0C, 0x0F)
+or sends `RTA_CTL_START`, and for as long as it holds a poll of one of those
+reads. A `REQ_RTA_CONTROL` STOP from a session that passed the checks above,
+while any other open session watches, is answered `OK` with `01` and never
+reaches the DSPi. The answer keeps its place in the session's reply order:
+it waits for the session's earlier commands and counts toward
+`max_inflight` until sent. The check runs as the command is admitted, which
+is queue order. Closing a session ends its watching and sends nothing.
+
 ### 8.4 Notifications
 
 Every notification frame from the DSPi is relayed to every authenticated
@@ -661,7 +671,8 @@ uart task takes the write up, not from when it was queued, and a write the
 DSPi refuses leaves the queue at once, since it will cause no notification.
 A notification whose source byte is `HOST_SET`, `BULK_SET` or `UART` takes
 the oldest entry. The source byte is byte 8 of `PARAM_CHANGED`, byte 4 of
-`BULK_INVALIDATED`, and byte 5 of the two name events,
+`BULK_INVALIDATED`, byte 8 of `CS_AUX` (0x0C), byte 16 of `RTA_CONFIG`
+(0x0D), and byte 5 of the two name events,
 `NOTIFY_EVT_INPUT_SOURCE_NAME` (0x0F) and `NOTIFY_EVT_DEVICE_NAME` (0x10), so
 a name write claims its own echo. The hub's own name writes (section 8.7)
 join the queue too: a rename as the session that asked, an adoption as

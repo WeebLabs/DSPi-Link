@@ -28,10 +28,14 @@
 #define PACKET_HEADER_BYTES 4 /* version, event, flags, seq */
 #define EVENT_PARAM_CHANGED 0x02
 #define EVENT_BULK_INVALIDATED 0x03
+#define EVENT_CS_AUX 0x0C
+#define EVENT_RTA_CONFIG 0x0D
 #define EVENT_INPUT_SOURCE_NAME 0x0F
 #define EVENT_DEVICE_NAME 0x10
 #define PARAM_CHANGED_SOURCE_OFFSET 8
 #define BULK_INVALIDATED_SOURCE_OFFSET 4
+#define CS_AUX_SOURCE_OFFSET 8
+#define RTA_CONFIG_SOURCE_OFFSET 16
 #define NAME_EVENT_SOURCE_OFFSET 5 /* 0x0F and 0x10 share one 40-byte layout */
 #define NAME_EVENT_NAME_OFFSET 8
 #define NAME_EVENT_BYTES (NAME_EVENT_NAME_OFFSET + DSPI_DEVICE_NAME_BYTES)
@@ -361,6 +365,12 @@ static int packet_source(const uint8_t *packet, size_t length)
     }
     if (event == EVENT_BULK_INVALIDATED && length > BULK_INVALIDATED_SOURCE_OFFSET) {
         return packet[BULK_INVALIDATED_SOURCE_OFFSET];
+    }
+    if (event == EVENT_CS_AUX && length > CS_AUX_SOURCE_OFFSET) {
+        return packet[CS_AUX_SOURCE_OFFSET];
+    }
+    if (event == EVENT_RTA_CONFIG && length > RTA_CONFIG_SOURCE_OFFSET) {
+        return packet[RTA_CONFIG_SOURCE_OFFSET];
     }
     if ((event == EVENT_INPUT_SOURCE_NAME || event == EVENT_DEVICE_NAME) &&
         length > NAME_EVENT_SOURCE_OFFSET) {

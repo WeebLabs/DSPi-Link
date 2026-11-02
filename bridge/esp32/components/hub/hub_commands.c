@@ -2,11 +2,11 @@
  * hub_commands.c - CMD frames, the queue of requests to the uart task, and
  * origin attribution.
  *
- * Implements Link spec 8.2 and the origin rule of 8.3, as bridge spec 8.3
- * and 8.4 describe. Every request the hub sends the DSPi, whether a client's
- * command, a poll or a snapshot read, goes through one queue here. The uart
- * task answers in the order it was asked, so the oldest pending request is
- * always the one being answered.
+ * Implements Link spec 8.2, the origin rule of 8.3 and the analyser STOP
+ * rule of 7.15, as bridge spec 8.3 and 8.4 describe. Every request the hub
+ * sends the DSPi, whether a client's command, a poll or a snapshot read, goes
+ * through one queue here. The uart task answers in the order it was asked,
+ * so the oldest pending request is always the one being answered.
  *
  * Portable: no ESP-IDF headers.
  */
@@ -24,6 +24,18 @@
 #define SOURCE_HOST_SET 1
 #define SOURCE_BULK_SET 2
 #define SOURCE_UART 8
+
+/* The analyser commands a hub arbitrates between sessions (Link spec 7.15). */
+#define REQ_RTA_GET_BANDS 0x0B
+#define REQ_RTA_GET_BINS 0x0C
+#define REQ_RTA_CONTROL 0x0E
+#define REQ_RTA_GET_BANDS_ALL 0x0F
+#define RTA_CTL_STOP 0
+#define RTA_CTL_START 1
+#define RTA_STOP_ACK 0x01 /* What the DSPi answers to any RTA_CONTROL */
+/* The firmware's own idle timeout, so a swallowed STOP never keeps the
+ * analyser running longer than an unread one would. */
+#define RTA_WATCH_WINDOW_MS 5000
 
 /* ---------------------------------------------------------------------------
  * The pending queue
@@ -304,6 +316,110 @@ static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
     return DSPI_STATUS_OK;
 }
 
+static bool is_rta_read(uint8_t request)
+{
+    return request == REQ_RTA_GET_BANDS || request == REQ_RTA_GET_BINS ||
+           request == REQ_RTA_GET_BANDS_ALL;
+}
+
+static bool session_watches_rta(hub_session_t *session, uint32_t now)
+{
+    if (session->rta_watching && now - session->rta_watched_ms > RTA_WATCH_WINDOW_MS) {
+        session->rta_watching = false; /* So the clock wrapping cannot revive it */
+    }
+    if (session->rta_watching) {
+        return true;
+    }
+    for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
+        if (session->polls[p].active && is_rta_read(session->polls[p].key.request)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Records analyser watching, and answers whether this is an RTA STOP that
+ * must not reach the DSPi because another session still watches. Decided at
+ * admission, which is queue order, so a band read queued ahead counts. */
+static bool rta_stop_swallowed(hub_t *hub, hub_session_t *session,
+                               const link_cmd_request_t *command)
+{
+    const bool control = command->request == REQ_RTA_CONTROL;
+    if (!command->is_get || (!control && !is_rta_read(command->request))) {
+        return false;
+    }
+    const uint32_t now = hub_now(hub);
+    if (!control || command->value == RTA_CTL_START) {
+        session->rta_watching = true;
+        session->rta_watched_ms = now;
+        return false;
+    }
+    if (command->value != RTA_CTL_STOP) {
+        return false;
+    }
+    session->rta_watching = false;
+    for (size_t s = 0; s < hub->config.max_sessions; s++) {
+        hub_session_t *other = &hub->sessions[s];
+        if (other != session && other->state == HUB_SESSION_OPEN &&
+            session_watches_rta(other, now)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The pending tag of the session's newest CMD still queued, or 0. Renames
+ * also count in commands_in_flight but answer in JSON, so they are skipped. */
+static uint32_t newest_queued_command(const hub_t *hub, int slot, uint16_t session_id)
+{
+    for (size_t i = hub->pending_count; i > 0; i--) {
+        const hub_pending_t *entry =
+            &hub->pending[(hub->pending_head + i - 1) % HUB_PENDING_CAPACITY];
+        if (entry->kind == HUB_WORK_CLIENT_COMMAND && entry->slot == slot &&
+            entry->session_id == session_id) {
+            return entry->tag;
+        }
+    }
+    return 0;
+}
+
+/* Answers a swallowed STOP in its place in the session's order: now, or
+ * once the session's newest queued CMD has been answered. */
+static void answer_swallowed_stop(hub_t *hub, int slot, hub_session_t *session,
+                                  uint16_t client_tag)
+{
+    const uint32_t after_tag = newest_queued_command(hub, slot, session->id);
+    if (after_tag == 0) {
+        const uint8_t ack = RTA_STOP_ACK;
+        respond(hub, slot, client_tag, DSPI_STATUS_OK, &ack, sizeof(ack));
+        return;
+    }
+    hub_deferred_ack_t *deferred = &session->deferred_acks[session->deferred_ack_count++];
+    deferred->after_tag = after_tag;
+    deferred->client_tag = client_tag;
+    session->commands_in_flight++;
+}
+
+/* Sends the swallowed STOPs that were waiting for the command `tag`. */
+static void release_deferred_acks(hub_t *hub, int slot, hub_session_t *session, uint32_t tag)
+{
+    const uint8_t ack = RTA_STOP_ACK;
+    size_t released = 0;
+    while (released < session->deferred_ack_count &&
+           session->deferred_acks[released].after_tag == tag) {
+        respond(hub, slot, session->deferred_acks[released].client_tag, DSPI_STATUS_OK, &ack,
+                sizeof(ack));
+        released++;
+    }
+    if (released == 0) {
+        return;
+    }
+    session->deferred_ack_count -= (uint8_t)released;
+    session->commands_in_flight -= (uint8_t)released;
+    memmove(session->deferred_acks, &session->deferred_acks[released],
+            session->deferred_ack_count * sizeof(session->deferred_acks[0]));
+}
+
 void hub_commands_handle_frame(hub_t *hub, int slot, const uint8_t *data, size_t length)
 {
     hub_session_t *session = hub_open_session(hub, slot);
@@ -318,6 +434,10 @@ void hub_commands_handle_frame(hub_t *hub, int slot, const uint8_t *data, size_t
 
     const link_class_t class_ = link_policy_class(command.request, command.is_get);
     uint8_t status = admission_status(hub, session, &command, class_);
+    if (status == DSPI_STATUS_OK && rta_stop_swallowed(hub, session, &command)) {
+        answer_swallowed_stop(hub, slot, session, command.tag);
+        return;
+    }
     if (status == DSPI_STATUS_OK) {
         status = enqueue_command(hub, slot, session, &command, class_);
     }
@@ -368,6 +488,7 @@ static void finish_client_command(hub_t *hub, const hub_pending_t *work, const d
     session->commands_in_flight--;
     respond(hub, work->slot, work->client_tag, status, reply->payload,
             status == DSPI_STATUS_OK ? reply->length : 0);
+    release_deferred_acks(hub, work->slot, session, work->tag);
 }
 
 /* Finishes one piece of work with its answer. */

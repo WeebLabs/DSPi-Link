@@ -60,6 +60,13 @@ typedef struct {
     uint16_t length;
 } hub_poll_key_t;
 
+/* A swallowed RTA STOP whose answer waits for an earlier command of the
+ * same session, so answers keep the order sent (Link spec 8.2). */
+typedef struct {
+    uint32_t after_tag; /* The pending tag it follows */
+    uint16_t client_tag;
+} hub_deferred_ack_t;
+
 typedef struct {
     bool active;
     hub_poll_key_t key;
@@ -82,6 +89,10 @@ typedef struct {
     uint16_t notify_sequence;
     uint16_t poll_sequence;
     bool resync_owed; /* A notification was dropped; RESYNC when there is room */
+    bool rta_watching;       /* Read the analyser or started it (Link spec 7.15) */
+    uint32_t rta_watched_ms; /* When it last did */
+    uint8_t deferred_ack_count; /* Also counted in commands_in_flight */
+    hub_deferred_ack_t deferred_acks[LINK_MAX_INFLIGHT];
     hub_poll_slot_t polls[HUB_POLL_SLOTS];
 } hub_session_t;
 
