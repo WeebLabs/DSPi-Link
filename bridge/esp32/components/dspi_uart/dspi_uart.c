@@ -50,6 +50,11 @@ static struct {
     bool device_present;
     dspi_identity_t identity; /* Of the device present */
     bool identity_warned;     /* An unreadable identity was logged; not again until found */
+    dspi_probe_t last_probe;  /* The last probe's answer, while no device is present */
+    bool probe_answered;      /* `last_probe` holds an answer */
+    bool firmware_warned;     /* An unusable firmware was logged; not again until it changes */
+    uint8_t legacy_platform[DSPI_PLATFORM_BYTES];
+    uint8_t legacy_platform_length;
     QueueHandle_t queue;
     volatile uint32_t last_loop_ms; /* For dspi_uart_is_alive() */
     dspi_uart_status_t published;   /* For dspi_uart_get_status(), counters aside */
@@ -220,6 +225,15 @@ static void publish_status(void)
         .device_present = uart_task_state.device_present,
         .identity = uart_task_state.identity,
     };
+    const dspi_firmware_t firmware = uart_task_state.last_probe.firmware;
+    if (!uart_task_state.device_present && uart_task_state.probe_answered &&
+        (firmware == DSPI_FIRMWARE_TOO_OLD || firmware == DSPI_FIRMWARE_TOO_NEW)) {
+        status.unusable_answered = true;
+        status.unusable_firmware = firmware;
+        memcpy(status.legacy_platform, uart_task_state.legacy_platform,
+               sizeof(status.legacy_platform));
+        status.legacy_platform_length = uart_task_state.legacy_platform_length;
+    }
     portENTER_CRITICAL(&status_lock);
     uart_task_state.published = status;
     portEXIT_CRITICAL(&status_lock);
@@ -347,6 +361,28 @@ static bool ensure_driver(void)
     return true;
 }
 
+/* A DSPi answered that the bridge cannot serve (bridge spec 7.6). It is not
+ * attached and is sent nothing else, apart from the legacy platform read of
+ * firmware 1.1.6 and older, which shows the user what to update. */
+static void refuse_firmware(const dspi_probe_t *probe)
+{
+    dspi_link_t *link = &uart_task_state.link;
+    if (probe->firmware == DSPI_FIRMWARE_TOO_OLD && uart_task_state.legacy_platform_length == 0) {
+        const int length = dspi_link_read_legacy_platform(link, uart_task_state.legacy_platform);
+        uart_task_state.legacy_platform_length = length > 0 ? (uint8_t)length : 0;
+    }
+    if (uart_task_state.firmware_warned || probe->firmware == DSPI_FIRMWARE_NOT_READY) {
+        return;
+    }
+    uart_task_state.firmware_warned = true;
+    if (probe->firmware == DSPI_FIRMWARE_TOO_OLD) {
+        ESP_LOGW(TAG,
+                 "The DSPi runs firmware 1.1.6 or older; update it over USB with DSPi Console");
+    } else {
+        ESP_LOGW(TAG, "The DSPi runs firmware newer than this bridge understands");
+    }
+}
+
 /* Probes for the DSPi once (bridge spec 7.5 and 7.6). */
 static void look_for_device(void)
 {
@@ -359,32 +395,39 @@ static void look_for_device(void)
     }
     const size_t candidate_count =
         config->detect_baud ? sizeof(candidates) / sizeof(candidates[0]) : 0;
+    dspi_probe_t probe;
     const bool answered =
-        dspi_link_find_baud(link, dspi_link_baud(link), candidates, candidate_count);
-    publish_status(); /* The rate may have changed */
+        dspi_link_find_baud(link, dspi_link_baud(link), candidates, candidate_count, &probe);
+    const dspi_firmware_t before = uart_task_state.last_probe.firmware;
+    const bool changed =
+        answered != uart_task_state.probe_answered || (answered && probe.firmware != before);
+    uart_task_state.probe_answered = answered;
+    if (answered) {
+        uart_task_state.last_probe = probe;
+    }
+    if (changed) {
+        uart_task_state.firmware_warned = false;
+        uart_task_state.legacy_platform_length = 0;
+    }
     if (!answered) {
+        publish_status(); /* The rate may have changed */
+        return;
+    }
+    if (probe.firmware != DSPI_FIRMWARE_PAGED) {
+        refuse_firmware(&probe);
+        publish_status();
         return;
     }
 
-    dspi_identity_t identity;
-    if (!dspi_link_read_identity(link, &identity)) {
-        if (!uart_task_state.identity_warned) {
-            ESP_LOGW(TAG, "A DSPi answered at %lu baud but its identity could not be read",
-                     (unsigned long)dspi_link_baud(link));
-            uart_task_state.identity_warned = true;
-        }
-        return;
+    /* Firmware 1.1.7 or later answered. Until the bridge's own reads are
+     * readdressed to its paged commands, nothing is attached. */
+    if (!uart_task_state.firmware_warned) {
+        ESP_LOGW(TAG,
+                 "A DSPi with protocol %u.%u answered at %lu baud; this build cannot attach it",
+                 probe.protocol_major, probe.protocol_minor, (unsigned long)dspi_link_baud(link));
+        uart_task_state.firmware_warned = true;
     }
-
-    uart_task_state.identity = identity;
-    uart_task_state.device_present = true;
-    uart_task_state.identity_warned = false;
     publish_status();
-    ESP_LOGI(TAG, "Found DSPi %s at %lu baud", identity.serial,
-             (unsigned long)dspi_link_baud(link));
-    if (config->handlers.device_found != NULL) {
-        config->handlers.device_found(config->handlers.context, &identity, dspi_link_baud(link));
-    }
 }
 
 static void check_still_present(void)

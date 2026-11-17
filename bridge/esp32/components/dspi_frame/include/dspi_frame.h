@@ -44,15 +44,37 @@
 #define DSPI_FRAME_CRC_BYTES 2
 
 /* Firmware status codes, carried unchanged into Link CMD responses (Link
- * spec 8.1). */
+ * spec 8.1). 0x00 to 0x07 come from the UART transport. */
 #define DSPI_STATUS_OK 0x00
 #define DSPI_STATUS_BUSY 0x01
-#define DSPI_STATUS_ERROR 0x02
-#define DSPI_STATUS_BLOCKED 0x03
+#define DSPI_STATUS_ERROR 0x02   /* Firmware 1.1.6 and older only: refused, no reason */
+#define DSPI_STATUS_BLOCKED 0x03 /* Firmware 1.1.6 and older only; now VC_ERR_BLOCKED */
 #define DSPI_STATUS_BULK_LOCKED 0x04
 #define DSPI_STATUS_CRC_ERROR 0x05
 #define DSPI_STATUS_OVERSIZE 0x06
 #define DSPI_STATUS_FRAME_ERROR 0x07
+
+/* Command result codes of firmware 1.1.7, carried in the same byte. A
+ * refused command changed nothing. */
+#define DSPI_STATUS_VC_ERR_UNKNOWN 0x10     /* No such command on this build */
+#define DSPI_STATUS_VC_ERR_DIRECTION 0x11   /* The command has no GET, or no SET */
+#define DSPI_STATUS_VC_ERR_LENGTH 0x12      /* Wrong SET payload length */
+#define DSPI_STATUS_VC_ERR_ADDRESS 0x13     /* wValue out of range */
+#define DSPI_STATUS_VC_ERR_VALUE 0x14       /* A payload value out of range */
+#define DSPI_STATUS_VC_ERR_UNSUPPORTED 0x15 /* A valid value this device cannot do */
+#define DSPI_STATUS_VC_ERR_BLOCKED 0x16     /* Not allowed on the UART */
+#define DSPI_STATUS_VC_ERR_BUSY 0x17        /* Try again shortly */
+#define DSPI_STATUS_VC_ERR_STATE 0x18       /* Not allowed in the current state */
+#define DSPI_STATUS_VC_ERR_PIN_INVALID 0x19 /* The GPIO cannot be used for this */
+#define DSPI_STATUS_VC_ERR_PIN_IN_USE 0x1A  /* The GPIO is already claimed */
+
+/* True for the statuses that mean "busy, the same request may succeed
+ * shortly": BUSY, BULK_LOCKED and VC_ERR_BUSY. */
+static inline bool dspi_status_is_busy(uint8_t status)
+{
+    return status == DSPI_STATUS_BUSY || status == DSPI_STATUS_BULK_LOCKED ||
+           status == DSPI_STATUS_VC_ERR_BUSY;
+}
 
 /* ---------------------------------------------------------------------------
  * CRC

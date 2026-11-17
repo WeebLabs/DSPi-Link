@@ -69,16 +69,10 @@ bool hub_device_notifies(const hub_t *hub)
            identity->notify_enabled;
 }
 
-/* "major.minor.patch" from the platform reply: bytes 1, 4 and 5 on current
- * firmware, or the nibbles of byte 2 on firmware that sends only 4 bytes. */
+/* "major.minor.patch" from the platform reply. */
 static void format_firmware_version(const dspi_identity_t *identity, char *out, size_t size)
 {
-    const uint8_t *platform = identity->platform;
-    if (identity->platform_length >= 6) {
-        snprintf(out, size, "%u.%u.%u", platform[1], platform[4], platform[5]);
-    } else {
-        snprintf(out, size, "%u.%u.%u", platform[1], platform[2] >> 4, platform[2] & 0x0F);
-    }
+    dspi_platform_version(identity->platform, identity->platform_length, out, size);
 }
 
 cJSON *hub_device_json(const hub_t *hub)
@@ -728,8 +722,7 @@ void hub_device_name_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_
         hub_reply_error(hub, work->slot, work->request_id, "busy",
                         "the DSPi did not take the name; try again");
     } else {
-        hub_reply_error(hub, work->slot, work->request_id, "internal",
-                        "the DSPi refused the name");
+        hub_reply_error(hub, work->slot, work->request_id, "internal", "the DSPi refused the name");
     }
 }
 

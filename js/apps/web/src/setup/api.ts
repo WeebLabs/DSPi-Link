@@ -13,7 +13,16 @@ export interface SetupState {
   chip: string;
   version: string;
   pin_required: boolean;
-  dspi: { found: boolean; serial?: string; baud?: number; notify_enable?: boolean };
+  dspi: {
+    found: boolean;
+    serial?: string;
+    baud?: number;
+    notify_enable?: boolean;
+    /** A DSPi answered whose firmware the bridge cannot serve (bridge spec 9.3). */
+    too_old?: boolean;
+    too_new?: boolean;
+    fw?: string;
+  };
   wifi: {
     saved_ssid: string | null;
     join: "idle" | "connecting" | "connected" | "failed";

@@ -82,8 +82,26 @@ typedef struct {
     uint32_t baud;
     bool device_present;
     dspi_identity_t identity; /* Valid while device_present */
+
+    /* A DSPi answered the last probe but is not attached, because its
+     * firmware is too old or too new (bridge spec 7.6). */
+    bool unusable_answered;
+    dspi_firmware_t unusable_firmware;            /* TOO_OLD or TOO_NEW */
+    uint8_t legacy_platform[DSPI_PLATFORM_BYTES]; /* TOO_OLD: its platform reply */
+    uint8_t legacy_platform_length;               /* 0 when it could not be read */
+
     dspi_link_counters_t counters;
 } dspi_uart_status_t;
+
+/* "too_old" or "too_new" when a DSPi answered whose firmware the bridge
+ * cannot serve, else NULL (bridge spec 8.7 and 9.3). */
+static inline const char *dspi_uart_unusable_reason(const dspi_uart_status_t *status)
+{
+    if (!status->unusable_answered) {
+        return NULL;
+    }
+    return status->unusable_firmware == DSPI_FIRMWARE_TOO_OLD ? "too_old" : "too_new";
+}
 
 /* A copy of the link's status and counters, safe from any task. Pins, rate,
  * presence and identity are copied as one consistent snapshot; the counters

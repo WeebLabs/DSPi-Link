@@ -885,6 +885,16 @@ static void io_describe_bridge(void *context, cJSON *bridge)
     cJSON_AddNumberToObject(uart, "rx_pin", link.rx_pin);
     cJSON_AddBoolToObject(uart, "live", link.device_present);
     cJSON_AddBoolToObject(uart, "notify_enable", task_state.hub.device.identity.notify_enabled);
+    const char *unusable = dspi_uart_unusable_reason(&link);
+    if (unusable != NULL) {
+        cJSON_AddBoolToObject(uart, unusable, true);
+        if (link.legacy_platform_length > 0) {
+            char version[16];
+            dspi_platform_version(link.legacy_platform, link.legacy_platform_length, version,
+                                  sizeof(version));
+            cJSON_AddStringToObject(uart, "fw", version);
+        }
+    }
     cJSON_AddNumberToObject(uart, "requests", link.counters.requests);
     cJSON_AddNumberToObject(uart, "timeouts", link.counters.timeouts);
     cJSON_AddNumberToObject(uart, "crc_errors", link.counters.crc_errors);

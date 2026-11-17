@@ -141,13 +141,16 @@ void dspi_link_listen(dspi_link_t *link, uint32_t duration_ms);
 
 /* How a heartbeat ended. */
 typedef enum {
-    DSPI_HEARTBEAT_SAME_DEVICE,  /* It answered, with the expected serial or an error status */
+    DSPI_HEARTBEAT_SAME_DEVICE,  /* It answered with the expected serial, or busy */
     DSPI_HEARTBEAT_NO_ANSWER,    /* No valid answer, even after the retry */
-    DSPI_HEARTBEAT_OTHER_DEVICE, /* A DSPi with another serial answered: it was swapped */
+    DSPI_HEARTBEAT_OTHER_DEVICE, /* Another serial, or a refusal: it was swapped */
 } dspi_heartbeat_t;
 
 /* Reads the serial number to check the device is still there, and is still
- * the one whose serial is `serial` (bridge spec 7.6). */
+ * the one whose serial is `serial` (bridge spec 7.6). A busy answer means
+ * the same device. Any other refusal means a device that does not know the
+ * read, such as older firmware swapped in, so it counts as another device
+ * and the next probe classifies it. */
 dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial);
 
 /* Requests in a row that got no valid answer. The caller declares the
@@ -164,14 +167,46 @@ const dspi_link_counters_t *dspi_link_counters(const dspi_link_t *link);
  * Finding the device
  * ------------------------------------------------------------------------- */
 
+/* Which firmware answered the probe (bridge spec 7.6). */
+typedef enum {
+    DSPI_FIRMWARE_PAGED,     /* "DSPi", protocol major 1: firmware 1.1.7 or later */
+    DSPI_FIRMWARE_TOO_OLD,   /* Status 0x02: 1.1.6 or older, which numbers commands otherwise */
+    DSPI_FIRMWARE_TOO_NEW,   /* OK, but not a protocol this bridge speaks */
+    DSPI_FIRMWARE_NOT_READY, /* Any other status, such as busy: probe again later */
+} dspi_firmware_t;
+
+/* The answer to the probe. */
+typedef struct {
+    dspi_firmware_t firmware;
+    uint8_t protocol_major; /* PAGED only */
+    uint8_t protocol_minor; /* PAGED only */
+} dspi_probe_t;
+
 /*
- * Looks for the DSPi by asking for its interface status at each rate in
- * turn: `first_baud`, then each of `candidates` not already tried (bridge
- * spec 7.5). Leaves the link at the rate that answered and returns true, or
- * returns false with the link back at `first_baud`.
+ * Looks for the DSPi by sending the probe, a GET of SYS.PROTOCOL_INFO, at
+ * each rate in turn: `first_baud`, then each of `candidates` not already
+ * tried (bridge spec 7.5). Any answer proves the rate. Leaves the link at
+ * the rate that answered, fills `probe` from that answer and returns true,
+ * or returns false with the link back at `first_baud`.
+ *
+ * The probe is safe on every firmware generation: older firmware does not
+ * know it and refuses it.
  */
 bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
-                         size_t count);
+                         size_t count, dspi_probe_t *probe);
+
+/* Bytes of the platform reply: 7 on firmware 1.1.6 and later. */
+#define DSPI_PLATFORM_BYTES 7
+
+/* Writes "major.minor.patch" from a platform reply of `length` bytes into
+ * `out`: bytes 1, 4 and 5, or the nibbles of byte 2 on old firmware that
+ * sends only 4 bytes. */
+void dspi_platform_version(const uint8_t *platform, size_t length, char *out, size_t size);
+
+/* Reads the platform of firmware 1.1.6 or older with its own REQ_GET_PLATFORM
+ * (0x7F), the one request such a device is sent, to show its version.
+ * Returns the bytes read into `platform` (DSPI_PLATFORM_BYTES), or -1. */
+int dspi_link_read_legacy_platform(dspi_link_t *link, uint8_t *platform);
 
 /* Characters in a DSPi serial number: REQ_GET_SERIAL returns 16 bytes. */
 #define DSPI_SERIAL_MAX_CHARS 16

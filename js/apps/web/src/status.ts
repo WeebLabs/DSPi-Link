@@ -36,3 +36,39 @@ export function statusLine(
     ),
   );
 }
+
+/** What the bridge says about a DSPi it found but cannot serve (bridge spec 7.6). */
+export interface UnusableFirmware {
+  too_old?: boolean;
+  too_new?: boolean;
+  /** The DSPi's firmware version, when the bridge could read it. */
+  fw?: string;
+}
+
+/**
+ * The status line for a DSPi whose firmware the bridge cannot serve.
+ *
+ * @param dspi What the bridge reported.
+ * @returns The line, or null when the firmware is fine or nothing answered.
+ */
+export function unusableFirmwareLine(
+  dspi: UnusableFirmware | undefined,
+): HTMLElement | null {
+  if (dspi?.too_old) {
+    const version = dspi.fw ? `It runs firmware ${dspi.fw}. ` : "";
+    return statusLine(
+      "warn",
+      "DSPi firmware too old",
+      `${version}The bridge needs firmware 1.1.7 or later. ` +
+        "Update the DSPi over USB with DSPi Console.",
+    );
+  }
+  if (dspi?.too_new) {
+    return statusLine(
+      "warn",
+      "DSPi firmware too new",
+      "The DSPi runs firmware this bridge doesn't understand. Update the bridge.",
+    );
+  }
+  return null;
+}

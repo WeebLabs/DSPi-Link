@@ -9,9 +9,11 @@
 
 #include "dspi_link.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "bridge_config.h"
+#include "dspi_commands.h"
 
 /* Commands the bridge sends on its own behalf (firmware commands.md). */
 #define REQ_GET_SERIAL 0x7E
@@ -437,9 +439,12 @@ const dspi_link_counters_t *dspi_link_counters(const dspi_link_t *link)
  * Finding the device
  * ------------------------------------------------------------------------- */
 
-/* The baud probe: the interface status, the cheapest read there is. */
-static const dspi_request_t IFACE_STATUS_REQUEST = {
-    .is_get = true, .request = REQ_GET_CTRL_IFACE_STATUS, .length = IFACE_STATUS_BYTES};
+/* The probe: SYS.PROTOCOL_INFO, which every generation can be sent. */
+static const dspi_request_t PROBE_REQUEST = {.is_get = true,
+                                             .request =
+                                                 DSPI_CMD_REQUEST(DSPI_CMD_SYS_PROTOCOL_INFO),
+                                             .index = DSPI_CMD_INDEX(DSPI_CMD_SYS_PROTOCOL_INFO),
+                                             .length = DSPI_PROTOCOL_INFO_BYTES};
 
 static const dspi_request_t SERIAL_REQUEST = {
     .is_get = true, .request = REQ_GET_SERIAL, .length = DSPI_SERIAL_MAX_CHARS};
@@ -462,33 +467,60 @@ dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial)
     if (reply.kind != DSPI_REPLY_ANSWERED) {
         return DSPI_HEARTBEAT_NO_ANSWER;
     }
+    if (dspi_status_is_busy(reply.status)) {
+        return DSPI_HEARTBEAT_SAME_DEVICE; /* It is there, and nothing says it changed */
+    }
     if (reply.status != DSPI_STATUS_OK) {
-        return DSPI_HEARTBEAT_SAME_DEVICE; /* Busy, say: it is there, and nothing says it changed */
+        return DSPI_HEARTBEAT_OTHER_DEVICE; /* It does not know the read: not the device found */
     }
     char answered[DSPI_SERIAL_MAX_CHARS + 1];
     copy_serial(reply.payload, reply.length, answered);
     return strcmp(answered, serial) == 0 ? DSPI_HEARTBEAT_SAME_DEVICE : DSPI_HEARTBEAT_OTHER_DEVICE;
 }
 
-/* Asks for the interface status at `baud`. Any answer at all, even an error
- * status, proves a DSPi is listening at that rate. */
-static bool answers_at(dspi_link_t *link, uint32_t baud)
+/* Classifies an answer to the probe (bridge spec 7.6). */
+static dspi_probe_t classify_probe(const dspi_reply_t *reply)
+{
+    static const uint8_t magic[4] = {'D', 'S', 'P', 'i'};
+    dspi_probe_t probe = {.firmware = DSPI_FIRMWARE_NOT_READY};
+    if (reply->status == DSPI_STATUS_ERROR) {
+        probe.firmware = DSPI_FIRMWARE_TOO_OLD;
+    } else if (reply->status == DSPI_STATUS_OK) {
+        const bool ours = reply->length >= 6 && memcmp(reply->payload, magic, 4) == 0 &&
+                          reply->payload[4] == DSPI_PROTOCOL_MAJOR;
+        probe.firmware = ours ? DSPI_FIRMWARE_PAGED : DSPI_FIRMWARE_TOO_NEW;
+        if (ours) {
+            probe.protocol_major = reply->payload[4];
+            probe.protocol_minor = reply->payload[5];
+        }
+    }
+    return probe;
+}
+
+/* Sends the probe at `baud`. Any answer at all, even an error status,
+ * proves a DSPi is listening at that rate; it is classified into `probe`. */
+static bool answers_at(dspi_link_t *link, uint32_t baud, dspi_probe_t *probe)
 {
     if (!dspi_link_set_baud(link, baud)) {
         return false;
     }
-    return dspi_link_transact(link, &IFACE_STATUS_REQUEST, false).kind == DSPI_REPLY_ANSWERED;
+    const dspi_reply_t reply = dspi_link_transact(link, &PROBE_REQUEST, false);
+    if (reply.kind != DSPI_REPLY_ANSWERED) {
+        return false;
+    }
+    *probe = classify_probe(&reply);
+    return true;
 }
 
 /* Tries `first_baud`, then each candidate not already tried. */
 static bool answers_at_any(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
-                           size_t count)
+                           size_t count, dspi_probe_t *probe)
 {
-    if (answers_at(link, first_baud)) {
+    if (answers_at(link, first_baud, probe)) {
         return true;
     }
     for (size_t i = 0; i < count; i++) {
-        if (candidates[i] != first_baud && answers_at(link, candidates[i])) {
+        if (candidates[i] != first_baud && answers_at(link, candidates[i], probe)) {
             return true;
         }
     }
@@ -496,10 +528,10 @@ static bool answers_at_any(dspi_link_t *link, uint32_t first_baud, const uint32_
 }
 
 bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t *candidates,
-                         size_t count)
+                         size_t count, dspi_probe_t *probe)
 {
     link->probing = true;
-    const bool found = answers_at_any(link, first_baud, candidates, count);
+    const bool found = answers_at_any(link, first_baud, candidates, count, probe);
     link->probing = false;
     if (!found) {
         /* If the port refuses, the link stays at the last rate tried, and
@@ -522,6 +554,22 @@ static int read_get(dspi_link_t *link, uint8_t request_code, uint8_t *out, size_
     const size_t length = reply.length < capacity ? reply.length : capacity;
     memcpy(out, reply.payload, length);
     return (int)length;
+}
+
+void dspi_platform_version(const uint8_t *platform, size_t length, char *out, size_t size)
+{
+    if (length >= 6) {
+        snprintf(out, size, "%u.%u.%u", platform[1], platform[4], platform[5]);
+    } else if (length >= 3) {
+        snprintf(out, size, "%u.%u.%u", platform[1], platform[2] >> 4, platform[2] & 0x0F);
+    } else if (size > 0) {
+        out[0] = '\0';
+    }
+}
+
+int dspi_link_read_legacy_platform(dspi_link_t *link, uint8_t *platform)
+{
+    return read_get(link, DSPI_LEGACY_REQ_GET_PLATFORM, platform, DSPI_PLATFORM_BYTES);
 }
 
 bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)

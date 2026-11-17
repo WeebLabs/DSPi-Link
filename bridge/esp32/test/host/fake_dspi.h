@@ -43,6 +43,7 @@ typedef struct {
 typedef struct {
     bool is_get;
     uint8_t request;
+    uint16_t index; /* wIndex: the page is its high byte */
     uint16_t length;
     uint32_t arrived_ms;
 } fake_request_record_t;
@@ -52,6 +53,7 @@ typedef struct {
     uint32_t device_baud; /* The DSPi's rate */
     uint32_t host_baud;   /* The rate the link set */
     unsigned restarts;    /* Restarts the link asked for, failed ones included */
+    bool paged;           /* Firmware 1.1.7: commands keyed by page and number */
     bool restart_fails;   /* Make every restart report failure */
 
     /* Bytes on their way to the link, each with the time it arrives. */
@@ -69,9 +71,10 @@ typedef struct {
     size_t answer_count;
     size_t answer_next;
 
-    /* Canned GET replies by command code. */
+    /* Canned GET replies by command ID, (page << 8) | command. A legacy fake
+     * ignores the page, as firmware 1.1.6 does, and finds only page 0 IDs. */
     struct {
-        uint8_t request;
+        uint16_t id;
         uint8_t data[64];
         size_t length;
     } canned[FAKE_DSPI_MAX_CANNED];
@@ -87,14 +90,20 @@ typedef struct {
 } fake_dspi_t;
 
 /* A DSPi at `baud` with serial, platform, interface status and UART
- * configuration answers already canned. */
+ * configuration answers already canned. It starts as firmware 1.1.6, which
+ * ignores the page byte and refuses unknown commands with 0x02. */
 void fake_dspi_init(fake_dspi_t *fake, uint32_t baud);
+
+/* Makes the fake firmware 1.1.7: it answers SYS.PROTOCOL_INFO, finds canned
+ * replies by full command ID, and refuses page 0 and unknown commands with
+ * 0x10 VC_ERR_UNKNOWN. */
+void fake_dspi_set_paged(fake_dspi_t *fake, bool paged);
 
 /* The port a dspi_link uses to talk to this fake. */
 dspi_port_t fake_dspi_port(fake_dspi_t *fake);
 
-/* Sets the reply to GET `request`. */
-void fake_dspi_can(fake_dspi_t *fake, uint8_t request, const uint8_t *data, size_t length);
+/* Sets the reply to a GET of command `id`; a legacy opcode is its own ID. */
+void fake_dspi_can(fake_dspi_t *fake, uint16_t id, const uint8_t *data, size_t length);
 
 /* Scripts how the next unscripted request is answered. */
 void fake_dspi_script(fake_dspi_t *fake, fake_answer_t answer);

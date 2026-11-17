@@ -58,6 +58,10 @@ export interface BridgeStats {
     timeouts: number;
     crc_errors: number;
     retries: number;
+    /** A DSPi answered whose firmware the bridge cannot serve (bridge spec 8.7). */
+    too_old?: boolean;
+    too_new?: boolean;
+    fw?: string;
   };
 }
 

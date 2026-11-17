@@ -17,6 +17,13 @@ static const uint8_t PLATFORM[7] = {0x01, 0x01, 0x17, 0x09, 0x01, 0x07, 0x00};
 static const uint8_t IFACE_STATUS[8] = {0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00};
 /* enabled, tx 16, rx 17, notify on, 1000000 baud */
 static const uint8_t UART_CONFIG[8] = {0x01, 16, 17, 0x01, 0x40, 0x42, 0x0F, 0x00};
+/* "DSPi", protocol 1.0, 12 pages, 64-byte SETs, 256-byte GETs */
+static const uint8_t PROTOCOL_INFO[16] = {'D',  'S',  'P',  'i',  0x01, 0x00, 0x0C, 0x00,
+                                          0x40, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00};
+
+#define PROTOCOL_INFO_ID 0x0110
+#define STATUS_ERROR 0x02      /* Firmware 1.1.6: refused */
+#define STATUS_VC_UNKNOWN 0x10 /* Firmware 1.1.7: no such command */
 
 void fake_dspi_init(fake_dspi_t *fake, uint32_t baud)
 {
@@ -29,18 +36,24 @@ void fake_dspi_init(fake_dspi_t *fake, uint32_t baud)
     fake_dspi_can(fake, 0x7F, PLATFORM, sizeof(PLATFORM));
     fake_dspi_can(fake, 0xF9, IFACE_STATUS, sizeof(IFACE_STATUS));
     fake_dspi_can(fake, 0xF6, UART_CONFIG, sizeof(UART_CONFIG));
+    fake_dspi_can(fake, PROTOCOL_INFO_ID, PROTOCOL_INFO, sizeof(PROTOCOL_INFO));
 }
 
-void fake_dspi_can(fake_dspi_t *fake, uint8_t request, const uint8_t *data, size_t length)
+void fake_dspi_set_paged(fake_dspi_t *fake, bool paged)
+{
+    fake->paged = paged;
+}
+
+void fake_dspi_can(fake_dspi_t *fake, uint16_t id, const uint8_t *data, size_t length)
 {
     for (size_t i = 0; i < fake->canned_count; i++) {
-        if (fake->canned[i].request == request) {
+        if (fake->canned[i].id == id) {
             memcpy(fake->canned[i].data, data, length);
             fake->canned[i].length = length;
             return;
         }
     }
-    fake->canned[fake->canned_count].request = request;
+    fake->canned[fake->canned_count].id = id;
     memcpy(fake->canned[fake->canned_count].data, data, length);
     fake->canned[fake->canned_count].length = length;
     fake->canned_count++;
@@ -80,10 +93,17 @@ void fake_dspi_send_raw(fake_dspi_t *fake, const uint8_t *bytes, size_t length, 
     send_bytes(fake, bytes, length, fake->now_ms + delay_ms);
 }
 
-static const uint8_t *canned_reply(const fake_dspi_t *fake, uint8_t request, size_t *length)
+/* The canned reply to a GET, found the way the firmware generation would:
+ * by full command ID when paged, by bRequest alone (page 0) when legacy. */
+static const uint8_t *canned_reply(const fake_dspi_t *fake, uint8_t request, uint16_t index,
+                                   size_t *length)
 {
+    const uint16_t id = fake->paged ? (uint16_t)((index & 0xFF00) | request) : request;
+    if (fake->paged && (id >> 8) == 0) {
+        return NULL; /* Page 0 has no commands */
+    }
     for (size_t i = 0; i < fake->canned_count; i++) {
-        if (fake->canned[i].request == request) {
+        if (fake->canned[i].id == id) {
             *length = fake->canned[i].length;
             return fake->canned[i].data;
         }
@@ -92,7 +112,7 @@ static const uint8_t *canned_reply(const fake_dspi_t *fake, uint8_t request, siz
 }
 
 /* Answers one complete, valid request. */
-static void answer(fake_dspi_t *fake, bool is_get, uint8_t request, uint16_t length)
+static void answer(fake_dspi_t *fake, bool is_get, uint8_t request, uint16_t index, uint16_t length)
 {
     fake_answer_t script = {.kind = FAKE_ANSWER_NORMALLY};
     if (fake->answer_next < fake->answer_count) {
@@ -110,9 +130,9 @@ static void answer(fake_dspi_t *fake, bool is_get, uint8_t request, uint16_t len
     if (script.kind == FAKE_ANSWER_WITH_STATUS) {
         status = script.status;
     } else if (is_get) {
-        payload = canned_reply(fake, request, &payload_length);
+        payload = canned_reply(fake, request, index, &payload_length);
         if (payload == NULL) {
-            status = 0x02; /* ERROR: unknown command */
+            status = fake->paged ? STATUS_VC_UNKNOWN : STATUS_ERROR;
         } else if (length != 0 && payload_length > length) {
             payload_length = length; /* The firmware clamps to wLength */
         }
@@ -134,6 +154,7 @@ static void handle_request(fake_dspi_t *fake, size_t total)
 {
     const uint8_t *in = fake->input;
     const bool is_get = in[1] == 0x02;
+    const uint16_t index = (uint16_t)(in[5] | (in[6] << 8));
     const uint16_t length = (uint16_t)(in[7] | (in[8] << 8));
     const size_t payload_length = is_get ? 0 : length;
 
@@ -147,14 +168,17 @@ static void handle_request(fake_dspi_t *fake, size_t total)
         fake->smallest_gap_ms = gap;
     }
     if (fake->record_count < FAKE_DSPI_MAX_RECORDED) {
-        fake->records[fake->record_count] = (fake_request_record_t){
-            .is_get = is_get, .request = in[2], .length = length, .arrived_ms = fake->now_ms};
+        fake->records[fake->record_count] = (fake_request_record_t){.is_get = is_get,
+                                                                    .request = in[2],
+                                                                    .index = index,
+                                                                    .length = length,
+                                                                    .arrived_ms = fake->now_ms};
     }
     fake->record_count++;
     memcpy(fake->last_payload, &in[9], payload_length);
     fake->last_payload_length = payload_length;
 
-    answer(fake, is_get, in[2], length);
+    answer(fake, is_get, in[2], index, length);
 }
 
 /* Bytes of the request in `input` once it is complete, or 0 if more are

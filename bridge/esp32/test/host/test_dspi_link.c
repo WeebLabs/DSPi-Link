@@ -288,6 +288,9 @@ static void a_failed_restart_is_tried_again(void)
 
 static const char SERIAL[] = "E46058388B1A2E2C"; /* The fake's */
 
+/* The probe's answer, for the tests that look for the device. */
+static dspi_probe_t probe;
+
 static void the_heartbeat_reads_the_serial(void)
 {
     start(BAUD, BAUD);
@@ -302,10 +305,29 @@ static void the_heartbeat_reads_the_serial(void)
     CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_NO_ANSWER);
     CHECK(fake.record_count == 3);
 
-    /* A busy DSPi is still there, and nothing says it changed. */
-    fake_dspi_script(&fake,
-                     (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = DSPI_STATUS_BUSY});
-    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_SAME_DEVICE);
+    /* A busy DSPi is still there, and nothing says it changed: each of the
+     * three busy statuses. */
+    const uint8_t busy[] = {DSPI_STATUS_BUSY, DSPI_STATUS_BULK_LOCKED, DSPI_STATUS_VC_ERR_BUSY};
+    for (size_t i = 0; i < sizeof(busy); i++) {
+        fake_dspi_script(&fake,
+                         (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = busy[i]});
+        CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_SAME_DEVICE);
+    }
+}
+
+/* A board that refuses the serial read does not know it: older firmware
+ * swapped in answers a paged read with 0x02. It must not stay attached,
+ * so it counts as another device and the next probe classifies it. */
+static void a_refused_heartbeat_means_another_device(void)
+{
+    start(BAUD, BAUD);
+    const uint8_t refusals[] = {DSPI_STATUS_ERROR, DSPI_STATUS_VC_ERR_UNKNOWN,
+                                DSPI_STATUS_VC_ERR_ADDRESS};
+    for (size_t i = 0; i < sizeof(refusals); i++) {
+        fake_dspi_script(&fake,
+                         (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = refusals[i]});
+        CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_OTHER_DEVICE);
+    }
 }
 
 /* A DSPi swapped between two heartbeats never goes silent long enough to be
@@ -438,15 +460,15 @@ static void looking_for_a_missing_device_never_restarts_the_uart(void)
     const uint32_t candidates[] = DSPI_UART_BAUD_CANDIDATES;
     for (int pass = 0; pass < 4; pass++) {
         CHECK(!dspi_link_find_baud(&link, BAUD, candidates,
-                                   sizeof(candidates) / sizeof(candidates[0])));
-        CHECK(!dspi_link_find_baud(&link, BAUD, candidates, 0));
+                                   sizeof(candidates) / sizeof(candidates[0]), &probe));
+        CHECK(!dspi_link_find_baud(&link, BAUD, candidates, 0, &probe));
     }
     CHECK(fake.restarts == 0);
     CHECK(dspi_link_counters(&link)->restarts == 0);
 
     /* Once found, unanswered requests restart it as before. */
     fake.device_baud = BAUD;
-    CHECK(dspi_link_find_baud(&link, BAUD, candidates, 0));
+    CHECK(dspi_link_find_baud(&link, BAUD, candidates, 0, &probe));
     for (int i = 0; i < DSPI_UART_UNANSWERED_BEFORE_REINSTALL; i++) {
         fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
         CHECK(dspi_link_transact(&link, &SET_MUTE, false).kind == DSPI_REPLY_TIMEOUT);
@@ -458,8 +480,8 @@ static void the_baud_rate_is_found(void)
 {
     start(921600, 115200);
     const uint32_t candidates[] = DSPI_UART_BAUD_CANDIDATES;
-    const bool found =
-        dspi_link_find_baud(&link, 115200, candidates, sizeof(candidates) / sizeof(candidates[0]));
+    const bool found = dspi_link_find_baud(&link, 115200, candidates,
+                                           sizeof(candidates) / sizeof(candidates[0]), &probe);
     CHECK(found);
     CHECK(dspi_link_baud(&link) == 921600);
     CHECK(fake.host_baud == 921600);
@@ -470,9 +492,67 @@ static void a_missing_device_leaves_the_first_rate(void)
     start(BAUD, BAUD);
     fake.device_baud = 9600; /* Not a candidate: nothing will answer */
     const uint32_t candidates[] = DSPI_UART_BAUD_CANDIDATES;
-    CHECK(
-        !dspi_link_find_baud(&link, BAUD, candidates, sizeof(candidates) / sizeof(candidates[0])));
+    CHECK(!dspi_link_find_baud(&link, BAUD, candidates, sizeof(candidates) / sizeof(candidates[0]),
+                               &probe));
     CHECK(dspi_link_baud(&link) == BAUD);
+}
+
+/* The probe is SYS.PROTOCOL_INFO: command 0x10 on page 0x01, 16 bytes. */
+static void the_probe_is_sys_protocol_info(void)
+{
+    start(BAUD, BAUD);
+    fake_dspi_set_paged(&fake, true);
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    CHECK(fake.record_count == 1);
+    CHECK(fake.records[0].is_get && fake.records[0].request == 0x10);
+    CHECK(fake.records[0].index == 0x0100);
+    CHECK(fake.records[0].length == 16);
+    CHECK(probe.firmware == DSPI_FIRMWARE_PAGED);
+    CHECK(probe.protocol_major == 1 && probe.protocol_minor == 0);
+}
+
+/* Firmware 1.1.6 refuses the probe with 0x02, which still proves the rate.
+ * The only other request it is sent is its own platform read. */
+static void older_firmware_is_too_old(void)
+{
+    start(BAUD, BAUD);
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_OLD);
+
+    uint8_t platform[DSPI_PLATFORM_BYTES];
+    CHECK(dspi_link_read_legacy_platform(&link, platform) == DSPI_PLATFORM_BYTES);
+    CHECK(fake.records[1].request == 0x7F && fake.records[1].index == 0);
+    char version[16];
+    dspi_platform_version(platform, DSPI_PLATFORM_BYTES, version, sizeof(version));
+    CHECK(strcmp(version, "1.1.7") == 0); /* The fake's platform bytes */
+}
+
+/* A probe answered OK with something that is not protocol 1 is firmware
+ * too new for this bridge. */
+static void an_unknown_protocol_is_too_new(void)
+{
+    start(BAUD, BAUD);
+    fake_dspi_set_paged(&fake, true);
+    const uint8_t major_two[16] = {'D', 'S', 'P', 'i', 0x02, 0x00};
+    fake_dspi_can(&fake, 0x0110, major_two, sizeof(major_two));
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_NEW);
+
+    const uint8_t not_dspi[16] = {'X', 'S', 'P', 'i', 0x01, 0x00};
+    fake_dspi_can(&fake, 0x0110, not_dspi, sizeof(not_dspi));
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_NEW);
+}
+
+/* A busy answer proves the rate but says nothing of the firmware yet. */
+static void a_busy_probe_is_not_ready(void)
+{
+    start(BAUD, BAUD);
+    fake_dspi_set_paged(&fake, true);
+    fake_dspi_script(&fake,
+                     (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = DSPI_STATUS_BUSY});
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    CHECK(probe.firmware == DSPI_FIRMWARE_NOT_READY);
 }
 
 static void the_identity_is_read(void)
@@ -585,6 +665,7 @@ void test_dspi_link(void)
     RUN(a_failed_restart_is_tried_again);
     RUN(the_heartbeat_reads_the_serial);
     RUN(the_heartbeat_spots_a_swapped_device);
+    RUN(a_refused_heartbeat_means_another_device);
     RUN(a_false_start_while_idle_does_not_swallow_the_answer);
     RUN(a_notification_missing_a_byte_does_not_swallow_the_answer);
     RUN(frames_inside_a_false_frame_are_found);
@@ -592,6 +673,10 @@ void test_dspi_link(void)
     RUN(looking_for_a_missing_device_never_restarts_the_uart);
     RUN(the_baud_rate_is_found);
     RUN(a_missing_device_leaves_the_first_rate);
+    RUN(the_probe_is_sys_protocol_info);
+    RUN(older_firmware_is_too_old);
+    RUN(an_unknown_protocol_is_too_new);
+    RUN(a_busy_probe_is_not_ready);
     RUN(the_identity_is_read);
     RUN(a_short_serial_stops_at_its_padding);
     RUN(a_board_that_keeps_a_name_reports_it);

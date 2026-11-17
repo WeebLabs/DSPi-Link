@@ -136,6 +136,16 @@ static bool add_dspi(cJSON *body)
         ok = cJSON_AddBoolToObject(dspi, "notify_enable", link.identity.notify_enabled) != NULL &&
              ok;
     }
+    const char *unusable = dspi_uart_unusable_reason(&link);
+    if (unusable != NULL) {
+        ok = cJSON_AddBoolToObject(dspi, unusable, true) != NULL && ok;
+        if (link.legacy_platform_length > 0) {
+            char version[16];
+            dspi_platform_version(link.legacy_platform, link.legacy_platform_length, version,
+                                  sizeof(version));
+            ok = cJSON_AddStringToObject(dspi, "fw", version) != NULL && ok;
+        }
+    }
     return ok;
 }
 
