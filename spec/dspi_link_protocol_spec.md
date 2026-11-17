@@ -1,17 +1,23 @@
 # DSPi Link Protocol Specification
 
-*Version: 1.2 (draft)*
-*Status: draft; dspi-link-js and the DSPi Console `feature/dspi-link` branch implement 1.1, and the ESP32 bridge (`spec/esp32_bridge_spec.md`) will implement 1.2*
-*Last updated: 2026-11-02 (the change history is in section 13)*
+*Version: 1.3 (draft)*
+*Status: draft. Version 1.3 tracks DSPi firmware 1.1.7, whose vendor commands are paged. dspi-link-js and the ESP32 bridge (`spec/esp32_bridge_spec.md`) implement 1.3; the DSPi Console `feature/dspi-link` branch implements 1.1*
+*Last updated: 2026-11-17 (the change history is in section 13)*
 
 DSPi Link is the local-network protocol through which a **hub** (DSPi Console
 in gateway mode, or a standalone bridge such as an ESP32 wired to a DSPi over
 UART) shares one or more DSPi devices with **clients** (DSPi Console on another
 machine, a web page served by the hub, or a mobile app). This document is
 self-contained: a hub or client can be implemented from it plus the firmware's
-vendor command catalogue (`Documentation/commands.md` in the firmware repo)
+vendor command catalogue (`Documentation/commands.md` in the firmware repo,
+with the machine-readable registry `Documentation/protocol/dspi_commands.json`)
 and the notification spec (`notification_protocol_v2_spec.md`). No DSPi Console
 source is required.
+
+Commands are written `PAGE.NAME` (for example `ROUTE.MASTER_VOLUME`) with
+their 16-bit command ID in brackets. Firmware 1.1.6 and older used single
+8-bit opcodes, written `REQ_NAME` with the opcode; this document names them
+only where it describes what a hub does with such a device.
 
 ---
 
@@ -46,7 +52,9 @@ source is required.
 | Term | Meaning |
 |------|---------|
 | Hub | The process that owns the physical link to one or more DSPi devices and serves them over the network. Kinds: `console` (Console in gateway mode, USB) and `bridge` (standalone microcontroller, UART). |
-| Device | One DSPi board, identified by its 16-character serial (`REQ_GET_SERIAL`, 0x7E), which is also the USB `iSerialNumber`. |
+| Device | One DSPi board, identified by its 16-character serial (`SYS.SERIAL`, 0x0121), which is also the USB `iSerialNumber`. |
+| Command ID | The 16-bit number `(page << 8) \| command` that names one firmware vendor command. The page travels in the high byte of `wIndex` and the command number in `bRequest` (section 8.2). Different pages reuse the same command numbers, so a `bRequest` alone does not name a command. |
+| Legacy device | A device whose firmware predates the paged commands (1.1.6 and older). It does not answer `SYS.PROTOCOL_INFO` (section 7.4). |
 | Client | Anything that connects to a hub: Console in client mode, the web UI, a mobile app, a script. |
 | Session | One authenticated WebSocket connection. Has a session id, a role, and a client name. |
 | Handle | A small integer (0..254) the hub assigns to a device for the lifetime of its attachment. Used in binary frames instead of the serial. 255 is reserved. |
@@ -276,42 +284,42 @@ A fixed PIN is long-lived, so it follows different rules:
 | `control` | Everything `viewer` can, plus `SET` commands classed *control* (EQ, routing, volumes, presets, DSP features, test signals, RTA). |
 | `admin` | Everything, including *config* (pins, input sources, control interfaces, control surfaces, flash writes of device-level config, factory reset, bootloader entry, firmware install, hub settings, client management). |
 
-The hub classifies each `bRequest` into *read*, *control* or *config* with
-a table it owns and maintains. Because the table is hub policy, the hub
-publishes the session's effective denial list in the auth `ok` reply
-(`policy.denied`, an array of `[bRequest, dir]` pairs, section 7.3) so clients
-can grey out controls without guessing. In `auth: none` mode there is no auth
-exchange unless the client chooses to send `auth.pair` (section 6.1), so a
-client receives the list only if it does. A command outside the role gets
-status `0x81 DENIED`.
+The hub classifies each command, by its command ID and direction, into
+*read*, *control* or *config* with a table it owns and maintains. The hub
+takes the command ID from the CMD frame as `(wIndex & 0xFF00) | bRequest`
+(section 8.2); it never classifies by `bRequest` alone. Because the table is
+hub policy, the hub publishes the session's effective denial list in the auth
+`ok` reply (`policy.denied_ids`, an array of `[id, dir]` pairs with `dir` 0
+for SET and 1 for GET as in a CMD frame, section 7.3) so clients can grey out
+controls without guessing. In `auth: none` mode there is no auth exchange
+unless the client chooses to send `auth.pair` (section 6.1), so a client
+receives the list only if it does. A command outside the role gets status
+`0x81 DENIED`.
 
-Write-as-read commands (a `GET` transfer that mutates, see `commands.md`
-section 1.1) are classified by what they do, not by their direction. The
-table must list them explicitly.
+Every GET is *read*: in firmware 1.1.7 a GET never changes device state. The
+only side effect any GET has is that a read of analyser bands or bins keeps
+the analyser running (section 7.15). The class of a SET is what the change
+does, not which flags the firmware gives the command: a flash write is not
+*config* by that fact alone, and preset save, load, delete and naming, the
+device and input source names, the input source and the bulk SET are
+*control*.
 
 Two *control* commands can reach hardware configuration under one device
 setting. When the device's output-config persistence mode is "with preset"
-(set by `REQ_SET_OUTPUT_CONFIG_MODE` 0x98, which is *config*), the firmware
+(set by `STORE.OUTPUT_CONFIG_MODE` 0x0220, which is *config*), the firmware
 applies the output pins, output types, I2S BCK/MCK pins, S/PDIF RX pin and
-ADAT configuration carried in a bulk blob (`REQ_SET_ALL_PARAMS` 0xA1) or a
-preset slot (`REQ_PRESET_LOAD` 0x91), so a `control` session can change the
-wiring through those two commands (firmware: `main.c` calls
-`bulk_params_apply(buf, oc_mode == OUTPUT_CONFIG_MODE_WITH_PRESET)`, and
-`flash_storage.c` `apply_output_config_from_mode()` runs `io_config_apply()`
-on preset load only in that mode). In the default "independent" mode they
+ADAT configuration carried in a bulk blob (`STORE.ALL_PARAMS` SET, 0x0240) or
+a preset slot (`STORE.PRESET_LOAD` 0x0211), so a `control` session can change
+the wiring through those two commands. In the default "independent" mode they
 change live parameters only. This is an accepted trade-off: the two commands
 stay *control* because they are the normal way a control user restores a
 configuration, and an admin who wants control users kept away from the
 wiring leaves the device in independent mode.
 
-A `bRequest` the firmware accepts in both directions can carry a different
-class per direction. `REQ_LIMITER` (0x81) is one case. Its `SET`
-changes a limiter setting and is *control*, while its `GET` reads a setting,
-the gain-reduction meter or the limiter status and is *read*, so a viewer
-can poll the meter but cannot change the limiter. `REQ_OUTPUT_LATENCY` (0x03)
-is the other: its `SET` selects the output latency, a device-global flash
-write followed by a muted output restart, and is *config*, while its `GET`
-reads the status or the option table and is *read*. Section 9.3 gives the
+A command with both directions has one class per direction, and the two
+usually differ: `DYN.LIMITER_THRESHOLD` (0x0711) is *control* to set and
+*read* to get, and `OUTPUT.LATENCY` (0x0420), a device-global flash write
+followed by a muted output restart, is *config* to set. Section 9.3 gives the
 table encoding.
 
 ### 6.4 Transport security
@@ -360,7 +368,7 @@ ignores unknown event types. Both ignore unknown fields.
 Client to hub, first message:
 
 ```json
-{"t": "hello", "proto": {"major": 1, "minor": 2},
+{"t": "hello", "proto": {"major": 1, "minor": 3},
  "client": {"name": "Living Room iPad", "app": "DSPi Mobile", "version": "0.1"}}
 ```
 
@@ -368,7 +376,7 @@ Hub to client, in reply (no `id`):
 
 ```json
 {"t": "hello",
- "proto": {"major": 1, "minor": 2},
+ "proto": {"major": 1, "minor": 3},
  "hub": {"id": "<uuid>", "name": "Studio Mac", "kind": "console", "version": "1.1.7"},
  "auth": "pin", "pin_source": "window",
  "caps": ["cmd", "notify", "poll", "snapshot", "lock", "fw_install", "web", "rename"],
@@ -408,7 +416,8 @@ can be granted less while others poll.
 
 ```json
 {"t": "auth.token", "id": 1, "token": "<base64url>"}
-{"t": "ok", "id": 1, "session": 12, "role": "control", "policy": {"denied": [[240,1],[83,1]]}}
+{"t": "ok", "id": 1, "session": 12, "role": "control",
+ "policy": {"denied": [], "denied_ids": [[304,0],[560,0]]}}
 
 {"t": "auth.pair", "id": 1, "pin": "482913", "name": "Living Room iPad", "role": "control"}
 {"t": "ok", "id": 1, "session": 12, "role": "control", "token": "<base64url>", "policy": {...}}
@@ -423,6 +432,13 @@ can be granted less while others poll.
 `session` is the session id the hub stamps into notification frames as
 `origin` (section 8.3). A client must remember it.
 
+`policy.denied_ids` lists the commands the session's role may not send, as
+`[id, dir]` pairs (section 6.3). The example denies `SYS.ENTER_BOOTLOADER`
+(0x0130) and `STORE.FACTORY_RESET` (0x0230), both SETs. `policy.denied` is
+the 1.2 field, which held `[bRequest, dir]` pairs; a 1.3 hub always sends it
+empty, because a `bRequest` cannot name a paged command, so a 1.2 client
+greys out nothing and the hub still enforces the role. Added in 1.3.
+
 ### 7.4 Device inventory
 
 ```json
@@ -430,6 +446,7 @@ can be granted less while others poll.
 {"t": "ok", "id": 5, "devices": [
   {"handle": 0, "serial": "E46058388B1A2E2C", "name": "Living room",
    "platform": 1, "fw": "1.1.7", "fw_beta": 0, "outputs": 9, "inputs": 8,
+   "protocol": {"major": 1, "minor": 0},
    "wire_version": 32, "state": "online", "link": "usb",
    "locked_by": null}
 ]}
@@ -438,15 +455,35 @@ can be granted less while others poll.
 | Field | Source |
 |-------|--------|
 | `handle` | Hub-assigned, section 2. Stable until `device.removed`. |
-| `serial` | `REQ_GET_SERIAL` (0x7E). |
-| `name` | The board's own name (`REQ_GET_DEVICE_NAME` 0x57) when its firmware stores one and it is set. Otherwise the hub-stored name, and failing that a default derived from the serial. The hub applies this order each time the device comes online. |
-| `platform`, `fw`, `outputs` | `REQ_GET_PLATFORM` (0x7F), 7-byte read. `fw` is `major.minor.patch` from bytes 1, 4 and 5, or from the byte 2 nibbles on firmware that returns only 4 bytes. |
+| `serial` | `SYS.SERIAL` (0x0121). |
+| `name` | The board's own name (`SYS.DEVICE_NAME` 0x0124) when it is set. Otherwise the hub-stored name, and failing that a default derived from the serial. The hub applies this order each time the device comes online. |
+| `platform`, `fw`, `outputs` | `SYS.PLATFORM` (0x0120), 7-byte read with the same layout as the 1.1.6 `REQ_GET_PLATFORM` reply. `fw` is `major.minor.patch` from bytes 1, 4 and 5, or from the byte 2 nibbles on legacy firmware that returns only 4 bytes. |
 | `fw_beta` | Byte 6 of the same read: the beta number, 0 for a final release. Betas of one patch share its `fw` string, so this is the only field that tells them apart. A hub omits it when the device returns fewer than 7 bytes, and a client treats a missing field as unknown, not as 0. Added in 1.1. |
-| `inputs` | Compile-time input count if the hub knows it; else omitted. A client that needs the channel layout and finds `inputs` missing reads it from the bulk header (`REQ_GET_ALL_PARAMS`). |
+| `protocol` | The device's vendor protocol version, `major` and `minor` from bytes 4 and 5 of `SYS.PROTOCOL_INFO` (0x0110). Absent for a legacy device. Added in 1.3. |
+| `inputs` | Compile-time input count if the hub knows it; else omitted. A client that needs the channel layout and finds `inputs` missing reads it from the bulk header (`STORE.ALL_PARAMS`). |
 | `wire_version` | From the bulk header, if the hub has read it; else omitted. Clients must still read it themselves. |
 | `state` | `online`, `offline` (known device currently unplugged; handle retained for 60 s), `updating` (firmware install in progress). |
 | `link` | `usb` or `uart`. Tells a client what to expect for latency and bulk timing. |
 | `locked_by` | Session id holding an exclusive lock, or `null`. |
+
+**Identifying the firmware generation.** The first request a hub sends a
+device is a GET of `SYS.PROTOCOL_INFO` (0x0110, 16 bytes). A reply that
+starts with the ASCII bytes `DSPi` comes from paged firmware; byte 4 is the
+protocol major, which must be 1, and the hub fills `protocol` from it. A USB
+STALL, or UART status `0x02`, means a legacy device. The probe is safe on
+both generations. It must come first because legacy firmware ignores the page
+byte and would run whichever 1.1.6 opcode shares the command number of a
+paged request, and several of those numbers belong to factory reset and
+preset writes.
+
+**Legacy devices.** A 1.3 hub sends a legacy device nothing paged and
+forwards nothing to it: it answers every CMD for that handle with
+`0x86 UNSUPPORTED` and every `poll.subscribe` with `err` `unsupported`. It
+may still list the device (with `fw` from the legacy `REQ_GET_PLATFORM`,
+0x7F) so that a client can offer a firmware update, and `fw.install` works on
+it (section 7.8). A hub that cannot install firmware, such as a bridge, need
+not list it at all. A client sends paged commands only to a device whose
+object carries `protocol`.
 
 Events, sent to every session:
 
@@ -456,24 +493,23 @@ Events, sent to every session:
 {"t": "device.changed", "device": { ...same object... }}
 ```
 
-`device.rename {handle, name}` (control or admin) renames the device. When
-the attached board's firmware stores names (a 32-byte `REQ_GET_DEVICE_NAME`
-reply), the hub writes `REQ_SET_DEVICE_NAME` (0x56) as the requesting
-session, replies `ok` once the board accepts the write, and emits
-`device.changed` when the board's `NOTIFY_EVT_DEVICE_NAME` (0x10) arrives.
-That notification is the only thing that sets the name of such a board, so a
-rename from any source is seen, including a raw 0x56 through `cmd`. The hub
+`device.rename {handle, name}` (control or admin) renames the device. The
+hub writes the `SYS.DEVICE_NAME` SET (0x0124) as the requesting session,
+replies `ok` once the board accepts the write, and emits `device.changed`
+when the board's `NOTIFY_EVT_DEVICE_NAME` (0x10) arrives. That notification
+is the only thing that sets the name of such a board, so a rename from any
+source is seen, including a raw `SYS.DEVICE_NAME` SET through `cmd`. The hub
 reduces the name to what the board can store: printable ASCII, gaps left by
 dropped characters closed, ends trimmed, at most 31 characters. An empty
 name clears it. Like a `cmd`, the write honours locks and the session's
 in-flight limit: while another session holds the device's lock (section 7.7)
-the rename answers `locked`, and past the limit it answers `busy`. A name-capable board that is not attached, or an
-unknown handle, answers `no_device`. On older firmware the hub changes its
-stored name and emits `device.changed` itself. Names stored on the board
+the rename answers `locked`, and past the limit it answers `busy`. A board that is not attached, or an
+unknown handle, answers `no_device`. For a legacy device that a hub lists,
+the hub changes its stored name and emits `device.changed` itself. Names stored on the board
 travel with it, so it keeps its name on any hub or computer. A board rename
 restarts the board's outputs briefly.
 
-A hub that holds a stored name for a name-capable board reporting an empty
+A hub that holds a stored name for a board reporting an empty
 name writes the stored name to the board once at attach. It deletes its
 stored entry when the board accepts that write, when it reads a non-empty
 board name, and on any `NOTIFY_EVT_DEVICE_NAME` for that board, so a later
@@ -485,7 +521,7 @@ clear is never undone. The full rules are in the firmware repo's
 ```json
 {"t": "device.snapshot", "id": 6, "handle": 0}
 {"t": "ok", "id": 6, "handle": 0, "wire_version": 32, "age_ms": 120,
- "bulk_b64": "<REQ_GET_ALL_PARAMS blob, base64>", "status_b64": "<REQ_GET_STATUS wValue=9 response>"}
+ "bulk_b64": "<STORE.ALL_PARAMS blob, base64>", "status_b64": "<MEAS.LEVELS response>"}
 ```
 
 The hub keeps one cached bulk blob per device, refreshed on
@@ -509,23 +545,26 @@ several sessions are executed once and fanned out.
 
 ```json
 {"t": "poll.subscribe", "id": 8, "handle": 0, "polls": [
-  {"slot": 0, "req": 80,  "val": 9, "idx": 2, "len": 41, "hz": 10},
-  {"slot": 1, "req": 11,  "val": 3, "idx": 2, "len": 82, "hz": 15}
+  {"slot": 0, "req": 16,  "val": 0, "idx": 2306, "len": 41, "hz": 10},
+  {"slot": 1, "req": 35,  "val": 3, "idx": 2306, "len": 82, "hz": 15}
 ]}
 {"t": "ok", "id": 8, "granted": [{"slot": 0, "hz": 10}, {"slot": 1, "hz": 12}]}
 
 {"t": "poll.unsubscribe", "id": 9, "handle": 0, "slots": [1]}
 ```
 
-`len` is what the client would pass as `wLength` over USB and must fit the
-device: the status frame above is `2 * channels + 7` bytes, 41 on a 17-channel
-RP2350 and 21 on a 7-channel RP2040, so a client reads the channel count from
-the bulk header first. `slot` is a session-chosen number 0..15 that comes back
+`req`, `val`, `idx` and `len` are the `bRequest`, `wValue`, `wIndex` and
+`wLength` of the GET, exactly as in a CMD frame (section 8.2), so `idx`
+carries the page: slot 0 polls `MEAS.LEVELS` (0x0910, `idx` 0x0902) and slot
+1 polls `MEAS.RTA_BANDS` (0x0923) for analyser channel 3. `len` must not be 0
+and must fit the device: the levels frame above is `2 * channels + 7` bytes,
+41 on a 17-channel RP2350 and 21 on a 7-channel RP2040, so a client reads the
+channel count from the bulk header first. `slot` is a session-chosen number 0..15 that comes back
 in each `POLL` frame.
 The hub may grant a lower rate than requested to stay inside
 `poll_budget_bps`; it reports the granted rates. A hub that cannot grant a
 useful rate (the bridge's floor is 1 Hz) answers `busy` and leaves the
-session's polls as they were. Poll commands must be
+session's polls as they were. Poll commands must be GETs, which are all
 classed *read*. A subscription ends when the session closes, when the device
 goes offline, or on `poll.unsubscribe`. A client that still wants a feed
 subscribes again when the device comes back online. A `poll.subscribe` for a
@@ -536,7 +575,7 @@ switch themselves off when unread and keeping them alive costs device CPU.
 ### 7.7 Locks
 
 Long operations that must not be interleaved with other clients' commands
-(firmware install, `REQ_SET_ALL_PARAMS`, preset save with its flash blackout)
+(firmware install, the `STORE.ALL_PARAMS` SET, preset save with its flash blackout)
 take an exclusive lock:
 
 ```json
@@ -559,17 +598,17 @@ on a remote hub through `lock.acquire`, and releases it on every exit:
 | Flow | `reason` | `timeout_ms` |
 |------|----------|--------------|
 | Configuration import (`.dspipreset` apply) | `Applying configuration` | 60000 |
-| Preset save (`REQ_PRESET_SAVE`) | `Saving preset` | 5000 |
+| Preset save (`STORE.PRESET_SAVE`) | `Saving preset` | 5000 |
 | Preset copy (two saves and the wait between them) | `Copying preset` | 10000 |
-| Output configuration save (`REQ_SAVE_OUTPUT_CONFIG`) | `Saving output configuration` | 5000 |
-| Flash save (`REQ_SAVE_PARAMS`) | `Saving to flash` | 5000 |
+| Output configuration save (`STORE.OUTPUT_CONFIG_SAVE`) | `Saving output configuration` | 5000 |
+| Flash save (a `STORE.PRESET_SAVE` to the active slot; firmware 1.1.7 has no separate flash save) | `Saving to flash` | 5000 |
 | IR learn, from arm until the result, cancel or timeout | `Learning an IR code` | 15000 |
-| Firmware install, from before `REQ_ENTER_BOOTLOADER` until the install ends | `Installing firmware` | 60000 |
+| Firmware install, from before `SYS.ENTER_BOOTLOADER` until the install ends | `Installing firmware` | 60000 |
 
 If the lock is refused the flow sends nothing and says "Another console is
 applying changes". The same wording appears briefly in the status row when an
 ordinary command is answered `0x85 LOCKED`. The Console's configuration
-import applies its document as individual commands, not `REQ_SET_ALL_PARAMS`.
+import applies its document as individual commands, not the `STORE.ALL_PARAMS` SET.
 A firmware install's lock normally ends with the device: the reboot detaches
 it from the hub.
 
@@ -584,7 +623,9 @@ it from the hub.
 ```
 
 Requires `admin` and implicitly takes the lock. The hub validates the SHA-256
-before touching the device, enters the bootloader (0xF0), copies the UF2 and
+before touching the device, enters the bootloader (`SYS.ENTER_BOOTLOADER`,
+0x0130, a zero-length SET; `REQ_ENTER_BOOTLOADER` 0xF0 on a legacy device),
+copies the UF2 and
 waits for the device to re-enumerate with the expected version. The device is
 `updating` throughout and `device.changed` fires at each state.
 
@@ -736,7 +777,7 @@ fails to start. A client confirms the outcome from `hub.version` in the
 
 ### 7.15 Analyser sharing
 
-The spectrum analyser (`REQ_RTA_*`, 0x08 to 0x0F) is one engine with one
+The spectrum analyser (the `MEAS.RTA_*` commands, 0x0920 to 0x092A) is one engine with one
 configuration shared by every session, and the firmware cannot tell sessions
 apart. The host-side rules (last chooser drives, followers adopt the device's
 configuration, a user action takes control) are in the firmware's
@@ -744,29 +785,31 @@ configuration, a user action takes control) are in the firmware's
 two things, because only the hub sees every session.
 
 **Watching.** A session is watching the analyser while it has read bands or
-bins (`REQ_RTA_GET_BANDS` 0x0B, `REQ_RTA_GET_BINS` 0x0C,
-`REQ_RTA_GET_BANDS_ALL` 0x0F) or sent `RTA_CTL_START` within the last 5000 ms,
-the firmware's own idle timeout, or while it holds a poll subscription for
-one of those commands. A session that closes stops watching at once.
+bins (the GETs the registry flags `KEEPALIVE`: `MEAS.RTA_BANDS` 0x0923,
+`MEAS.RTA_BINS` 0x0924 and `MEAS.RTA_BANDS_ALL` 0x0926) or sent
+`MEAS.RTA_START` (0x0928) within the last 5000 ms, the firmware's own idle
+timeout, or while it holds a poll subscription for one of those commands. A
+session that closes stops watching at once. The hub recognises these
+commands by their full command ID, never by `bRequest` alone.
 
-**STOP is per session.** `REQ_RTA_CONTROL` (0x0E) with `RTA_CTL_STOP` (0)
-means "this session has stopped watching". The hub forwards it to the device
-only when no other session is watching. Otherwise it answers the session
-`OK` with the one-byte acknowledgement the device would have sent (`01`) and
-does not touch the device. `RTA_CTL_START` and `RTA_CTL_RESET_AVG` are always
-forwarded. A hub must never forward a STOP on a session's behalf when that
-session closes: the firmware stops itself 5 s after the last read.
+**STOP is per session.** `MEAS.RTA_STOP` (0x0929, a zero-length SET) means
+"this session has stopped watching". The hub forwards it to the device only
+when no other session is watching. Otherwise it answers the session `OK` with
+no payload, as the device would have, and does not touch the device.
+`MEAS.RTA_START` and `MEAS.RTA_RESET` (0x092A) are always forwarded. A hub
+must never forward a STOP on a session's behalf when that session closes: the
+firmware stops itself 5 s after the last read.
 
 **The configuration event is attributed.** `NOTIFY_EVT_RTA_CONFIG` (0x0D,
 notification spec section 3.9) is a host-sourced event when its source byte,
 at offset 16, is `HOST_SET`, `BULK_SET` or (over a bridge) `UART`, and the hub
-attributes it to the session whose `REQ_RTA_SET_CONFIG` it answers, exactly as
+attributes it to the session whose `MEAS.RTA_CONFIG` SET it answers, exactly as
 it attributes `PARAM_CHANGED` (section 8.3). That attribution is how a client
 tells its own echo from another session's change. A hub relays the packet
 verbatim like every other notification.
 
-**Viewers.** `REQ_RTA_SET_CONFIG` and `REQ_RTA_CONTROL` remain classed
-*control*, so a viewer can watch whatever configuration the device holds (band
+**Viewers.** The `MEAS.RTA_CONFIG` SET, `MEAS.RTA_START`, `MEAS.RTA_STOP` and
+`MEAS.RTA_RESET` are classed *control*, so a viewer can watch whatever configuration the device holds (band
 reads auto-start the analyser) but cannot choose channels. Letting viewers
 take part is a possible later relaxation and would need the same per-session
 rules above.
@@ -803,28 +846,50 @@ tell the frame was a request (types below 0x80 from a client).
 
 ### 8.1 Status codes
 
-Byte 0 of a CMD response. Codes 0x00..0x07 are the firmware's `CTRL_STATUS_*`
-values, so a bridge forwards the UART status untouched and a Console hub maps
-its USB result onto the same table. Codes from 0x80 are Link-level.
+Byte 0 of a CMD response. Codes 0x00..0x7F are the firmware's: 0x00..0x07
+are its UART transport statuses and 0x10..0x1A its command result codes
+(`VC_*`, firmware `commands.md`). A bridge forwards the UART status untouched
+and a Console hub maps its USB result onto the same table (section 9.1).
+Codes from 0x80 are Link-level. A client shows an unknown code in hex and
+treats it as a final refusal.
 
 | Code | Name | Meaning / client action |
 |------|------|-------------------------|
 | 0x00 | OK | On GET, payload follows. On SET, dispatched (as with USB and UART, this does not certify the value was applied; read back if it matters). |
 | 0x01 | BUSY | Device could not take the request now. Retry. |
-| 0x02 | ERROR | Unknown command or the handler rejected it (USB STALL maps here). |
-| 0x03 | BLOCKED | The device refused a USB-only command on this transport (bridge hubs: 0xF5, 0xF7, 0xA2, 0xA3). |
-| 0x04 | BULK_LOCKED | Bulk buffer owned by another transport. Retry. |
+| 0x02 | ERROR | Refused, reason unknown. Firmware 1.1.7 never sends it; a USB hub sends it for a STALL it cannot explain (section 9.1), and a legacy device sends it for any refusal. |
+| 0x03 | BLOCKED | Legacy firmware only: a USB-only command refused on the UART. Firmware 1.1.7 answers `0x16` instead. |
+| 0x04 | BULK_LOCKED | Bulk buffer owned by another transport, or a bulk apply pending. Retry. |
 | 0x05 | CRC_ERROR | The device received a damaged frame from the hub and did not run it. Retry. A hub sends this only when the device says so; a damaged answer from the device, to a command that may have run, is reported as `TIMEOUT`, so a retry never repeats a command that ran. |
 | 0x06 | OVERSIZE | Payload too large for the device transport. |
 | 0x07 | FRAME_ERROR | Malformed frame between bridge and device. |
+| 0x10 | VC_ERR_UNKNOWN | No such command on this device's build (for example an RP2350-only command on an RP2040). |
+| 0x11 | VC_ERR_DIRECTION | The command has no GET, or no SET. |
+| 0x12 | VC_ERR_LENGTH | Wrong SET payload length. |
+| 0x13 | VC_ERR_ADDRESS | `wValue` out of range, or non-zero for a command that addresses nothing. |
+| 0x14 | VC_ERR_VALUE | A payload value out of range, or a NaN or infinite float. |
+| 0x15 | VC_ERR_UNSUPPORTED | A valid value this device cannot do. |
+| 0x16 | VC_ERR_BLOCKED | Not allowed on the device's transport to the hub (a USB-only command through a bridge). |
+| 0x17 | VC_ERR_BUSY | Try again shortly. |
+| 0x18 | VC_ERR_STATE | Not allowed in the device's current state. |
+| 0x19 | VC_ERR_PIN_INVALID | The GPIO cannot be used for this function. |
+| 0x1A | VC_ERR_PIN_IN_USE | The GPIO is already claimed. |
 | 0x80 | NO_DEVICE | No device at this handle, or it is offline. |
 | 0x81 | DENIED | The session's role does not permit this command. |
 | 0x82 | TIMEOUT | The hub gave up waiting for the device (over USB at least 2 s, 5 s for bulk; see the rules below). The command may or may not have executed. |
 | 0x83 | TOO_LARGE | Payload exceeds `limits.max_payload`. |
 | 0x84 | RATE_LIMITED | Too many in-flight commands; see `max_inflight`. |
 | 0x85 | LOCKED | Another session holds the device lock. |
-| 0x86 | UNSUPPORTED | Frame type or feature this hub does not implement. |
+| 0x86 | UNSUPPORTED | Frame type or feature this hub does not implement, or a CMD for a legacy device (section 7.4). |
 | 0x87 | BAD_FRAME | Malformed Link frame. |
+
+**Retries.** A client resends a command unchanged only on `0x01`, `0x04`,
+`0x17` and `0x84`. On `0x82 TIMEOUT` it retries a read after about 150 ms and
+confirms a write by reading it back, since the write may have run. Every
+other code is final, and the client shows it. A refusal changes nothing on
+the device. `OK` to a SET means the write passed every check and is queued;
+many writes are applied by the device a moment later, so read back if it
+matters.
 
 ### 8.2 CMD
 
@@ -835,10 +900,11 @@ Offset  Size  Field     Meaning
 4       1     handle    Device handle
 5       1     dir       0 = SET (host to device, bmRequestType 0x41)
                         1 = GET (device to host, bmRequestType 0xC1)
-6       1     bRequest  Vendor command id
+6       1     bRequest  Command number: the low byte of the command ID
 7       1     reserved  0
-8       2     wValue
-10      2     wIndex    Pass 2 for application commands; the hub forwards it
+8       2     wValue    The command's address (channel, output, slot...), or 0
+10      2     wIndex    (page << 8) | 2: the high byte of the command ID, and
+                        the vendor interface number 2; the hub forwards it
 12      2     wLength   SET: payload length that follows.  GET: bytes requested.
 14      n     payload   SET only, wLength bytes
 ```
@@ -855,21 +921,31 @@ Offset  Size  Field     Meaning
 
 Rules:
 
-- **Direction is the client's statement of the USB transfer type.** Write-as-read
-  commands are sent with `dir = 1` exactly as over USB. The hub does not
-  second-guess it; it only classifies for authorization.
+- **Command ID.** A client sends command ID `id` as `bRequest = id & 0xFF`
+  and `wIndex = (id & 0xFF00) | 2`. The low byte 2 names the vendor
+  interface, which a USB hub needs and a bridge ignores. A request with
+  `wIndex` high byte 0 names no command on paged firmware and is refused.
+- **Direction is the client's statement of the USB transfer type.** Every
+  GET is a read and every change is a SET, including actions that carry no
+  value, which are SETs with `wLength` 0. The hub classifies by command ID
+  and direction (section 6.3).
+- **`wValue` is an address or 0.** Values travel in the payload. A SET
+  payload must have exactly a length the command accepts.
 - **Ordering.** The hub executes commands for one device strictly in arrival
   order across all sessions and answers a session's commands in the order it
   sent them. Commands for different devices may interleave. A client may keep
   up to `max_inflight` requests outstanding per device; the hub answers
   `RATE_LIMITED` beyond that.
-- **GET length.** A GET response may be shorter than `wLength` (the firmware
-  clamps, and old firmware returns short reads). Clients size by `length`.
-- **Bulk.** `REQ_GET_ALL_PARAMS` (0xA0) and `REQ_SET_ALL_PARAMS` (0xA1) go
-  through unchanged with `wLength` up to `max_payload`. Clients never use the
-  chunked forms (0xA2/0xA3) over Link; how the hub moves the blob to the
-  device is its own business (single-shot on macOS, chunked on a Windows hub
-  in future, one UART frame on a bridge).
+- **GET length.** A client sends the `wLength` it wants, never 0: over USB a
+  read of 0 bytes returns nothing, while over UART it returns the whole
+  reply, so its meaning depends on the hub. A GET response may be shorter
+  than `wLength` (the firmware clamps). Clients size by `length`.
+- **Bulk.** `STORE.ALL_PARAMS` (0x0240) goes through unchanged in both
+  directions: a GET with `wLength` up to `max_payload`, and a SET of exactly
+  the blob size (6136 bytes for wire format 32). Clients never use the
+  chunked form `STORE.ALL_PARAMS_CHUNK` (0x0241) over Link; how the hub moves
+  the blob to the device is its own business (single-shot on macOS, chunked
+  on a Windows hub, one UART frame on a bridge).
 - **Timeouts.** The hub waits long enough for its link to the device, then
   answers `TIMEOUT`. Over USB that is at least 2 s for a response and 5 s
   for bulk. A hub whose link has known, bounded timing may wait less, and
@@ -877,7 +953,7 @@ Rules:
   about 160 ms, 280 ms for bulk (`esp32_bridge_spec.md` section 7.2).
   Flash-writing commands can blind the device for about 45 ms; hubs must
   not treat one timeout as a device loss.
-- **Bootloader entry (0xF0)** is `config` class. After it, the hub reports
+- **Bootloader entry (`SYS.ENTER_BOOTLOADER`, 0x0130)** is `config` class. After it, the hub reports
   the device `offline`, then `removed` if it does not return within 60 s
   (Console hubs that were asked to install firmware handle this themselves).
 
@@ -913,7 +989,7 @@ else.
 
 A gap in the Link `tag` sequence, or a gap in the firmware `seq`, means the
 session missed events; the client re-reads state (`device.snapshot` or
-`REQ_GET_ALL_PARAMS`). The hub sends RESYNC (8.6) when it knows it dropped.
+`STORE.ALL_PARAMS`). The hub sends RESYNC (8.6) when it knows it dropped.
 
 ### 8.4 POLL
 
@@ -971,8 +1047,17 @@ state) rather than an error. The client re-reads state.
 - Owns the vendor interface exclusively; the local UI and all remote sessions
   go through the same command router, so ordering and attribution are the
   same for everyone.
-- Maps USB results to status codes: success to `OK`, `kIOUSBPipeStalled` to
-  `ERROR`, timeouts to `TIMEOUT`, disconnect to `NO_DEVICE`.
+- Maps USB results to status codes: success to `OK`, timeouts to `TIMEOUT`,
+  disconnect to `NO_DEVICE`. After a STALL (`kIOUSBPipeStalled`) it reads
+  `SYS.LAST_RESULT` (0x0114, 8 bytes) at once, before any other request to
+  the device. When the record's command ID (u16 at offset 0), direction
+  (offset 2, 1 for GET) and `wValue` (u16 at offset 4) match the stalled
+  request, it forwards the result code at offset 3 as the status. Otherwise
+  it forwards `0x02 ERROR`: the record is shared by every USB program on the
+  computer, so another program may have overwritten it. Clients then see the
+  same code from a USB hub as from a bridge.
+- Probes each device with `SYS.PROTOCOL_INFO` when it attaches and treats a
+  legacy device as section 7.4 requires.
 - Relays EP 0x83 packets and keeps the snapshot cache.
 - Implements `fw_install`, `lock`, `snapshot`, `rename`, `web`.
 
@@ -982,19 +1067,23 @@ DSPi Console for Windows implements the same hub with these differences,
 none of which are visible to clients:
 
 - **Bulk transfers.** WinUSB caps a control transfer's data stage at 4096
-  bytes, so a Windows hub cannot issue `0xA0`/`0xA1` for the 6136-byte blob
-  (wire V32; the size grows with the wire format).
-  It serves a client's `0xA0` GET by running the chunked read (`0xA2`, 2048-byte
-  chunks) and returning the concatenated blob in one CMD response, and serves
-  a client's `0xA1` SET by splitting the payload across `0xA3` writes. The
-  client sees exactly what a macOS hub would return. The hub must hold the
-  device's per-device FIFO for the whole chunk session, because any other
-  vendor request between chunks tears the session down
-  (`bulk_params_chunking.md`). If a client itself sends `0xA2`/`0xA3`, the
-  hub passes them through unchanged on any USB hub kind.
+  bytes, so a Windows hub cannot issue `STORE.ALL_PARAMS` for the 6136-byte
+  blob (wire V32; the size grows with the wire format).
+  It serves a client's `STORE.ALL_PARAMS` GET by running the chunked read
+  (`STORE.ALL_PARAMS_CHUNK`, 0x0241, 2048-byte chunks, `wValue` the byte
+  offset) and returning the concatenated blob in one CMD response, and
+  serves a client's `STORE.ALL_PARAMS` SET by splitting the payload across
+  chunk writes. The client sees exactly what a macOS hub would return. The
+  hub must hold the device's per-device FIFO for the whole chunk session,
+  because any other vendor request between chunks tears the session down.
+  That includes a read of `SYS.LAST_RESULT`, so after a refused chunk the
+  hub reads the reason, forwards it, and does not resume the session. If a
+  client itself sends `STORE.ALL_PARAMS_CHUNK`, the hub passes it through
+  unchanged on any USB hub kind.
 - **Status mapping.** WinUSB pipe stall (`ERROR_GEN_FAILURE` on the
-  transfer) maps to `ERROR`; `ERROR_SEM_TIMEOUT` to `TIMEOUT`;
-  `ERROR_DEVICE_NOT_CONNECTED` to `NO_DEVICE`.
+  transfer) is a STALL, explained through `SYS.LAST_RESULT` as in section
+  9.1; `ERROR_SEM_TIMEOUT` maps to `TIMEOUT`; `ERROR_DEVICE_NOT_CONNECTED` to
+  `NO_DEVICE`.
 - **Discovery.** Windows 10 and later resolve and advertise mDNS natively
   through `Windows.Networking.ServiceDiscovery.Dnssd` (`DnssdServiceInstance`
   to register, `DeviceWatcher` with the DNS-SD selector to browse); no
@@ -1014,23 +1103,25 @@ none of which are visible to clients:
 - Requires the device's UART control interface enabled over USB once, with
   `notify_enable = 1` and a baud of 1000000 (recommended) or 921600 (the
   6136-byte V32 bulk read takes about 61 ms at 1 Mbaud, 530 ms at 115200).
-  The firmware refuses the enabling command (0xF5) on the UART itself, so a
-  bridge cannot do this step. The bridge reads `REQ_GET_CTRL_IFACE_STATUS`
-  (0xF9) and `REQ_GET_UART_CONFIG` (0xF6) when the device appears and reports
-  `uart_live` and `notify_enable`.
+  The firmware refuses the enabling command (the `XPORT.UART_CONFIG` SET,
+  0x0B10) on the UART itself with `0x16`, so a bridge cannot do this step.
+  The bridge reads `XPORT.STATUS` (0x0B12) and the `XPORT.UART_CONFIG` GET
+  when the device appears and reports `uart_live` and `notify_enable`.
+- Attaches only paged firmware. It refuses a legacy device and does not list
+  it, because it cannot install firmware; it tells the user to update the
+  board over USB with DSPi Console.
 - Follows the analyser rules in section 7.15: tracks which sessions are
-  watching and swallows `RTA_CTL_STOP` while another session is.
+  watching and swallows `MEAS.RTA_STOP` while another session is.
 - Obeys the one-request-in-flight rule on the UART: the Link router
   serialises per device anyway, so this costs nothing.
 - Forwards the UART `status` byte verbatim; wraps UART timeouts as `TIMEOUT`.
-- Cannot serve `REQ_RTA_GET_BANDS_ALL` (0x0F): it is USB-only in firmware,
-  the device refuses it on the UART and the client receives status `0x02
-  ERROR` (not `BLOCKED`), so clients behind a bridge poll `REQ_RTA_GET_BANDS`
-  (0x0B) per channel instead. A bridge also caps every non-bulk `GET`
-  response at 132 bytes and every `SET` payload at 64 bytes (firmware
-  `vendor_commands.c`: `_ext_resp_copy` is `sizeof(CsMacro)` = 132 and
-  `vendor_rx_buf` is 64), so a longer `GET` reply is truncated and a longer
-  `SET` answers `OVERSIZE`.
+- Cannot serve USB-only commands. The device refuses them on the UART with
+  `0x16 VC_ERR_BLOCKED`: `MEAS.RTA_BANDS_ALL` (0x0926), so clients behind a
+  bridge poll `MEAS.RTA_BANDS` (0x0923) per channel instead, the chunked
+  bulk commands, and the SETs of the transport configuration. Non-bulk `GET`
+  replies are up to 256 bytes and arrive whole (`SYS.PROTOCOL_INFO` reports
+  the device's limits). A bridge caps every `SET` payload at 64 bytes, except
+  the `STORE.ALL_PARAMS` SET, so a longer `SET` answers `OVERSIZE`.
 - Relays type 0x40 UART notification frames as NOTIFY. Because a busy request
   stream starves UART notifications, the bridge must leave idle gaps: a
   minimum of 2 ms between the end of one response and the start of the next
@@ -1060,22 +1151,23 @@ machine-readable files so that no implementation hand-transcribes them:
 
 | File | Content | Used by |
 |------|---------|---------|
-| `policy/commands.json` | Every `bRequest` with its direction(s), class (`read`, `control`, `config`) and a short name, plus a per-direction `classes` object where the directions differ. | Hubs (authorization), clients (greying out controls), tests (coverage). |
+| `policy/commands.json` | Every firmware command ID with its `PAGE.NAME` and a class (`read`, `control`, `config`) for each direction it has. | Hubs (authorization), clients (greying out controls), tests (coverage). |
+| `policy/firmware/dspi_commands.json`, `legacy_map.json` | The firmware's command registry and its old-to-new opcode map, copied from the firmware repository, so CI can check that the policy table names every command. | Tooling and tests. |
 | `fixtures/frames/*.bin` + `frames.json` | Byte-exact CMD, NOTIFY, POLL, FWDATA and RESYNC frames with their decoded meaning. | Codec tests in every language. |
 | `fixtures/messages/*.json` | Valid and invalid control-plane messages with the expected reply or error code. | Control-plane tests. |
-| `fixtures/device/bulk_v32.bin`, `status_wvalue9.bin`, `platform.bin` | Real device captures with the decoded values in the `capture.json` sidecar. | Decoder tests, so Swift, C#, TypeScript and Kotlin all decode the same bytes to the same numbers. |
+| `fixtures/device/bulk_v32.bin`, `status_wvalue9.bin`, `platform.bin` | Real device captures with the decoded values in the `capture.json` sidecar. `status_wvalue9.bin` is the `MEAS.LEVELS` reply, whose bytes are unchanged from the 1.1.6 status frame it was captured as. | Decoder tests, so Swift, C#, TypeScript and Kotlin all decode the same bytes to the same numbers. |
 | `conformance/` (planned, not yet in the repository) | A reference client that drives any hub through the checklist in section 12, and a reference hub (Python, on the existing `tools/dspi_test` USB layer) that any client can be tested against. | CI for every implementation. |
 
 An implementation embeds `policy/commands.json` as a resource and records the
-spec version it was taken from. A hub must treat a `bRequest` absent from
-its embedded table as `config`.
+spec version it was taken from. A hub must treat a command ID, or a
+direction of one, absent from its embedded table as `config`.
 
-A row whose directions need different classes carries `classes`, an object
-with one entry per direction in `dirs`, for example
-`"classes": {"set": "control", "get": "read"}`. Where `classes` is present it
-decides, and `class` must hold the strictest of its values. A 1.0 reader
-ignores the unknown key and applies `class` to both directions, which fails
-safe.
+Each row is an object such as
+`{"id": 1360, "name": "ROUTE.MASTER_VOLUME", "classes": {"get": "read", "set": "control"}}`
+with an optional `note`. `classes` has one entry per direction the command
+has. The table is reviewed by hand: a new firmware command is added with the
+class of the 1.1.6 command it replaces, if any, and otherwise by judgement.
+The 1.2 table, keyed by `code` (the 1.1.6 opcode), is retired.
 
 ## 10. Versioning and compatibility rules
 
@@ -1087,21 +1179,24 @@ safe.
    `unknown_type`; unknown events are dropped.
 4. Binary: `flags` bits and reserved bytes are 0 when sent and ignored when
    received; unknown frame types are dropped or answered `UNSUPPORTED`.
-5. Status codes 0x00..0x07 track the firmware's `CTRL_STATUS_*` table and
-   never diverge from it; Link codes live at 0x80 and above.
-6. Firmware compatibility is not Link's concern. A client gates features on
-   the device's own reports (`REQ_GET_PLATFORM`, the bulk wire-format
-   version, `REQ_GET_CAPS` and friends) exactly as it does over USB. The hub
-   passes commands through even when it does not know them.
+5. Status codes 0x00..0x7F are the firmware's and are forwarded verbatim;
+   Link codes live at 0x80 and above.
+6. Firmware compatibility is otherwise not Link's concern. A client gates
+   features on the device's own reports (`SYS.PAGE_LIST`,
+   `SYS.PAGE_COMMANDS`, `SYS.COMMAND_INFO`, `SYS.PLATFORM` and the bulk
+   wire-format version) exactly as it does over USB. The hub passes commands
+   through even when it does not know them. The one exception is the firmware
+   generation: a hub reports it in the device object and forwards nothing to
+   a legacy device (section 7.4).
 7. The hub's authorization table is the one place where a new firmware
-   command needs hub attention: an unlisted `bRequest` is treated as *config*
+   command needs hub attention: an unlisted command ID is treated as *config*
    (admin only) until classified, which fails safe.
 
 ---
 
 ## 11. Worked examples
 
-### 11.1 Set master volume to -20 dB (REQ_SET_MASTER_VOLUME 0xD2)
+### 11.1 Set master volume to -20 dB (ROUTE.MASTER_VOLUME 0x0550)
 
 Client sends a binary frame, request id 0x0007, handle 0:
 
@@ -1109,10 +1204,10 @@ Client sends a binary frame, request id 0x0007, handle 0:
 01 00 07 00   type=CMD, flags, tag=7
 00            handle 0
 00            dir = SET
-D2            bRequest
+50            bRequest: command 0x50
 00            reserved
 00 00         wValue 0
-02 00         wIndex 2
+02 05         wIndex 0x0502: page 0x05 (ROUTE), interface 2
 04 00         wLength 4
 00 00 A0 C1   -20.0f little-endian
 ```
@@ -1130,24 +1225,26 @@ Every other session then receives a NOTIFY frame carrying the device's
 `origin = 12` (the sender's session id), and the sender receives the same
 frame and drops it because `origin` matches its own session.
 
-### 11.2 Read the platform (REQ_GET_PLATFORM 0x7F)
+### 11.2 Read the platform (SYS.PLATFORM 0x0120)
 
 ```
-01 00 08 00  01 01 7F 00  00 00 02 00  07 00     -> handle 1, GET, wLength 7
+01 00 08 00  01 01 20 00  00 00 02 01  07 00     -> handle 1, GET, wIndex 0x0102, wLength 7
 81 00 08 00  00 00 07 00  01 01 17 09 01 07 00  -> RP2350, fw 1.1.7, final (beta 0), 9 outputs
 ```
 
 ### 11.3 Subscribe to the peak meters at 10 Hz
 
+`MEAS.LEVELS` is 0x0910: `req` 16 (0x10), `idx` 2306 (0x0902).
+
 ```json
 {"t": "poll.subscribe", "id": 3, "handle": 0,
- "polls": [{"slot": 0, "req": 80, "val": 9, "idx": 2, "len": 41, "hz": 10}]}
+ "polls": [{"slot": 0, "req": 16, "val": 0, "idx": 2306, "len": 41, "hz": 10}]}
 ```
 
 Then, ten times a second:
 
 ```
-03 00 <seq16>  00 00 29 00  <41 bytes of REQ_GET_STATUS>
+03 00 <seq16>  00 00 29 00  <41 bytes of MEAS.LEVELS>
 ```
 
 ---
@@ -1161,9 +1258,10 @@ A hub is conformant when it:
 - [ ] defaults to `auth: none`, and when `pin` is on rate-limits failures and stores only hashes of tokens and of any fixed PIN;
 - [ ] implements CMD with per-device ordering, `max_inflight`, and the status table;
 - [ ] relays notifications verbatim with `origin` attribution and sends RESYNC on drop;
-- [ ] tracks analyser watchers per session and swallows `RTA_CTL_STOP` while another session is watching (section 7.15);
+- [ ] probes every device with `SYS.PROTOCOL_INFO` first, reports `protocol`, and forwards nothing to a legacy device;
+- [ ] tracks analyser watchers per session and swallows `MEAS.RTA_STOP` while another session is watching (section 7.15);
 - [ ] implements poll subscriptions with fan-out and stops polling when unsubscribed;
-- [ ] classifies every command it forwards and fails safe on unknown ones;
+- [ ] classifies every command it forwards by command ID and direction, and fails safe on unknown ones;
 - [ ] keeps handles stable, emits `device.added/removed/changed`;
 - [ ] closes with the defined codes and survives client reconnect storms.
 
@@ -1175,13 +1273,55 @@ A client is conformant when it:
 - [ ] uses `caps` and `limits` instead of assuming hub kind;
 - [ ] suppresses echoes by `origin`, never by `source` alone;
 - [ ] re-reads state on any sequence gap or RESYNC;
+- [ ] sends paged commands only to a device with `protocol`, with `wIndex` carrying the page and a non-zero `wLength` on every GET;
+- [ ] retries only the codes section 8.1 names as retryable;
 - [ ] gates device features on the device's own version and capability reports.
 
 ---
 
 ## 13. Change history
 
-### 13.1 Changes from 1.1
+### 13.1 Changes from 1.2
+
+Version 1.3 tracks DSPi firmware 1.1.7, whose vendor commands are addressed
+by a page and a command number instead of one 8-bit opcode. The frame
+layouts did not change: the page travels in the high byte of `wIndex`, which
+CMD frames and polls already carried. Three changes are exceptions to the
+additive rule of section 10, because the firmware's own change left no
+additive choice. A 1.1 or 1.2 client connected to a 1.3 hub keeps working
+with the hub itself, sees status `0x10` (or `0x86` for a legacy device) on
+every device command it sends, because it sends page 0, and greys out
+nothing.
+
+- `hello.proto.minor` is 3. Version 1.2 is final.
+- The policy table and every authorization decision are keyed by command ID
+  and direction, not by `bRequest` (sections 6.3 and 9.3). The table is
+  regenerated from the firmware registry, every GET is *read*, and
+  write-as-read commands no longer exist. Exception to section 10: a hub
+  with a 1.2 table classes paged commands by unrelated old opcodes.
+- The auth `ok` carries `policy.denied_ids`, `[id, dir]` pairs, and sends
+  `policy.denied` empty (section 7.3). Exception to section 10: a 1.2 client
+  no longer learns what it is denied.
+- Status codes 0x08..0x7F belong to the firmware and are forwarded verbatim;
+  the table gains the firmware result codes 0x10..0x1A, and `0x02` and
+  `0x03` now come only from legacy firmware or an unexplained USB STALL
+  (section 8.1). A USB hub explains a STALL through `SYS.LAST_RESULT`
+  (section 9.1). Exception to section 10: rule 5 reserved only 0x00..0x07.
+- Section 8.1 says which codes a client retries.
+- The device object gains `protocol` (section 7.4). A hub probes every device
+  with `SYS.PROTOCOL_INFO` first and forwards nothing to a legacy device,
+  answering `0x86 UNSUPPORTED`. A bridge does not attach one at all
+  (section 9.2).
+- `wIndex` is `(page << 8) | 2` (section 8.2). A GET carries a non-zero
+  `wLength`.
+- Device identity, names, snapshots, polls, locks, firmware install and
+  analyser sharing name the 1.1.7 commands. The swallowed `MEAS.RTA_STOP` is
+  answered `OK` with no payload (section 7.15).
+- A bridge's non-bulk GET replies are up to 256 bytes, delivered whole, and
+  USB-only commands through a bridge answer `0x16` (section 9.2).
+- The worked examples use the 1.1.7 commands (section 11).
+
+### 13.2 Changes from 1.1
 
 Version 1.2 adds hub administration for hubs without a screen, and makes
 authentication opt-in. Every change is additive under section 10, so 1.1
@@ -1231,7 +1371,7 @@ with a window PIN, and only its prompt wording may read oddly.
   flash saves, IR learn, firmware install). Client behaviour only; no
   message changes.
 
-### 13.2 Changes from 1.0
+### 13.3 Changes from 1.0
 
 Version 1.1 tracks firmware v1.1.6-beta5 (wire format V32). Every change is
 additive under section 10, so 1.0 hubs and clients keep working. The one

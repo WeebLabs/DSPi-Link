@@ -1,9 +1,9 @@
 # DSPi Link ESP32 Bridge Specification
 
 *Version: 1.0 (draft)*
-*Implements: DSPi Link protocol 1.2 (`spec/dspi_link_protocol_spec.md`)*
+*Implements: DSPi Link protocol 1.3 (`spec/dspi_link_protocol_spec.md`), against DSPi firmware 1.1.7 or later*
 *Status: draft; no implementation yet. `bridge/esp32/PLAN.md` gives the build order.*
-*Last updated: 2026-11-02*
+*Last updated: 2026-11-17*
 
 The ESP32 bridge is the reference implementation of a DSPi Link bridge hub.
 It is a firmware image for common ESP32 boards. Wired to a DSPi's UART
@@ -28,8 +28,8 @@ same level as correctness. Section 16 sets the code standards.
 The bridge:
 
 - serves one DSPi, connected over UART;
-- implements a Link 1.2 hub of kind `bridge` with the capabilities in
-  section 8.1;
+- implements a Link 1.3 hub of kind `bridge` with the capabilities in
+  section 8.1, for a DSPi running firmware 1.1.7 or later;
 - joins a 2.4 GHz Wi-Fi network, set up from a phone or computer through a
   setup network and captive portal;
 - serves the DSPi control web page and its own settings page;
@@ -49,6 +49,9 @@ Out of scope for version 1.0:
   over USB, so the bridge omits `fw_install`.
 - Enabling the DSPi's UART interface. The firmware accepts that command only
   over USB, so the user does it once in DSPi Console (section 5).
+- DSPi firmware 1.1.6 and older. Its commands are numbered differently, so
+  the bridge refuses such a DSPi and asks for a firmware update (section
+  7.6). Bridge firmware 0.1.0 is the last release that serves it.
 
 ---
 
@@ -188,8 +191,8 @@ removed from the LED choices.
 ## 5. Preparing the DSPi
 
 The DSPi ships with its UART control interface off, and the firmware
-accepts the command that turns it on (`REQ_SET_UART_CONFIG`, 0xF5) only over
-USB. The user therefore sets it once in DSPi Console with the DSPi plugged
+accepts the command that turns it on (the `XPORT.UART_CONFIG` SET, 0x0B10)
+only over USB, and refuses it on the UART with `0x16`. The user therefore sets it once in DSPi Console with the DSPi plugged
 in:
 
 | Setting | Value |
@@ -207,7 +210,10 @@ The bridge checks the result rather than trusting it:
 - **No answer at any baud rate.** The UART is off, the wires are swapped or
   missing, or ground is not connected. The setup and settings pages say
   exactly this and link to the wiring diagram.
-- **Notifications off.** The bridge reads `REQ_GET_UART_CONFIG` (0xF6) and
+- **Firmware too old.** The DSPi answers, but runs firmware 1.1.6 or older.
+  The pages say so, give its version, and ask the user to update it over USB
+  with DSPi Console.
+- **Notifications off.** The bridge reads the `XPORT.UART_CONFIG` GET (0x0B10) and
   sees `notify_enable = 0`. It works, but omits the `notify` capability, so
   clients fall back to polling and react more slowly. The pages show a
   warning explaining how to turn notifications on in Console.
@@ -368,7 +374,7 @@ the same source compiles into the firmware and into the host tests.
 |-----------|----------------|------------|
 | `bridge_config` | Named constants: timeouts, queue depths, limits, retry counts. | nothing |
 | `link_codec` | Encodes and decodes Link binary frames (Link spec 8), and base64 for the `_b64` fields. | nothing |
-| `link_policy` | `link_policy_class(bRequest, dir)`, generated from `policy/commands.json` with the spec version it came from. Unknown codes are `config`. | nothing |
+| `link_policy` | `link_policy_class(id, dir)` for a 16-bit command ID, searched in a sorted table generated from `policy/commands.json` with the spec version it came from. Unknown IDs are `config`. | nothing |
 | `dspi_frame` | Builds DSPi UART requests and parses responses and notifications byte by byte (firmware spec 3). | nothing |
 | `dspi_uart` | The link engine (`dspi_link.c`, portable): one request at a time, the idle gap, retries, recovery after timeouts, baud detection and the device's identity. The uart task (`dspi_uart.c`) runs it on the real UART and reports the device found or lost. | `dspi_frame` |
 | `hub` | The hub state machine (portable): sessions, hello, auth, inventory, command routing, polls, notify relay, snapshot, locks, administration, the hub's own update, with JSON through cJSON. The hub task (`hub_task.c`) runs it and connects it to the HTTP server, the uart task, the ota task, flash and mDNS. | `link_codec`, `link_policy`, `hub_auth`, cJSON |
@@ -431,12 +437,17 @@ defines it. In summary:
 The CRC is CRC-16/CCITT-FALSE (polynomial 0x1021, initial value 0xFFFF, no
 reflection, no final XOR) over every byte after the `A5`, sent
 little-endian. The firmware spec's worked example
-`A5 01 D2 00 00 00 00 04 00 00 00 A0 C1 CF 6D` is a host test.
+`A5 01 50 00 00 00 05 04 00 00 00 A0 C1 71 3D` (`ROUTE.MASTER_VOLUME` set to
+-20 dB) is a host test.
+
+The page of a command travels in `wIdxH`. The bridge's own requests send
+`wIdxL` 0, which the UART accepts; clients send 2 (Link spec 8.2).
 
 A Link CMD maps onto one UART request: `dir = 0` becomes a SET frame and
 `dir = 1` a GET frame, with `bRequest`, `wValue`, `wIndex` and `wLength`
-copied unchanged. A GET response's status byte becomes the CMD response
-status unchanged (Link spec 8.1).
+copied unchanged. A response's status byte becomes the CMD response
+status unchanged (Link spec 8.1): `0x00` to `0x07` from the UART transport,
+and the command result codes `0x10` to `0x1A`.
 
 Responses carry no request id, so the link depends on strict
 one-at-a-time use.
@@ -472,15 +483,13 @@ The uart task sends a request at most twice, and only in these cases:
   rejected the frame itself and did not run the request, so any request,
   SET included, is sent again.
 - **No valid answer arrives** (a timeout, or an answer that fails its CRC),
-  and the request is a GET that `link_policy` classes as *read*. Such a
-  request is safe to repeat. Write-as-read commands such as
-  `REQ_RTA_CONTROL` (0x0E) and `REQ_CS_MACRO_FIRE` (0x25) are excluded,
-  because their GET frames change state.
+  and the request is a GET. A GET never changes state, so it is safe to
+  repeat.
 
 Other requests with no valid answer are not repeated, because the bridge
-cannot know whether they ran. `BUSY` (0x01) and `BULK_LOCKED` (0x04) are
-passed to the client unchanged, since the firmware has already retried for
-50 ms. When the last attempt gets no valid answer, whether nothing came or
+cannot know whether they ran. `BUSY` (0x01), `BULK_LOCKED` (0x04) and
+`VC_ERR_BUSY` (0x17) are passed to the client unchanged, since the firmware
+has already retried for 50 ms. When the last attempt gets no valid answer, whether nothing came or
 the answer failed its CRC, the client receives Link status `0x82 TIMEOUT`:
 the command may or may not have run. `0x05 CRC_ERROR` reaches a client only
 when the DSPi itself reports it, meaning the DSPi did not run the frame, so
@@ -512,11 +521,12 @@ probe changes the baud rate, which already flushes the receiver.
 ### 7.5 Finding the baud rate
 
 When automatic detection is on (`uart.detect_baud`, section 8.11), the uart
-task looks for the DSPi by sending `REQ_GET_CTRL_IFACE_STATUS` (0xF9, 8
+task looks for the DSPi by sending a GET of `SYS.PROTOCOL_INFO` (0x0110, 16
 bytes) at each rate in turn, starting with the saved rate and then trying
 1,000,000, 921,600, 460,800, 230,400 and 115,200. The first rate that
 returns a frame with a valid CRC wins and is saved. When detection is off,
-only `uart.baud` is tried.
+only `uart.baud` is tried. The probe is safe on every firmware generation,
+and its answer also says which generation is listening (section 7.6).
 
 ### 7.6 Device presence
 
@@ -524,19 +534,31 @@ The uart task reports the device as found or lost; the hub turns those
 reports into Link events.
 
 - **Finding.** While no device is known, the uart task probes every 2 s
-  (section 7.5). On an answer it reads, in order, `REQ_GET_SERIAL` (0x7E),
-  `REQ_GET_PLATFORM` (0x7F, 7 bytes), `REQ_GET_CTRL_IFACE_STATUS` (0xF9),
-  `REQ_GET_UART_CONFIG` (0xF6) and `REQ_GET_DEVICE_NAME` (0x57, 32 bytes),
-  then reports the device found with those values. Only a full 32-byte OK
-  answer to 0x57 marks the board as keeping its own name (section 8.7).
-  Older firmware STALLs it or answers one byte, so a miss is read once
-  more before the board counts as old firmware for the attachment. The
-  hub assigns handle 0 and sends `device.added`.
+  (section 7.5) and classifies the answer:
+  - **OK, 16 bytes starting `DSPi`, byte 4 (the protocol major) 1.** Paged
+    firmware. The uart task reads, in order, `SYS.SERIAL` (0x0121),
+    `SYS.PLATFORM` (0x0120, 7 bytes), `XPORT.STATUS` (0x0B12),
+    `XPORT.UART_CONFIG` (0x0B10) and `SYS.DEVICE_NAME` (0x0124, 32 bytes),
+    then reports the device found with those values and the protocol
+    version. The hub assigns handle 0 and sends `device.added`.
+  - **Status `0x02`.** Firmware 1.1.6 or older, which does not know the
+    command. The uart task sends it only the legacy `REQ_GET_PLATFORM`
+    (0x7F, frame `A5 02 7F 00 00 00 00 07 00 87 29`) to learn its version,
+    reports the firmware too old, and attaches nothing. It keeps probing
+    every 2 s, so the bridge attaches the board once it is updated.
+  - **OK with any other protocol major, or a reply that is not `DSPi`.**
+    Firmware too new for this bridge. Reported like too old, without a
+    version, and nothing is attached.
+  - **Any other status**, such as `0x01` while a USB transfer holds the
+    device's buffers. Not found yet; the next probe tries again.
 - **Watching.** When the link has carried no traffic for 1 s, the uart task
-  sends `REQ_GET_SERIAL` (0x7E) as a heartbeat. An answer with a different
-  serial means another DSPi was plugged in: the uart task reports the device
-  lost, and the next probe finds the new one (see Swapping). A quick reboot
-  of the same DSPi cannot be told apart from no change.
+  reads `SYS.SERIAL` as a heartbeat. An answer with a different serial
+  means another DSPi was plugged in: the uart task reports the device lost,
+  and the next probe finds the new one (see Swapping). A busy answer
+  (`0x01`, `0x04` or `0x17`) means the same device. Any other refusal also
+  means the device changed, because a legacy board swapped in answers a
+  paged read with `0x02`, so it is reported lost and re-probed. A quick
+  reboot of the same DSPi cannot be told apart from no change.
 - **Notifications** are relayed only while a device is present. Frames that
   arrive before the device is reported found are dropped, since no client
   could yet place them.
@@ -572,7 +594,7 @@ changes.
 
 ```json
 {"t": "hello",
- "proto": {"major": 1, "minor": 2},
+ "proto": {"major": 1, "minor": 3},
  "hub": {"id": "<uuid>", "name": "DSPi Bridge 3F2A", "kind": "bridge", "version": "1.0.0"},
  "auth": "none",
  "caps": ["cmd", "notify", "poll", "snapshot", "lock", "web", "rename",
@@ -640,22 +662,32 @@ that applies:
 1. `BAD_FRAME` if the frame is malformed.
 2. `NO_DEVICE` if handle is not 0 or the device is offline.
 3. `TOO_LARGE` if the payload exceeds `max_payload`.
-4. `DENIED` if the session's role does not permit the command's class.
+4. `DENIED` if the session's role does not permit the command's class,
+   looked up by command ID `(wIndex & 0xFF00) | bRequest` and direction.
 5. `LOCKED` if another session holds the lock.
 6. `RATE_LIMITED` if the session already has `max_inflight` commands queued.
 7. `BUSY` (0x01) if a firmware update is in progress and the command is a
-   GET whose `wLength` exceeds 2048 bytes, half the UART's receive buffer
-   (section 14.2). The command has not run, so the client may retry.
+   GET whose `wLength` is 0 or exceeds 2048 bytes, half the UART's receive
+   buffer (section 14.2). A `wLength` of 0 asks the DSPi for its whole
+   reply, which may be the 6136-byte blob. The command has not run, so the
+   client may retry.
+
+A SET payload over 64 bytes answers `OVERSIZE` (0x06) before it is queued,
+except the `STORE.ALL_PARAMS` SET (0x0240), which goes to the bulk buffer.
+The bridge recognises that one command by its full ID, never by `bRequest`
+alone and never by the registry's `BULK` flag, which also covers the
+USB-only chunked command.
 
 Then the command joins the uart task's queue and its response returns to the
 session with the client's `tag`. The hub never interprets payloads.
 
 The one exception is the analyser STOP rule of Link spec 7.15. A session
-watches the analyser for 5 s after it reads bands or bins (0x0B, 0x0C, 0x0F)
-or sends `RTA_CTL_START`, and for as long as it holds a poll of one of those
-reads. A `REQ_RTA_CONTROL` STOP from a session that passed the checks above,
-while any other open session watches, is answered `OK` with `01` and never
-reaches the DSPi. The answer keeps its place in the session's reply order:
+watches the analyser for 5 s after it reads bands or bins (`MEAS.RTA_BANDS`
+0x0923, `MEAS.RTA_BINS` 0x0924, `MEAS.RTA_BANDS_ALL` 0x0926) or sends
+`MEAS.RTA_START` (0x0928), and for as long as it holds a poll of one of
+those reads. A `MEAS.RTA_STOP` (0x0929) from a session that passed the
+checks above, while any other open session watches, is answered `OK` with
+no payload and never reaches the DSPi. The answer keeps its place in the session's reply order:
 it waits for the session's earlier commands and counts toward
 `max_inflight` until sent. The check runs as the command is admitted, which
 is queue order. Closing a session ends its watching and sends nothing.
@@ -664,9 +696,8 @@ is queue order. Closing a session ends its watching and sends nothing.
 
 Every notification frame from the DSPi is relayed to every authenticated
 session as a NOTIFY frame (Link spec 8.3). For `origin`, the hub keeps a
-queue of the sessions that sent writes, in dispatch order: SETs, and GETs
-that `link_policy` classes as anything but *read* (write-as-read commands
-such as `REQ_RTA_CONTROL`). An entry's 1 s lifetime counts from when the
+queue of the sessions that sent writes, in dispatch order: every SET, and
+no GET, since a GET changes nothing. An entry's 1 s lifetime counts from when the
 uart task takes the write up, not from when it was queued, and a write the
 DSPi refuses leaves the queue at once, since it will cause no notification.
 A notification whose source byte is `HOST_SET`, `BULK_SET` or `UART` takes
@@ -685,7 +716,8 @@ with reason 0 to every session and marks the snapshot cache stale.
 
 Poll subscriptions follow Link spec 7.6. Identical polls (same `req`, `val`,
 `idx` and `len`) from several sessions run once, at the fastest rate any of
-them was granted, and fan out. Each session still receives answers only at
+them was granted, and fan out. A poll is admitted only for a GET classed
+*read*, looked up by the command ID in `idx` and `req`. Each session still receives answers only at
 its own granted rate. The hub stops polling as soon as no session
 subscribes.
 
@@ -693,12 +725,12 @@ subscribes.
 
 The hub keeps one cached bulk blob and refreshes it by re-reading, as Link
 spec 7.5 allows, rather than by patching. Any `PARAM_CHANGED` or
-`BULK_INVALIDATED` notification, and any write the hub forwards (a SET or a
-write-as-read GET), marks the cache stale. When the DSPi has
+`BULK_INVALIDATED` notification, and any SET the hub forwards, marks the
+cache stale. When the DSPi has
 `notify_enable` off, no notification can say what changed, so every
 snapshot re-reads the blob.
 
-Every `device.snapshot` request gets a fresh status read, plus a blob read
+Every `device.snapshot` request gets a fresh `MEAS.LEVELS` read (0x0910), plus a `STORE.ALL_PARAMS` read
 when the cache is stale, which takes about 61 ms at 1 Mbaud. A request that
 arrives while a status read is already under way waits for the next one,
 so its answer never predates it. The hub matches each read's answer to the
@@ -711,10 +743,11 @@ found, which gives `wire_version` for the device object.
 - Locks follow Link spec 7.7.
 - Device names follow the firmware's `Documentation/Features/device_name_spec.md`
   section 5.
-  - **Where the name lives.** Firmware that answers `REQ_GET_DEVICE_NAME`
-    (0x57) in full stores the board's own name, and the board is the only
-    authority for it. For older firmware the bridge saves names by serial,
-    for up to 8 devices. The default name is `DSPi` followed by the last 4
+  - **Where the name lives.** Every DSPi the bridge attaches stores its own
+    name (`SYS.DEVICE_NAME`, 0x0124), and the board is the only authority
+    for it. The bridge may still hold names it saved by serial, for up to 8
+    devices, from boards whose earlier firmware kept none; it uses them only
+    for adoption, below. The default name is `DSPi` followed by the last 4
     characters of the serial.
   - **The name shown.** Each time the device is found, new or returning, the
     `name` in the device object is the board's name if it is set, else the
@@ -726,24 +759,22 @@ found, which gives `wire_version` for the device object.
     default. It sends `device.changed` and refreshes DNS-SD when that changes
     the name. This is the only way the shown name of a name-keeping board
     changes, so a rename from any source is seen: `device.rename`, a raw
-    0x56 through CMD, the front panel or USB. The packet is relayed to
+    `SYS.DEVICE_NAME` SET through CMD, the front panel or USB. The packet is relayed to
     clients as usual.
-  - **`device.rename` on a name-keeping board.** The board must be online,
+  - **`device.rename`.** The board must be online,
     else `no_device`, because its own name would override a saved one when
     it returns. A lock held by another session answers `locked`. The name is
     reduced to what the board stores: printable ASCII (32 to 126) only, runs
     of spaces closed to one, no space at either end, at most 31 characters,
     so "Café ♫ Rack" becomes "Caf Rack". An empty result clears the name.
-    The hub sends `REQ_SET_DEVICE_NAME` (0x56) with the name zero-padded to
-    32 bytes as the requesting session, and replies `ok` once the board
-    answers OK. No answer or a busy board answers `busy`, an absent device
-    `no_device`, any other status `internal`. The reply does not change the
-    shown name; the 0x10 that follows does.
-  - **`device.rename` on older firmware** saves the name (1 to 63 bytes of
-    UTF-8) by serial, replies `ok` and sends `device.changed` itself.
+    The hub sends the `SYS.DEVICE_NAME` SET with the name zero-padded to 32
+    bytes as the requesting session, and replies `ok` once the board answers
+    OK. No answer or a busy board (`0x01`, `0x04` or `0x17`) answers `busy`,
+    an absent device `no_device`, any other status `internal`. The reply
+    does not change the shown name; the 0x10 that follows does.
   - **Adoption.** When a name-keeping board reports an empty name and the
     bridge has a saved name for it that is non-empty once reduced as above,
-    the hub writes it to the board with 0x56 at attach. The saved entry is
+    the hub writes it to the board with the `SYS.DEVICE_NAME` SET at attach. The saved entry is
     deleted as soon as the board accepts that write, so adoption runs at
     most once even if the confirming 0x10 is lost, and a later deliberate
     clear is never undone. The write restarts the board's outputs briefly,
@@ -759,6 +790,11 @@ found, which gives `wire_version` for the device object.
            "retries": 0}
 }
 ```
+
+When a DSPi answers but its firmware cannot be attached (section 7.6),
+`uart` also carries `"too_old": true` and, when the bridge could read it,
+`"fw": "1.1.6"`. Firmware too new for the bridge is reported as
+`"too_new": true`.
 
 ### 8.8 Discovery
 
@@ -941,6 +977,10 @@ POST /setup/v1/finish
 200  {}
 ```
 
+- `dspi.found` is false while no DSPi is attached. When a DSPi answers but
+  cannot be attached, `dspi` also carries `too_old` or `too_new` and, if
+  known, `fw`, exactly as `hub.stats` does (section 8.7), so the page can ask
+  for a firmware update instead of a wiring check.
 - `wifi.join` in `state` is `idle`, `connecting`, `connected` or `failed`;
   when `failed`, `wifi.failure` says why: `wrong_password`, `not_found` or
   `timed_out`. The setup page polls `state` once a second after `apply`.
@@ -1015,7 +1055,8 @@ Five short steps, one main button each.
 
 Sections in one scrolling screen, each with a heading and plain sentences:
 
-- **Status.** DSPi connection (found, serial, firmware, link health), Wi-Fi
+- **Status.** DSPi connection (found, serial, firmware, link health, or
+  "firmware too old: update it over USB with DSPi Console"), Wi-Fi
   network and signal, bridge firmware version and uptime.
 - **DSPi connection.** TX and RX pin pickers fed by `options`, a wiring
   diagram that redraws with the chosen pins, the baud rate with "Detect
