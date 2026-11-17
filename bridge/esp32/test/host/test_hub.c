@@ -17,6 +17,26 @@
 static fake_hub_io_t io_record;
 static hub_t hub;
 
+/* Firmware 1.1.7 commands the tests send, by 16-bit command ID. */
+#define SYS_PLATFORM 0x0120
+#define SYS_DEVICE_NAME 0x0124
+#define SYS_ENTER_BOOTLOADER 0x0130
+#define STORE_PRESET_LOAD 0x0211
+#define STORE_FACTORY_RESET 0x0230
+#define STORE_ALL_PARAMS 0x0240
+#define STORE_ALL_PARAMS_CHUNK 0x0241
+#define ROUTE_PREAMP 0x0540
+#define ROUTE_MASTER_VOLUME 0x0550
+#define ROUTE_OUTPUT_DELAY 0x0523
+#define MEAS_LEVELS 0x0910
+#define MEAS_RTA_CONFIG 0x0920
+#define MEAS_RTA_BANDS 0x0923
+#define MEAS_RTA_BINS 0x0924
+#define MEAS_RTA_START 0x0928
+#define MEAS_RTA_STOP 0x0929
+#define MEAS_RTA_RESET 0x092A
+#define CS_AUX_STATE 0x0A60
+
 static const dspi_identity_t IDENTITY = {
     .serial = "E46058388B1A2E2C",
     .platform = {0x01, 0x01, 0x17, 0x09, 0x01, 0x07, 0x02},
@@ -184,9 +204,10 @@ static void attach_device(void)
     forget_submissions();
 }
 
-/* Sends a CMD request frame. */
-static void send_cmd(int slot, uint16_t tag, bool is_get, uint8_t request, uint16_t length,
-                     const uint8_t *payload)
+/* Sends a CMD request frame for command `id` with `value` as wValue, as a
+ * client does: bRequest the low byte, wIndex the page and interface 2. */
+static void send_cmd_value(int slot, uint16_t tag, bool is_get, uint16_t id, uint16_t value,
+                           uint16_t length, const uint8_t *payload)
 {
     static uint8_t frame[LINK_CMD_REQUEST_HEADER_BYTES + LINK_MAX_PAYLOAD_BYTES];
     frame[0] = LINK_FRAME_CMD_REQUEST;
@@ -195,12 +216,12 @@ static void send_cmd(int slot, uint16_t tag, bool is_get, uint8_t request, uint1
     frame[3] = (uint8_t)(tag >> 8);
     frame[4] = 0; /* handle */
     frame[5] = is_get ? 1 : 0;
-    frame[6] = request;
+    frame[6] = (uint8_t)(id & 0xFF);
     frame[7] = 0;
-    frame[8] = 0;
-    frame[9] = 0;
+    frame[8] = (uint8_t)(value & 0xFF);
+    frame[9] = (uint8_t)(value >> 8);
     frame[10] = 2;
-    frame[11] = 0;
+    frame[11] = (uint8_t)(id >> 8);
     frame[12] = (uint8_t)(length & 0xFF);
     frame[13] = (uint8_t)(length >> 8);
     const size_t payload_length = is_get ? 0 : length;
@@ -208,6 +229,19 @@ static void send_cmd(int slot, uint16_t tag, bool is_get, uint8_t request, uint1
         memcpy(&frame[14], payload, payload_length);
     }
     hub_session_binary(&hub, slot, frame, LINK_CMD_REQUEST_HEADER_BYTES + payload_length);
+}
+
+/* Sends a CMD request frame for command `id` with wValue 0. */
+static void send_cmd(int slot, uint16_t tag, bool is_get, uint16_t id, uint16_t length,
+                     const uint8_t *payload)
+{
+    send_cmd_value(slot, tag, is_get, id, 0, length, payload);
+}
+
+/* The command ID a submission named. */
+static uint16_t submitted_id(const fake_submission_t *submission)
+{
+    return (uint16_t)((submission->request.index & 0xFF00) | submission->request.request);
 }
 
 /* The status byte of the last CMD response to `slot`, or -1. */
@@ -800,7 +834,7 @@ static void a_raw_name_write_claims_its_own_notification(void)
     const int writer = open_session(0);
     attach_device();
     uint8_t name[32] = "Desk";
-    send_cmd(0, 1, false, 0x56, sizeof(name), name);
+    send_cmd(0, 1, false, SYS_DEVICE_NAME, sizeof(name), name);
     answer_last(DSPI_STATUS_OK, NULL, 0);
     notify_name(1, 8 /* UART */, "Desk");
     CHECK(last_notify_origin(0) == writer);
@@ -820,11 +854,12 @@ static void a_get_goes_to_the_dspi_and_back(void)
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 77, true, 0x7F, 7, NULL);
+    send_cmd(0, 77, true, SYS_PLATFORM, 7, NULL);
 
     CHECK(io_record.submission_count == 1);
-    CHECK(io_record.submissions[0].request.request == 0x7F);
-    CHECK(io_record.submissions[0].may_retry); /* A read */
+    CHECK(io_record.submissions[0].request.request == 0x20);
+    CHECK(io_record.submissions[0].request.index == 0x0102); /* Page 1, interface 2 */
+    CHECK(io_record.submissions[0].may_retry);               /* A read */
 
     const uint8_t platform[7] = {1, 1, 0x17, 9, 1, 7, 2};
     answer_last(0, platform, 7);
@@ -834,20 +869,25 @@ static void a_get_goes_to_the_dspi_and_back(void)
     CHECK(memcmp(&response->data[8], platform, 7) == 0);
 }
 
-static void write_as_read_commands_are_never_retried(void)
+/* Every GET may be repeated after no answer, and no SET may (bridge spec
+ * 7.3): firmware 1.1.7 has no GET that changes anything. */
+static void every_get_and_no_set_is_retried(void)
 {
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x0E, 1, NULL); /* REQ_RTA_CONTROL */
+    send_cmd(0, 1, false, STORE_PRESET_LOAD, 0, NULL);
     CHECK(io_record.submission_count == 1 && !io_record.submissions[0].may_retry);
+    /* A read the 1.1.6 table classed by an unrelated old opcode. */
+    send_cmd(0, 2, true, 0x0421 /* OUTPUT.LATENCY_STATUS */, 12, NULL);
+    CHECK(io_record.submission_count == 2 && io_record.submissions[1].may_retry);
 }
 
 static void commands_without_a_device_are_refused(void)
 {
     start();
     open_session(0);
-    send_cmd(0, 3, true, 0x7F, 7, NULL);
+    send_cmd(0, 3, true, SYS_PLATFORM, 7, NULL);
     CHECK(last_status(0) == LINK_STATUS_NO_DEVICE);
     CHECK(io_record.submission_count == 0);
 }
@@ -858,10 +898,10 @@ static void too_many_commands_are_rate_limited(void)
     open_session(0);
     attach_device();
     for (uint16_t tag = 1; tag <= LINK_MAX_INFLIGHT; tag++) {
-        send_cmd(0, tag, true, 0x7F, 7, NULL);
+        send_cmd(0, tag, true, SYS_PLATFORM, 7, NULL);
     }
     CHECK(io_record.submission_count == LINK_MAX_INFLIGHT);
-    send_cmd(0, 99, true, 0x7F, 7, NULL);
+    send_cmd(0, 99, true, SYS_PLATFORM, 7, NULL);
     CHECK(last_status(0) == LINK_STATUS_RATE_LIMITED);
 }
 
@@ -871,12 +911,24 @@ static void long_sets_are_oversize_but_bulk_sets_go_through(void)
     open_session(0);
     attach_device();
     static uint8_t payload[6136];
-    send_cmd(0, 5, false, 0x3E, 65, payload); /* Not bulk, over 64 bytes */
+    send_cmd(0, 5, false, ROUTE_MASTER_VOLUME, 65, payload); /* Not bulk, over 64 bytes */
     CHECK(last_status(0) == DSPI_STATUS_OVERSIZE);
     CHECK(io_record.submission_count == 0);
 
+    /* Only STORE.ALL_PARAMS may pass the 64-byte cap, recognised by its full
+     * ID. None of these may reach the 64-byte payload of a pending entry:
+     * the USB-only chunked command, the same command number on another
+     * page, and the 1.1.6 bulk SET on page 0. */
+    const uint16_t not_bulk[] = {STORE_ALL_PARAMS_CHUNK, ROUTE_PREAMP, 0x00A1};
+    for (size_t i = 0; i < sizeof(not_bulk) / sizeof(not_bulk[0]); i++) {
+        send_cmd(0, (uint16_t)(10 + i), false, not_bulk[i], sizeof(payload), payload);
+        CHECK(last_status(0) == DSPI_STATUS_OVERSIZE);
+        CHECK(io_record.submission_count == 0);
+        CHECK(!hub.bulk_set_busy);
+    }
+
     payload[100] = 0x5A;
-    send_cmd(0, 6, false, 0xA1, sizeof(payload), payload); /* REQ_SET_ALL_PARAMS */
+    send_cmd(0, 6, false, STORE_ALL_PARAMS, sizeof(payload), payload);
     CHECK(io_record.submission_count == 1);
     CHECK(io_record.submissions[0].request.length == sizeof(payload));
     CHECK(io_record.submissions[0].payload[100] == 0x5A);
@@ -887,15 +939,15 @@ static void failures_map_to_link_statuses(void)
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x7F, 7, NULL);
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL);
     hub_reply(&hub, io_record.submissions[0].tag, &(dspi_reply_t){.kind = DSPI_REPLY_TIMEOUT});
     CHECK(last_status(0) == LINK_STATUS_TIMEOUT);
 
-    send_cmd(0, 2, true, 0x7F, 7, NULL);
+    send_cmd(0, 2, true, SYS_PLATFORM, 7, NULL);
     hub_reply(&hub, io_record.submissions[1].tag, &(dspi_reply_t){.kind = DSPI_REPLY_CORRUPT});
     CHECK(last_status(0) == LINK_STATUS_TIMEOUT); /* It may have run: never "retry" */
 
-    send_cmd(0, 3, true, 0x7F, 7, NULL);
+    send_cmd(0, 3, true, SYS_PLATFORM, 7, NULL);
     answer_last(DSPI_STATUS_BUSY, NULL, 0);
     CHECK(last_status(0) == DSPI_STATUS_BUSY);
 }
@@ -905,7 +957,7 @@ static void a_reply_for_a_closed_session_goes_nowhere(void)
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x7F, 7, NULL);
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL);
     hub_session_closed(&hub, 0);
     open_session(0); /* The slot is reused by someone else */
     forget_messages();
@@ -924,7 +976,7 @@ static void notifications_carry_the_writers_session(void)
     const int writer = open_session(0);
     open_session(1);
     attach_device();
-    send_cmd(0, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(0, 1, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     answer_last(0, NULL, 0);
     notify(1, 1 /* HOST_SET */);
 
@@ -971,8 +1023,9 @@ static void a_full_queue_owes_a_resync(void)
  * Polls (Link spec 7.6)
  * ------------------------------------------------------------------------- */
 
+/* MEAS.LEVELS (0x0910): command 16, wIndex 0x0902. */
 static const char *METER_POLL = "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":"
-                                "[{\"slot\":%d,\"req\":80,\"val\":9,\"idx\":2,\"len\":41,"
+                                "[{\"slot\":%d,\"req\":16,\"val\":0,\"idx\":2306,\"len\":41,"
                                 "\"hz\":10}]}";
 
 static void identical_polls_run_once_and_fan_out(void)
@@ -990,7 +1043,7 @@ static void identical_polls_run_once_and_fan_out(void)
 
     hub_tick(&hub);
     CHECK(io_record.submission_count == 1);
-    CHECK(io_record.submissions[0].request.request == 80);
+    CHECK(submitted_id(&io_record.submissions[0]) == MEAS_LEVELS);
     hub_tick(&hub); /* One poll at a time */
     CHECK(io_record.submission_count == 1);
 
@@ -1009,7 +1062,7 @@ static void a_slower_subscriber_gets_only_its_own_rate(void)
     open_session(1);
     attach_device();
     send_json(0, "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":"
-                 "[{\"slot\":0,\"req\":80,\"val\":9,\"idx\":2,\"len\":41,\"hz\":20}]}");
+                 "[{\"slot\":0,\"req\":16,\"val\":0,\"idx\":2306,\"len\":41,\"hz\":20}]}");
     send_json(1, METER_POLL, 0); /* The same poll at 10 Hz */
 
     static const uint8_t meters[41] = {7};
@@ -1036,7 +1089,7 @@ static void commands_go_before_polls(void)
     open_session(0);
     attach_device();
     send_json(0, METER_POLL, 0);
-    send_cmd(0, 1, true, 0x7F, 7, NULL);
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL);
     hub_tick(&hub);
     CHECK(io_record.submission_count == 1); /* Only the command */
 }
@@ -1058,9 +1111,17 @@ static void only_reads_may_be_polled(void)
     start();
     open_session(0);
     attach_device();
+    /* MEAS.RTA_STOP has no GET, so polling it is not a read. */
     send_json(0, "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":"
-                 "[{\"slot\":0,\"req\":14,\"val\":0,\"idx\":2,\"len\":1,\"hz\":10}]}");
+                 "[{\"slot\":0,\"req\":41,\"val\":0,\"idx\":2306,\"len\":1,\"hz\":10}]}");
     cJSON *err = last_json(0, "err");
+    CHECK(strcmp(json_string(err, "code"), "denied") == 0);
+    cJSON_Delete(err);
+
+    /* The 1.1.6 meter poll names page 0, which has no commands. */
+    send_json(0, "{\"t\":\"poll.subscribe\",\"id\":9,\"handle\":0,\"polls\":"
+                 "[{\"slot\":0,\"req\":80,\"val\":9,\"idx\":2,\"len\":41,\"hz\":10}]}");
+    err = last_json(0, "err");
     CHECK(strcmp(json_string(err, "code"), "denied") == 0);
     cJSON_Delete(err);
 }
@@ -1148,15 +1209,22 @@ static void without_notifications_every_snapshot_reads_the_blob(void)
     CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
 }
 
-static void write_as_read_commands_mark_the_cache_stale(void)
+static void a_set_marks_the_cache_stale_and_a_get_does_not(void)
 {
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x91 /* PRESET_LOAD, a GET that writes */, 1, NULL);
-    answer_last(0, (const uint8_t[]){0}, 1);
+    send_cmd(0, 1, true, MEAS_RTA_BANDS, 82, NULL);
+    answer_last(0, (const uint8_t[82]){0}, 82);
     forget_submissions();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
+    CHECK(io_record.submission_count == 1 && last_request() == 0x50); /* Status only */
+    answer_last(0, (const uint8_t[41]){0}, 41);
+
+    send_cmd(0, 2, false, STORE_PRESET_LOAD, 0, NULL);
+    answer_last(0, NULL, 0);
+    forget_submissions();
+    send_json(0, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
     CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
 }
 
@@ -1198,9 +1266,9 @@ static void a_lock_keeps_other_sessions_out(void)
     CHECK(json_number(ok, "timeout_ms") == 60000); /* Capped */
     cJSON_Delete(ok);
 
-    send_cmd(1, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(1, 1, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     CHECK(last_status(1) == LINK_STATUS_LOCKED);
-    send_cmd(0, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(0, 1, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     CHECK(io_record.submission_count == 1); /* The holder may write */
     CHECK(hub.device.locked_by == holder);
 
@@ -1646,8 +1714,8 @@ static void a_lost_answer_times_out_and_a_late_one_is_ignored(void)
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x7F, 7, NULL);
-    send_cmd(0, 2, true, 0x7F, 7, NULL);
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL);
+    send_cmd(0, 2, true, SYS_PLATFORM, 7, NULL);
     const uint32_t first = io_record.submissions[0].tag;
     const uint32_t second = io_record.submissions[1].tag;
 
@@ -1675,8 +1743,8 @@ static void an_unknown_answer_finishes_only_older_requests(void)
     start();
     open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x7F, 7, NULL);
-    send_cmd(0, 2, true, 0x7F, 7, NULL);
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL);
+    send_cmd(0, 2, true, SYS_PLATFORM, 7, NULL);
     const uint32_t second = io_record.submissions[1].tag;
 
     /* An answer for a tag before every pending one changes nothing. */
@@ -1692,16 +1760,17 @@ static void an_unknown_answer_finishes_only_older_requests(void)
 /* Subscribes `count` polls on `slot`, slots `first_slot` up, to distinct
  * keys starting at index `first_index` (or all to `first_index` when
  * `same` is set). */
-static void subscribe_polls(int slot, int first_slot, int count, int first_index, bool same)
+/* Subscribes `count` MEAS.LEVELS polls, told apart by wValue. */
+static void subscribe_polls(int slot, int first_slot, int count, int first_value, bool same)
 {
     char text[2048];
     size_t used = (size_t)snprintf(text, sizeof(text),
                                    "{\"t\":\"poll.subscribe\",\"id\":8,\"handle\":0,\"polls\":[");
     for (int i = 0; i < count; i++) {
         used += (size_t)snprintf(text + used, sizeof(text) - used,
-                                 "%s{\"slot\":%d,\"req\":80,\"val\":9,\"idx\":%d,\"len\":41,"
+                                 "%s{\"slot\":%d,\"req\":16,\"val\":%d,\"idx\":2306,\"len\":41,"
                                  "\"hz\":1}",
-                                 i > 0 ? "," : "", first_slot + i, first_index + (same ? 0 : i));
+                                 i > 0 ? "," : "", first_slot + i, first_value + (same ? 0 : i));
     }
     snprintf(text + used, sizeof(text) - used, "]}");
     hub_session_text(&hub, slot, text, strlen(text));
@@ -1724,7 +1793,7 @@ static void a_refused_subscription_changes_nothing(void)
     cJSON *err = last_json(1, "err");
     CHECK(strcmp(json_string(err, "code"), "busy") == 0);
     cJSON_Delete(err);
-    CHECK(hub.sessions[1].polls[0].active && hub.sessions[1].polls[0].key.index == 0);
+    CHECK(hub.sessions[1].polls[0].active && hub.sessions[1].polls[0].key.value == 0);
     CHECK(hub.poll_group_count == HUB_MAX_POLL_GROUPS);
 }
 
@@ -1749,10 +1818,13 @@ static void an_update_holds_back_large_answers_until_it_ends(void)
     send_json(1, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
     CHECK(io_record.submission_count == 0);                           /* So does the snapshot... */
     CHECK(last_json(1, "ok") == NULL && last_json(1, "err") == NULL); /* ...unanswered */
-    send_cmd(1, 5, true, 0xA0, 6136, NULL);
+    send_cmd(1, 5, true, STORE_ALL_PARAMS, 6136, NULL);
     CHECK(last_status(1) == DSPI_STATUS_BUSY); /* A large GET is not run */
     CHECK(io_record.submission_count == 0);
-    send_cmd(1, 6, true, 0x7F, 7, NULL);
+    send_cmd(1, 7, true, STORE_ALL_PARAMS, 0, NULL); /* 0: the whole reply */
+    CHECK(last_status(1) == DSPI_STATUS_BUSY);
+    CHECK(io_record.submission_count == 0);
+    send_cmd(1, 6, true, SYS_PLATFORM, 7, NULL);
     CHECK(io_record.submission_count == 1); /* A small one goes on */
     answer_last(0, (const uint8_t[]){1, 2, 3, 4, 5, 6, 7}, 7);
 
@@ -1923,21 +1995,21 @@ static void a_refused_write_claims_no_notification(void)
     open_session(0);
     const int second = open_session(1);
     attach_device();
-    send_cmd(0, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(0, 1, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     answer_last(2 /* ERROR: nothing changed */, NULL, 0);
-    send_cmd(1, 1, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(1, 1, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     answer_last(0, NULL, 0);
     notify(1, 1 /* HOST_SET */);
     CHECK(last_notify_origin(0) == second);
 }
 
-static void write_as_read_commands_are_attributed(void)
+static void actions_without_a_value_are_attributed(void)
 {
     start();
     const int loader = open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x91 /* PRESET_LOAD */, 1, NULL);
-    answer_last(0, (const uint8_t[]){0}, 1);
+    send_cmd(0, 1, false, STORE_PRESET_LOAD, 0, NULL);
+    answer_last(0, NULL, 0);
     notify(1, 1);
     CHECK(last_notify_origin(0) == loader);
 }
@@ -1947,9 +2019,9 @@ static void a_write_queued_behind_a_slow_one_keeps_its_window(void)
     start();
     const int writer = open_session(0);
     attach_device();
-    send_cmd(0, 1, true, 0x7F, 7, NULL); /* A read first */
+    send_cmd(0, 1, true, SYS_PLATFORM, 7, NULL); /* A read first */
     const uint32_t read = io_record.submissions[0].tag;
-    send_cmd(0, 2, false, 0xD2, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    send_cmd(0, 2, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
     const uint32_t write = io_record.submissions[1].tag;
     io_record.now_ms += 2 * LINK_ORIGIN_WINDOW_MS; /* The read takes its time */
     answer_tag(read, 0, (const uint8_t[]){1}, 1);
@@ -1960,53 +2032,52 @@ static void a_write_queued_behind_a_slow_one_keeps_its_window(void)
     CHECK(last_notify_origin(0) == writer);
 }
 
-static void subscribe_one(int slot, int poll_slot, int request, int value, int length, int hz)
+/* Subscribes one poll of command `id`. */
+static void subscribe_one(int slot, int poll_slot, uint16_t id, int value, int length, int hz)
 {
     send_json(slot,
               "{\"t\":\"poll.subscribe\",\"id\":30,\"handle\":0,\"polls\":[{\"slot\":%d,\"req\":%d,"
-              "\"val\":%d,\"idx\":2,\"len\":%d,\"hz\":%d}]}",
-              poll_slot, request, value, length, hz);
+              "\"val\":%d,\"idx\":%d,\"len\":%d,\"hz\":%d}]}",
+              poll_slot, id & 0xFF, value, (id & 0xFF00) | 2, length, hz);
 }
 
 /* ---------------------------------------------------------------------------
  * Analyser sharing (Link spec 7.15)
  * ------------------------------------------------------------------------- */
 
-/* Sends REQ_RTA_CONTROL (0x0E) with `control` as wValue, laid out as
- * send_cmd() lays out a GET. */
-static void send_rta_control_value(int slot, uint16_t tag, uint8_t control)
+/* Sends one of the analyser's zero-length SETs: MEAS.RTA_START, _STOP or
+ * _RESET. */
+static void send_rta(int slot, uint16_t tag, uint16_t id)
 {
-    const uint8_t frame[LINK_CMD_REQUEST_HEADER_BYTES] = {LINK_FRAME_CMD_REQUEST,
-                                                          0,
-                                                          (uint8_t)(tag & 0xFF),
-                                                          (uint8_t)(tag >> 8),
-                                                          0,
-                                                          1,
-                                                          0x0E,
-                                                          0,
-                                                          control,
-                                                          0,
-                                                          2,
-                                                          0,
-                                                          1,
-                                                          0};
-    hub_session_binary(&hub, slot, frame, sizeof(frame));
+    send_cmd(slot, tag, false, id, 0, NULL);
 }
 
-/* Whether the last CMD response to `slot` answers `tag` OK with the one-byte
- * ack, the answer a swallowed STOP gets. */
+/* The payload length of the n-th CMD response to `slot`, or -1. */
+static int response_length(int slot, size_t n)
+{
+    for (size_t i = 0; i < io_record.message_count; i++) {
+        const fake_message_t *m = &io_record.messages[i];
+        if (m->slot == slot && m->binary && m->data[0] == LINK_FRAME_CMD_RESPONSE && n-- == 0) {
+            return (int)m->length - LINK_CMD_RESPONSE_HEADER_BYTES;
+        }
+    }
+    return -1;
+}
+
+/* Whether the last CMD response to `slot` answers `tag` OK with no payload,
+ * the answer a SET gets and so the answer a swallowed STOP gets. */
 static bool answered_ack(int slot, uint16_t tag)
 {
     const fake_message_t *response = last_frame(slot, LINK_FRAME_CMD_RESPONSE);
     return response != NULL && response->data[4] == 0 &&
            (response->data[2] | response->data[3] << 8) == tag &&
-           response->length == LINK_CMD_RESPONSE_HEADER_BYTES + 1 &&
-           response->data[LINK_CMD_RESPONSE_HEADER_BYTES] == 0x01;
+           (response->data[6] | response->data[7] << 8) == 0 &&
+           response->length == LINK_CMD_RESPONSE_HEADER_BYTES;
 }
 
 static void read_bands(int slot, uint16_t tag)
 {
-    send_cmd(slot, tag, true, 0x0B, 82, NULL);
+    send_cmd(slot, tag, true, MEAS_RTA_BANDS, 82, NULL);
     static const uint8_t frame[82] = {0};
     answer_last(0, frame, sizeof(frame));
 }
@@ -2018,19 +2089,19 @@ static void a_stop_is_kept_from_the_device_while_another_session_watches(void)
     open_session(1);
     attach_device();
     read_bands(1, 1);
-    send_rta_control_value(0, 2, 1 /* START */);
-    answer_last(0, (const uint8_t[]){1}, 1);
+    send_rta(0, 2, MEAS_RTA_START);
+    answer_last(0, NULL, 0);
     forget_submissions();
 
-    send_rta_control_value(0, 3, 0 /* STOP */);
+    send_rta(0, 3, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 0);
     CHECK(answered_ack(0, 3));
 
     /* The first session stopped watching, so the second one's STOP goes through. */
-    send_rta_control_value(1, 4, 0);
+    send_rta(1, 4, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 1);
-    CHECK(io_record.submissions[0].request.request == 0x0E);
-    CHECK(io_record.submissions[0].request.value == 0);
+    CHECK(submitted_id(&io_record.submissions[0]) == MEAS_RTA_STOP);
+    CHECK(!io_record.submissions[0].request.is_get && io_record.submissions[0].request.length == 0);
 }
 
 static void a_stop_goes_through_once_the_other_watch_lapses(void)
@@ -2042,7 +2113,7 @@ static void a_stop_goes_through_once_the_other_watch_lapses(void)
     read_bands(1, 1);
     forget_submissions();
     io_record.now_ms += 5001; /* Past the firmware's own idle timeout */
-    send_rta_control_value(0, 2, 0);
+    send_rta(0, 2, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 1);
 }
 
@@ -2054,8 +2125,8 @@ static void start_and_reset_always_reach_the_device(void)
     attach_device();
     read_bands(1, 1);
     forget_submissions();
-    send_rta_control_value(0, 2, 1 /* START */);
-    send_rta_control_value(0, 3, 2 /* RESET_AVG */);
+    send_rta(0, 2, MEAS_RTA_START);
+    send_rta(0, 3, MEAS_RTA_RESET);
     CHECK(io_record.submission_count == 2);
 }
 
@@ -2065,16 +2136,16 @@ static void an_analyser_poll_counts_as_watching(void)
     open_session(0);
     open_session(1);
     attach_device();
-    subscribe_one(1, 0, 0x0B, 0, 82, 10);
+    subscribe_one(1, 0, MEAS_RTA_BANDS, 0, 82, 10);
     forget_submissions();
     io_record.now_ms += 10000; /* A poll watches however long ago it began */
-    send_rta_control_value(0, 2, 0);
+    send_rta(0, 2, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 0);
     CHECK(answered_ack(0, 2));
 
     send_json(1, "{\"t\":\"poll.unsubscribe\",\"id\":9,\"handle\":0,\"slots\":[0]}");
     forget_submissions();
-    send_rta_control_value(0, 3, 0);
+    send_rta(0, 3, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 1);
 }
 
@@ -2088,7 +2159,7 @@ static void a_closed_session_stops_watching_and_sends_nothing(void)
     forget_submissions();
     hub_session_closed(&hub, 1);
     CHECK(io_record.submission_count == 0); /* No STOP on its behalf */
-    send_rta_control_value(0, 2, 0);
+    send_rta(0, 2, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 1);
 }
 
@@ -2101,7 +2172,7 @@ static void a_viewer_cannot_stop_the_analyser(void)
     read_bands(1, 1); /* A watcher, so a swallow would answer OK */
     forget_submissions();
     hub.sessions[0].role = LINK_ROLE_VIEWER;
-    send_rta_control_value(0, 2, 0);
+    send_rta(0, 2, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 0);
     CHECK(last_status(0) == LINK_STATUS_DENIED);
 }
@@ -2112,11 +2183,11 @@ static void a_bins_read_counts_as_watching(void)
     open_session(0);
     open_session(1);
     attach_device();
-    send_cmd(1, 1, true, 0x0C /* RTA_GET_BINS */, 64, NULL);
+    send_cmd(1, 1, true, MEAS_RTA_BINS, 64, NULL);
     static const uint8_t bins[64] = {0};
     answer_last(0, bins, sizeof(bins));
     forget_submissions();
-    send_rta_control_value(0, 2, 0);
+    send_rta(0, 2, MEAS_RTA_STOP);
     CHECK(io_record.submission_count == 0);
     CHECK(answered_ack(0, 2));
 }
@@ -2152,9 +2223,9 @@ static void a_swallowed_stop_is_answered_in_the_order_sent(void)
     read_bands(1, 1);
     forget_submissions();
     const size_t before = response_count(0);
-    send_cmd(0, 7, true, 0x7F, 7, NULL); /* Still waiting for the DSPi */
-    send_rta_control_value(0, 8, 0);
-    send_rta_control_value(0, 9, 0);
+    send_cmd(0, 7, true, SYS_PLATFORM, 7, NULL); /* Still waiting for the DSPi */
+    send_rta(0, 8, MEAS_RTA_STOP);
+    send_rta(0, 9, MEAS_RTA_STOP);
     CHECK(response_count(0) == before); /* Neither STOP overtakes the read */
     CHECK(hub.sessions[0].commands_in_flight == 3);
 
@@ -2163,6 +2234,7 @@ static void a_swallowed_stop_is_answered_in_the_order_sent(void)
     CHECK(response_tag(0, before) == 7);
     CHECK(response_tag(0, before + 1) == 8);
     CHECK(response_tag(0, before + 2) == 9);
+    CHECK(response_length(0, before + 1) == 0 && response_length(0, before + 2) == 0);
     CHECK(hub.sessions[0].commands_in_flight == 0);
 }
 
@@ -2175,8 +2247,8 @@ static void a_held_stop_follows_a_lost_command_too(void)
     read_bands(1, 1);
     forget_submissions();
     const size_t before = response_count(0);
-    send_cmd(0, 7, true, 0x7F, 7, NULL);
-    send_rta_control_value(0, 8, 0);
+    send_cmd(0, 7, true, SYS_PLATFORM, 7, NULL);
+    send_rta(0, 8, MEAS_RTA_STOP);
     const dspi_reply_t lost = {.kind = DSPI_REPLY_TIMEOUT};
     hub_reply(&hub, io_record.submissions[0].tag, &lost);
     CHECK(response_count(0) == before + 2);
@@ -2196,12 +2268,65 @@ static void a_pending_rename_does_not_hold_a_stop(void)
     send_json(0, "{\"t\":\"device.rename\",\"id\":7,\"handle\":0,\"name\":\"Rack\"}");
     CHECK(hub.sessions[0].commands_in_flight == 1);
     /* A rename answers in JSON, so the STOP has no CMD to wait for. */
-    send_rta_control_value(0, 8, 0);
+    send_rta(0, 8, MEAS_RTA_STOP);
     CHECK(answered_ack(0, 8));
     CHECK(hub.sessions[0].commands_in_flight == 1);
     answer_last(DSPI_STATUS_OK, NULL, 0);
     CHECK(last_answer_id(0, "ok") == 7);
     CHECK(hub.sessions[0].commands_in_flight == 0);
+}
+
+/* Watching is told by full command ID: MEAS.RTA_BANDS is command 0x23 on
+ * page 0x09, and the same number on another page is not an analyser read. */
+static void an_analyser_command_number_on_another_page_is_not_watching(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    subscribe_one(1, 0, ROUTE_OUTPUT_DELAY, 0, 4, 10); /* Command 0x23 on page 0x05 */
+    send_cmd(1, 1, true, 0x0524 /* Command 0x24, like MEAS.RTA_BINS */, 1, NULL);
+    answer_last(0, (const uint8_t[]){0}, 1);
+    forget_submissions();
+    send_rta(0, 2, MEAS_RTA_STOP);
+    CHECK(io_record.submission_count == 1); /* Nobody watches: it reaches the DSPi */
+}
+
+/* Only a well-formed STOP is swallowed. Anything else goes to the DSPi,
+ * which refuses it, so the session learns why. */
+static void a_malformed_stop_is_never_swallowed(void)
+{
+    start();
+    open_session(0);
+    open_session(1);
+    attach_device();
+    read_bands(1, 1);
+    forget_submissions();
+    send_cmd_value(0, 2, false, MEAS_RTA_STOP, 1, 0, NULL); /* wValue 1 */
+    CHECK(io_record.submission_count == 1);
+    send_cmd(0, 3, false, MEAS_RTA_STOP, 1, (const uint8_t[]){0}); /* A payload */
+    CHECK(io_record.submission_count == 2);
+    send_cmd(0, 4, true, MEAS_RTA_STOP, 1, NULL); /* As a GET */
+    CHECK(io_record.submission_count == 3);
+}
+
+/* A control session must never reach the commands whose numbers belonged
+ * to a control-class opcode in firmware 1.1.6. */
+static void control_sessions_cannot_reset_or_reboot_the_dspi(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    hub.sessions[0].role = LINK_ROLE_CONTROL;
+    send_cmd(0, 1, false, SYS_ENTER_BOOTLOADER, 0, NULL);
+    CHECK(last_status(0) == LINK_STATUS_DENIED);
+    send_cmd(0, 2, false, STORE_FACTORY_RESET, 0, NULL);
+    CHECK(last_status(0) == LINK_STATUS_DENIED);
+    CHECK(io_record.submission_count == 0);
+
+    /* What a control user does need still goes through. */
+    send_cmd(0, 3, false, ROUTE_MASTER_VOLUME, 4, (const uint8_t[]){0, 0, 0xA0, 0xC1});
+    CHECK(io_record.submission_count == 1);
 }
 
 static void analyser_and_aux_events_are_attributed(void)
@@ -2211,21 +2336,21 @@ static void analyser_and_aux_events_are_attributed(void)
     const int writer = open_session(1);
     attach_device();
 
-    send_cmd(1, 1, false, 0x08 /* RTA_SET_CONFIG */, 12, (const uint8_t[12]){0});
+    send_cmd(1, 1, false, MEAS_RTA_CONFIG, 12, (const uint8_t[12]){0});
     answer_last(0, NULL, 0);
     uint8_t rta[17] = {0x02, 0x0D, 0x00, 1};
     rta[16] = 1; /* HOST_SET */
     hub_notification(&hub, rta, sizeof(rta));
     CHECK(last_notify_origin(0) == writer);
 
-    send_cmd(1, 2, false, 0x04 /* CS_AUX_STATE */, 1, (const uint8_t[]){1});
+    send_cmd(1, 2, false, CS_AUX_STATE, 1, (const uint8_t[]){1});
     answer_last(0, NULL, 0);
     const uint8_t aux[9] = {0x02, 0x0C, 0x00, 2, 0, 1, 0, 0, 1 /* HOST_SET */};
     hub_notification(&hub, aux, sizeof(aux));
     CHECK(last_notify_origin(0) == writer);
 
     /* A front-panel change is nobody's echo, and leaves the queue alone. */
-    send_cmd(1, 3, false, 0x04, 1, (const uint8_t[]){0});
+    send_cmd(1, 3, false, CS_AUX_STATE, 1, (const uint8_t[]){0});
     answer_last(0, NULL, 0);
     const uint8_t gpio[9] = {0x02, 0x0C, 0x00, 3, 0, 0, 0, 0, 5 /* GPIO */};
     hub_notification(&hub, gpio, sizeof(gpio));
@@ -2242,7 +2367,7 @@ static void the_poll_budget_is_shared_by_every_session(void)
     attach_device();
 
     /* One bulk-sized poll takes most of the 40,000 bytes a second. */
-    subscribe_one(0, 0, 0xA0, 0, 8192, 20);
+    subscribe_one(0, 0, STORE_ALL_PARAMS, 0, 8192, 20);
     cJSON *ok = last_json(0, "ok");
     const cJSON *grant = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(ok, "granted"), 0);
     const int granted = json_number(grant, "hz");
@@ -2251,7 +2376,7 @@ static void the_poll_budget_is_shared_by_every_session(void)
     cJSON_Delete(ok);
 
     /* Another session cannot add a second one on top, even at 1 Hz... */
-    subscribe_one(1, 0, 0xA0, 1, 8192, 1);
+    subscribe_one(1, 0, STORE_ALL_PARAMS, 1, 8192, 1);
     cJSON *err = last_json(1, "err");
     CHECK(strcmp(json_string(err, "code"), "busy") == 0);
     cJSON_Delete(err);
@@ -2259,7 +2384,7 @@ static void the_poll_budget_is_shared_by_every_session(void)
 
     /* ...but may share the one that runs, which costs nothing more. */
     forget_messages();
-    subscribe_one(1, 0, 0xA0, 0, 8192, 1);
+    subscribe_one(1, 0, STORE_ALL_PARAMS, 0, 8192, 1);
     ok = last_json(1, "ok");
     grant = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(ok, "granted"), 0);
     CHECK(json_number(grant, "hz") == 1);
@@ -2509,7 +2634,7 @@ void test_hub(void)
     RUN(a_pending_adoption_is_not_repeated_on_reattach);
     RUN(an_adoption_answer_after_a_board_swap_is_ignored);
     RUN(a_get_goes_to_the_dspi_and_back);
-    RUN(write_as_read_commands_are_never_retried);
+    RUN(every_get_and_no_set_is_retried);
     RUN(commands_without_a_device_are_refused);
     RUN(too_many_commands_are_rate_limited);
     RUN(long_sets_are_oversize_but_bulk_sets_go_through);
@@ -2526,7 +2651,7 @@ void test_hub(void)
     RUN(snapshots_read_the_status_fresh_and_the_blob_when_it_changed);
     RUN(a_snapshot_asked_during_a_status_read_waits_for_the_next);
     RUN(without_notifications_every_snapshot_reads_the_blob);
-    RUN(write_as_read_commands_mark_the_cache_stale);
+    RUN(a_set_marks_the_cache_stale_and_a_get_does_not);
     RUN(an_answer_for_an_abandoned_snapshot_read_is_ignored);
     RUN(a_lock_keeps_other_sessions_out);
     RUN(the_hub_can_be_renamed);
@@ -2555,7 +2680,7 @@ void test_hub(void)
     RUN(failures_the_io_reports_are_errors);
     RUN(a_failed_hash_keeps_the_pin_off);
     RUN(a_refused_write_claims_no_notification);
-    RUN(write_as_read_commands_are_attributed);
+    RUN(actions_without_a_value_are_attributed);
     RUN(a_write_queued_behind_a_slow_one_keeps_its_window);
     RUN(a_stop_is_kept_from_the_device_while_another_session_watches);
     RUN(a_stop_goes_through_once_the_other_watch_lapses);
@@ -2567,6 +2692,9 @@ void test_hub(void)
     RUN(a_swallowed_stop_is_answered_in_the_order_sent);
     RUN(a_held_stop_follows_a_lost_command_too);
     RUN(a_pending_rename_does_not_hold_a_stop);
+    RUN(an_analyser_command_number_on_another_page_is_not_watching);
+    RUN(a_malformed_stop_is_never_swallowed);
+    RUN(control_sessions_cannot_reset_or_reboot_the_dspi);
     RUN(analyser_and_aux_events_are_attributed);
     RUN(the_poll_budget_is_shared_by_every_session);
     RUN(client_names_are_kept_valid_utf8);

@@ -9,11 +9,7 @@ import { chipLabel } from "../firmware.js";
 import { statusLine, unusableFirmwareLine } from "../status.js";
 import { signalWords } from "../wifi.js";
 import { count, formatBaud, formatDuration } from "./fields.js";
-import {
-  readBridgeStats,
-  type BridgeStats,
-  type SectionContext,
-} from "./state.js";
+import { readBridgeStats, type BridgeStats, type SectionContext } from "./state.js";
 
 /**
  * Draws the Status section from the state.
@@ -23,19 +19,12 @@ import {
 export function drawStatus(context: SectionContext): void {
   const { state, options } = context;
   if (options.announce) {
-    context.add(
-      "status",
-      statusLine(options.announce.tone, options.announce.text),
-    );
+    context.add("status", statusLine(options.announce.tone, options.announce.text));
   }
   if (state.loadError) {
     context.add(
       "status",
-      statusLine(
-        "bad",
-        "Couldn't read the bridge's settings.",
-        state.loadError,
-      ),
+      statusLine("bad", "Couldn't read the bridge's settings.", state.loadError),
     );
     return;
   }
@@ -58,9 +47,7 @@ function deviceLine(context: SectionContext): HTMLElement {
   const firmware = device.fw
     ? `firmware ${device.fw}${device.fw_beta ? ` beta ${device.fw_beta}` : ""}`
     : null;
-  const detail = [`Serial ${device.serial}`, firmware]
-    .filter(Boolean)
-    .join(", ");
+  const detail = [`Serial ${device.serial}`, firmware].filter(Boolean).join(", ");
   return statusLine("good", "DSPi connected", detail);
 }
 
@@ -83,10 +70,7 @@ function facts(context: SectionContext): HTMLElement {
     list.append(el("dt", { text: term }), el("dd", { text: value }));
   };
   if (stats) {
-    fact(
-      "Link to the DSPi",
-      `${formatBaud(stats.uart.baud)} baud, ${linkHealth(stats.uart)}`,
-    );
+    fact("Link to the DSPi", `${formatBaud(stats.uart.baud)} baud, ${linkHealth(stats.uart)}`);
   }
   if (stats?.wifi.ssid) {
     const signal = `${signalWords(stats.wifi.rssi)} signal (${stats.wifi.rssi} dBm)`;

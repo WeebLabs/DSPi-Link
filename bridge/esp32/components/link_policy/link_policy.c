@@ -10,9 +10,23 @@
 
 #include "link_policy_table.h"
 
-link_class_t link_policy_class(uint8_t request, bool is_get)
+link_class_t link_policy_class(uint16_t id, bool is_get)
 {
-    return (link_class_t)LINK_POLICY_TABLE[request][is_get ? 1 : 0];
+    size_t low = 0;
+    size_t high = LINK_POLICY_TABLE_ROWS;
+    while (low < high) {
+        const size_t middle = low + (high - low) / 2;
+        const link_policy_row_t *row = &LINK_POLICY_TABLE[middle];
+        if (row->id == id) {
+            return (link_class_t)(is_get ? row->get_class : row->set_class);
+        }
+        if (row->id < id) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return LINK_CLASS_CONFIG; /* Not listed: admin only until classified */
 }
 
 bool link_policy_role_allows(link_role_t role, link_class_t class_)

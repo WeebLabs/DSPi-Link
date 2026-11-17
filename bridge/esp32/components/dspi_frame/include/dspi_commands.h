@@ -25,6 +25,17 @@
 /* SYS page */
 #define DSPI_CMD_SYS_PROTOCOL_INFO 0x0110 /* GET, 16 bytes: "DSPi", major, minor, ... */
 
+/* STORE page */
+#define DSPI_CMD_STORE_ALL_PARAMS 0x0240 /* GET or SET the whole bulk blob */
+
+/* MEAS page: the analyser commands a hub arbitrates (Link spec 7.15). The
+ * three reads are the registry's KEEPALIVE GETs: reading keeps it running. */
+#define DSPI_CMD_MEAS_RTA_BANDS 0x0923
+#define DSPI_CMD_MEAS_RTA_BINS 0x0924
+#define DSPI_CMD_MEAS_RTA_BANDS_ALL 0x0926
+#define DSPI_CMD_MEAS_RTA_START 0x0928 /* Zero-length SET */
+#define DSPI_CMD_MEAS_RTA_STOP 0x0929  /* Zero-length SET */
+
 /* SYS.PROTOCOL_INFO's reply: the magic, then the protocol major and minor. */
 #define DSPI_PROTOCOL_INFO_BYTES 16
 #define DSPI_PROTOCOL_MAJOR 1 /* The only major this bridge speaks */

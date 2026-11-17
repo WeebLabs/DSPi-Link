@@ -190,7 +190,9 @@ static int read_requests(hub_t *hub, int slot, int id, const cJSON *polls,
             hub_reply_error(hub, slot, id, "bad_request", problem);
             return 0;
         }
-        if (link_policy_class(requests[i].key.request, true) != LINK_CLASS_READ) {
+        const hub_poll_key_t *key = &requests[i].key;
+        if (link_policy_class(link_policy_command_id(key->request, key->index), true) !=
+            LINK_CLASS_READ) {
             hub_reply_error(hub, slot, id, "denied", "only commands classed read may be polled");
             return 0;
         }

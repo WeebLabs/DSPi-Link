@@ -717,8 +717,7 @@ void hub_device_name_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_
         hub_reply_ok(hub, work->slot, work->request_id, NULL);
     } else if (reply->kind == DSPI_REPLY_NO_DEVICE) {
         hub_reply_error(hub, work->slot, work->request_id, "no_device", NULL);
-    } else if (reply->kind != DSPI_REPLY_ANSWERED || reply->status == DSPI_STATUS_BUSY ||
-               reply->status == DSPI_STATUS_BULK_LOCKED) {
+    } else if (reply->kind != DSPI_REPLY_ANSWERED || dspi_status_is_busy(reply->status)) {
         hub_reply_error(hub, work->slot, work->request_id, "busy",
                         "the DSPi did not take the name; try again");
     } else {

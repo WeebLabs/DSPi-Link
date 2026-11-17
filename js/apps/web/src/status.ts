@@ -51,9 +51,7 @@ export interface UnusableFirmware {
  * @param dspi What the bridge reported.
  * @returns The line, or null when the firmware is fine or nothing answered.
  */
-export function unusableFirmwareLine(
-  dspi: UnusableFirmware | undefined,
-): HTMLElement | null {
+export function unusableFirmwareLine(dspi: UnusableFirmware | undefined): HTMLElement | null {
   if (dspi?.too_old) {
     const version = dspi.fw ? `It runs firmware ${dspi.fw}. ` : "";
     return statusLine(

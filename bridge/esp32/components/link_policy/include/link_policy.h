@@ -1,9 +1,10 @@
 /*
  * link_policy.h - which role may send which command (Link spec 6.3 and 9.3).
  *
- * The classes come from the shared policy/commands.json, turned into C by
- * tools/gen_policy.py. A command the table does not list is config, so a
- * new firmware command is admin-only until classified (Link spec 10.7).
+ * The classes come from the shared policy/commands.json, keyed by 16-bit
+ * command ID and turned into C by tools/gen_policy.py. A command the table
+ * does not list is config, so a new firmware command is admin-only until
+ * classified (Link spec 10.7).
  *
  * Portable: no ESP-IDF headers. Every function only reads constant data, so
  * any task may call them; on the bridge it is the hub task.
@@ -30,9 +31,18 @@ typedef enum {
     LINK_ROLE_ADMIN,
 } link_role_t;
 
-/* The class of `request` sent in one direction, from the generated table
- * (link_policy_table.h, private to this component). */
-link_class_t link_policy_class(uint8_t request, bool is_get);
+/* The class of command `id`, (page << 8) | command, sent in one direction,
+ * from the generated table (link_policy_table.h, private to this
+ * component). Never call it with a bRequest alone: different pages reuse
+ * the same command numbers. */
+link_class_t link_policy_class(uint16_t id, bool is_get);
+
+/* The command ID a request names: the page from the high byte of wIndex and
+ * the command number from bRequest (Link spec 8.2). */
+static inline uint16_t link_policy_command_id(uint8_t request, uint16_t index)
+{
+    return (uint16_t)((index & 0xFF00) | request);
+}
 
 /* True when `role` may send a command of `class_`: a viewer reads, control
  * also controls, and admin may do anything. */

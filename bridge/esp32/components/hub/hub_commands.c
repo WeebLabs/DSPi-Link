@@ -13,11 +13,8 @@
 
 #include <string.h>
 
+#include "dspi_commands.h"
 #include "hub_internal.h"
-
-/* REQ_SET_ALL_PARAMS: the bulk SET, which the UART carries in one frame and
- * the firmware accepts above the 64-byte limit for other SETs. */
-#define REQ_SET_ALL_PARAMS 0xA1
 
 /* Notification sources that a Link client's write produces (Link spec 8.3):
  * HOST_SET, BULK_SET and UART. */
@@ -25,14 +22,6 @@
 #define SOURCE_BULK_SET 2
 #define SOURCE_UART 8
 
-/* The analyser commands a hub arbitrates between sessions (Link spec 7.15). */
-#define REQ_RTA_GET_BANDS 0x0B
-#define REQ_RTA_GET_BINS 0x0C
-#define REQ_RTA_CONTROL 0x0E
-#define REQ_RTA_GET_BANDS_ALL 0x0F
-#define RTA_CTL_STOP 0
-#define RTA_CTL_START 1
-#define RTA_STOP_ACK 0x01 /* What the DSPi answers to any RTA_CONTROL */
 /* The firmware's own idle timeout, so a swallowed STOP never keeps the
  * analyser running longer than an unread one would. */
 #define RTA_WATCH_WINDOW_MS 5000
@@ -233,6 +222,17 @@ static void respond(hub_t *hub, int slot, uint16_t tag, uint8_t status, const ui
     (void)hub_send_binary(hub, slot, hub->frame, frame_length);
 }
 
+/* The STORE.ALL_PARAMS SET, the one SET the UART carries above 64 bytes,
+ * into the hub's bulk buffer. Recognised by its full command ID only: the
+ * same command number on another page is an ordinary SET, and the registry's
+ * BULK flag also covers the USB-only chunked command (bridge spec 8.3). The
+ * payload cap and the buffer routing both ask this, so they cannot differ. */
+static bool is_bulk_set(const link_cmd_request_t *command)
+{
+    return !command->is_get &&
+           link_policy_command_id(command->request, command->index) == DSPI_CMD_STORE_ALL_PARAMS;
+}
+
 /* The checks of bridge spec 8.3, in order. Returns the status to answer
  * with, or DSPI_STATUS_OK if the command may go to the DSPi. */
 static uint8_t admission_status(const hub_t *hub, const hub_session_t *session,
@@ -253,17 +253,19 @@ static uint8_t admission_status(const hub_t *hub, const hub_session_t *session,
     if (session->commands_in_flight >= LINK_MAX_INFLIGHT) {
         return LINK_STATUS_RATE_LIMITED;
     }
-    if (command->is_get && command->length > HUB_UPDATE_MAX_GET_BYTES &&
+    /* A GET of length 0 asks for the whole reply, which may be the bulk
+     * blob, so it waits too (bridge spec 8.3). */
+    if (command->is_get && (command->length == 0 || command->length > HUB_UPDATE_MAX_GET_BYTES) &&
         hub_update_in_progress(hub)) {
         return DSPI_STATUS_BUSY; /* Not run; retry once the update is over */
     }
-    if (!command->is_get && command->request != REQ_SET_ALL_PARAMS &&
+    if (!command->is_get && !is_bulk_set(command) &&
         command->length > DSPI_UART_MAX_SET_PAYLOAD_BYTES) {
         /* The firmware refuses this on its UART (Link spec 9.2); answer as
          * it would, without spending the link on it. */
         return DSPI_STATUS_OVERSIZE;
     }
-    if (!command->is_get && command->request == REQ_SET_ALL_PARAMS && hub->bulk_set_busy) {
+    if (is_bulk_set(command) && hub->bulk_set_busy) {
         return LINK_STATUS_RATE_LIMITED; /* The one bulk SET buffer is in use */
     }
     return DSPI_STATUS_OK;
@@ -272,23 +274,25 @@ static uint8_t admission_status(const hub_t *hub, const hub_session_t *session,
 /* Queues an admitted command for the uart task. Returns DSPI_STATUS_OK once
  * it is on its way, or the status to answer with now. */
 static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
-                               const link_cmd_request_t *command, link_class_t class_)
+                               const link_cmd_request_t *command)
 {
     hub_pending_t *entry = reserve_pending(hub);
     if (entry == NULL) {
         return LINK_STATUS_RATE_LIMITED;
     }
-    const bool is_bulk_set = !command->is_get && command->request == REQ_SET_ALL_PARAMS;
+    const bool bulk = is_bulk_set(command);
     entry->kind = HUB_WORK_CLIENT_COMMAND;
     entry->slot = slot;
     entry->session_id = session->id;
     entry->client_tag = command->tag;
-    /* A write-as-read GET changes the device too (Link spec 6.3). */
-    entry->writes = !command->is_get || class_ != LINK_CLASS_READ;
-    entry->is_bulk_set = is_bulk_set;
+    /* Every change is a SET; a GET never changes the device (Link spec 6.3). */
+    entry->writes = !command->is_get;
+    entry->is_bulk_set = bulk;
 
-    /* Where the SET payload lives until the uart task has sent it. */
-    uint8_t *payload_store = is_bulk_set ? hub->bulk_set_buffer : entry->payload;
+    /* Where the SET payload lives until the uart task has sent it. Only the
+     * bulk SET may exceed the entry's own buffer, and admission_status() has
+     * refused every other SET that would. */
+    uint8_t *payload_store = bulk ? hub->bulk_set_buffer : entry->payload;
     if (command->payload != NULL) {
         memcpy(payload_store, command->payload, command->length);
     }
@@ -300,9 +304,8 @@ static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
         .length = command->length,
         .payload = command->is_get ? NULL : payload_store,
     };
-    /* Only a read is safe to repeat after no answer (bridge spec 7.3). */
-    const bool may_retry = command->is_get && class_ == LINK_CLASS_READ;
-    if (!hub->io.submit(hub->io.context, &request, may_retry, entry->tag)) {
+    /* Only a GET is safe to repeat after no answer (bridge spec 7.3). */
+    if (!hub->io.submit(hub->io.context, &request, command->is_get, entry->tag)) {
         return LINK_STATUS_RATE_LIMITED;
     }
 
@@ -312,14 +315,15 @@ static uint8_t enqueue_command(hub_t *hub, int slot, hub_session_t *session,
     commit_pending(hub);
     session->commands_in_flight++;
     hub->client_commands_pending++;
-    hub->bulk_set_busy = hub->bulk_set_busy || is_bulk_set;
+    hub->bulk_set_busy = hub->bulk_set_busy || bulk;
     return DSPI_STATUS_OK;
 }
 
-static bool is_rta_read(uint8_t request)
+/* A GET of analyser bands or bins, which keeps the analyser running. */
+static bool is_rta_read(uint16_t id)
 {
-    return request == REQ_RTA_GET_BANDS || request == REQ_RTA_GET_BINS ||
-           request == REQ_RTA_GET_BANDS_ALL;
+    return id == DSPI_CMD_MEAS_RTA_BANDS || id == DSPI_CMD_MEAS_RTA_BINS ||
+           id == DSPI_CMD_MEAS_RTA_BANDS_ALL;
 }
 
 static bool session_watches_rta(hub_session_t *session, uint32_t now)
@@ -331,7 +335,9 @@ static bool session_watches_rta(hub_session_t *session, uint32_t now)
         return true;
     }
     for (size_t p = 0; p < HUB_POLL_SLOTS; p++) {
-        if (session->polls[p].active && is_rta_read(session->polls[p].key.request)) {
+        const hub_poll_key_t *key = &session->polls[p].key;
+        if (session->polls[p].active &&
+            is_rta_read(link_policy_command_id(key->request, key->index))) {
             return true;
         }
     }
@@ -344,17 +350,17 @@ static bool session_watches_rta(hub_session_t *session, uint32_t now)
 static bool rta_stop_swallowed(hub_t *hub, hub_session_t *session,
                                const link_cmd_request_t *command)
 {
-    const bool control = command->request == REQ_RTA_CONTROL;
-    if (!command->is_get || (!control && !is_rta_read(command->request))) {
-        return false;
-    }
+    const uint16_t id = link_policy_command_id(command->request, command->index);
     const uint32_t now = hub_now(hub);
-    if (!control || command->value == RTA_CTL_START) {
+    if ((command->is_get && is_rta_read(id)) ||
+        (!command->is_get && id == DSPI_CMD_MEAS_RTA_START)) {
         session->rta_watching = true;
         session->rta_watched_ms = now;
         return false;
     }
-    if (command->value != RTA_CTL_STOP) {
+    /* Only a well-formed STOP is swallowed; the DSPi refuses any other. */
+    if (command->is_get || id != DSPI_CMD_MEAS_RTA_STOP || command->value != 0 ||
+        command->length != 0) {
         return false;
     }
     session->rta_watching = false;
@@ -389,8 +395,7 @@ static void answer_swallowed_stop(hub_t *hub, int slot, hub_session_t *session, 
 {
     const uint32_t after_tag = newest_queued_command(hub, slot, session->id);
     if (after_tag == 0) {
-        const uint8_t ack = RTA_STOP_ACK;
-        respond(hub, slot, client_tag, DSPI_STATUS_OK, &ack, sizeof(ack));
+        respond(hub, slot, client_tag, DSPI_STATUS_OK, NULL, 0); /* A SET's answer: no payload */
         return;
     }
     hub_deferred_ack_t *deferred = &session->deferred_acks[session->deferred_ack_count++];
@@ -402,12 +407,10 @@ static void answer_swallowed_stop(hub_t *hub, int slot, hub_session_t *session, 
 /* Sends the swallowed STOPs that were waiting for the command `tag`. */
 static void release_deferred_acks(hub_t *hub, int slot, hub_session_t *session, uint32_t tag)
 {
-    const uint8_t ack = RTA_STOP_ACK;
     size_t released = 0;
     while (released < session->deferred_ack_count &&
            session->deferred_acks[released].after_tag == tag) {
-        respond(hub, slot, session->deferred_acks[released].client_tag, DSPI_STATUS_OK, &ack,
-                sizeof(ack));
+        respond(hub, slot, session->deferred_acks[released].client_tag, DSPI_STATUS_OK, NULL, 0);
         released++;
     }
     if (released == 0) {
@@ -431,14 +434,15 @@ void hub_commands_handle_frame(hub_t *hub, int slot, const uint8_t *data, size_t
         return;
     }
 
-    const link_class_t class_ = link_policy_class(command.request, command.is_get);
+    const link_class_t class_ =
+        link_policy_class(link_policy_command_id(command.request, command.index), command.is_get);
     uint8_t status = admission_status(hub, session, &command, class_);
     if (status == DSPI_STATUS_OK && rta_stop_swallowed(hub, session, &command)) {
         answer_swallowed_stop(hub, slot, session, command.tag);
         return;
     }
     if (status == DSPI_STATUS_OK) {
-        status = enqueue_command(hub, slot, session, &command, class_);
+        status = enqueue_command(hub, slot, session, &command);
     }
     if (status != DSPI_STATUS_OK) {
         respond(hub, slot, command.tag, status, NULL, 0);

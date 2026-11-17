@@ -1,6 +1,8 @@
 /*
  * Structural checks on policy/commands.json (Link spec 9.3). Every hub embeds
  * this file, so a malformed row is an authorization bug in every implementation.
+ * The bridge's tools/gen_policy.py --check also compares it with the firmware
+ * registry in policy/firmware/.
  */
 
 import { readFileSync } from "node:fs";
@@ -12,66 +14,99 @@ type Dir = "set" | "get";
 type Cls = "read" | "control" | "config";
 
 interface Row {
-  code: number;
+  id: number;
   name: string;
-  dirs: Dir[];
-  class: Cls;
-  classes?: Partial<Record<Dir, Cls>>;
+  classes: Partial<Record<Dir, Cls>>;
   note?: string;
 }
 
 const table = JSON.parse(readFileSync(join(FIXTURES, "..", "policy", "commands.json"), "utf8")) as {
   spec_version: string;
-  generated: string;
   commands: Row[];
 };
 
-const RANK: Record<Cls, number> = { read: 0, control: 1, config: 2 };
-
-function classOf(row: Row, dir: Dir): Cls {
-  return row.classes?.[dir] ?? row.class;
+function byName(name: string): Row {
+  const row = table.commands.find((r) => r.name === name);
+  if (!row) throw new Error(`${name} is not in the table`);
+  return row;
 }
 
 describe("policy table", () => {
-  it("is spec 1.1", () => {
-    expect(table.spec_version).toBe("1.1");
+  it("is spec 1.3", () => {
+    expect(table.spec_version).toBe("1.3");
   });
 
-  it("lists each bRequest once, in ascending order", () => {
-    const codes = table.commands.map((r) => r.code);
-    expect(codes.every((c) => Number.isInteger(c) && c >= 0 && c <= 255)).toBe(true);
-    for (let i = 1; i < codes.length; i++) expect(codes[i]).toBeGreaterThan(codes[i - 1]);
+  it("lists each command ID once, in ascending order, with a page above 0", () => {
+    const ids = table.commands.map((r) => r.id);
+    expect(ids.every((id) => Number.isInteger(id) && id >= 0x0100 && id <= 0xffff)).toBe(true);
+    for (let i = 1; i < ids.length; i++) expect(ids[i]).toBeGreaterThan(ids[i - 1]);
   });
 
-  it("gives every row a name, valid directions and a valid class", () => {
+  it("gives every row a PAGE.NAME, at least one direction and valid classes", () => {
     for (const row of table.commands) {
-      expect(row.name, `code ${row.code}`).toMatch(/^[A-Z0-9_]+$/);
-      expect(row.dirs.length, row.name).toBeGreaterThan(0);
-      expect(new Set(row.dirs).size, row.name).toBe(row.dirs.length);
-      for (const d of row.dirs) expect(["set", "get"], row.name).toContain(d);
-      expect(RANK[row.class], row.name).toBeDefined();
+      expect(row.name, `id ${row.id}`).toMatch(/^[A-Z]+\.[A-Z0-9_]+$/);
+      const dirs = Object.keys(row.classes);
+      expect(dirs.length, row.name).toBeGreaterThan(0);
+      for (const d of dirs) expect(["set", "get"], row.name).toContain(d);
+      for (const c of Object.values(row.classes)) {
+        expect(["read", "control", "config"], row.name).toContain(c);
+      }
     }
   });
 
-  it("covers exactly the listed directions in `classes`, with `class` as the strictest", () => {
-    for (const row of table.commands.filter((r) => r.classes)) {
-      expect(Object.keys(row.classes!).sort(), row.name).toEqual([...row.dirs].sort());
-      const ranks = row.dirs.map((d) => RANK[classOf(row, d)]);
-      expect(ranks.every((r) => r !== undefined), row.name).toBe(true);
-      expect(RANK[row.class], row.name).toBe(Math.max(...ranks));
+  it("classes every GET as read, since a GET never changes the device", () => {
+    for (const row of table.commands.filter((r) => r.classes.get)) {
+      expect(row.classes.get, row.name).toBe("read");
     }
   });
 
   it("never classes a SET as read, so a viewer can never write", () => {
-    for (const row of table.commands.filter((r) => r.dirs.includes("set"))) {
-      expect(classOf(row, "set"), row.name).not.toBe("read");
+    for (const row of table.commands.filter((r) => r.classes.set)) {
+      expect(row.classes.set, row.name).not.toBe("read");
     }
   });
 
   it("lets a viewer read the limiter but not change it", () => {
-    const limiter = table.commands.find((r) => r.code === 0x81)!;
-    expect(limiter.name).toBe("LIMITER");
-    expect(classOf(limiter, "set")).toBe("control");
-    expect(classOf(limiter, "get")).toBe("read");
+    const threshold = byName("DYN.LIMITER_THRESHOLD");
+    expect(threshold.id).toBe(0x0711);
+    expect(threshold.classes).toEqual({ get: "read", set: "control" });
+  });
+
+  // Each of these shares its command number with a control-class 1.1.6
+  // opcode, so a table keyed by bRequest alone would let any control
+  // session run it (firmware migration guide 13.3.8).
+  it.each([
+    ["SYS.ENTER_BOOTLOADER", 0x0130],
+    ["STORE.FACTORY_RESET", 0x0230],
+    ["STORE.STARTUP", 0x0216],
+    ["INPUT.I2S_RX_PIN", 0x0330],
+    ["INPUT.I2S_RX_RATE", 0x0332],
+    ["INPUT.ADAT_RX_CLOCK_MODE", 0x0342],
+    ["OUTPUT.TYPE", 0x0410],
+    ["OUTPUT.ADAT_TX_ENABLE", 0x0430],
+    ["CS.SAVE", 0x0a18],
+    ["CS.IR_CMD", 0x0a30],
+    ["CS.IR_LEARN_ARM", 0x0a32],
+    ["CS.DISPLAY_CONFIG", 0x0a70],
+    ["XPORT.UART_CONFIG", 0x0b10],
+    ["CLOCK.I2S_BCK_PIN", 0x0c10],
+    ["CLOCK.I2S_CLOCK_MODE", 0x0c12],
+  ])("keeps %s admin-only", (name, id) => {
+    const row = byName(name);
+    expect(row.id).toBe(id);
+    expect(row.classes.set).toBe("config");
+  });
+
+  it("lets a control user send what Link's own clients send", () => {
+    for (const name of [
+      "ROUTE.MASTER_VOLUME",
+      "SYS.DEVICE_NAME",
+      "STORE.ALL_PARAMS",
+      "MEAS.RTA_CONFIG",
+      "MEAS.RTA_START",
+      "MEAS.RTA_STOP",
+    ]) {
+      expect(byName(name).classes.set, name).toBe("control");
+    }
   });
 });
