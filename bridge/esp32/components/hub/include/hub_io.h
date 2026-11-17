@@ -86,11 +86,10 @@ typedef struct {
      * spec 7.13). Called once every session has been told. */
     void (*restart)(void *context, hub_restart_level_t level);
 
-    /* Saves, loads and deletes device names by serial (bridge spec 8.7).
-     * save returns false, having logged why, when the name could not be
-     * saved; load returns false when no name is saved. forget does nothing
-     * when none is, and logs a failure, since the hub can do no more. */
-    bool (*save_device_name)(void *context, const char *serial, const char *name);
+    /* Loads and deletes device names saved by serial (bridge spec 8.7),
+     * which the hub only adopts onto boards now: load returns false when
+     * no name is saved. forget does nothing when none is, and logs a
+     * failure, since the hub can do no more. */
     bool (*load_device_name)(void *context, const char *serial, char *name, size_t size);
     void (*forget_device_name)(void *context, const char *serial);
 

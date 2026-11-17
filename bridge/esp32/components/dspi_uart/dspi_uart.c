@@ -419,15 +419,29 @@ static void look_for_device(void)
         return;
     }
 
-    /* Firmware 1.1.7 or later answered. Until the bridge's own reads are
-     * readdressed to its paged commands, nothing is attached. */
-    if (!uart_task_state.firmware_warned) {
-        ESP_LOGW(TAG,
-                 "A DSPi with protocol %u.%u answered at %lu baud; this build cannot attach it",
-                 probe.protocol_major, probe.protocol_minor, (unsigned long)dspi_link_baud(link));
-        uart_task_state.firmware_warned = true;
+    publish_status(); /* The rate may have changed */
+
+    dspi_identity_t identity;
+    if (!dspi_link_read_identity(link, &identity)) {
+        if (!uart_task_state.identity_warned) {
+            ESP_LOGW(TAG, "A DSPi answered at %lu baud but its identity could not be read",
+                     (unsigned long)dspi_link_baud(link));
+            uart_task_state.identity_warned = true;
+        }
+        return;
     }
+    identity.protocol_major = probe.protocol_major;
+    identity.protocol_minor = probe.protocol_minor;
+
+    uart_task_state.identity = identity;
+    uart_task_state.device_present = true;
+    uart_task_state.identity_warned = false;
     publish_status();
+    ESP_LOGI(TAG, "Found DSPi %s at %lu baud, protocol %u.%u", identity.serial,
+             (unsigned long)dspi_link_baud(link), identity.protocol_major, identity.protocol_minor);
+    if (config->handlers.device_found != NULL) {
+        config->handlers.device_found(config->handlers.context, &identity, dspi_link_baud(link));
+    }
 }
 
 static void check_still_present(void)

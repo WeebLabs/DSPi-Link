@@ -56,7 +56,7 @@ still to do.
 The front panel firmware's timeout recovery (`DSPi-ESP32-Front-Panel`,
 `dspiRecoverAfterTimeout`) is a useful reference, but the code is written
 fresh to these standards, with a receive buffer sized for 132-byte replies
-and 6136-byte bulk reads.
+(256 since the firmware 1.1.7 port) and 6136-byte bulk reads.
 
 **Done when** the bridge finds a real DSPi, reads its serial, platform and
 bulk blob, and logs notifications while the DSPi is changed from Console,
@@ -378,6 +378,27 @@ the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
   setup journey on an Android phone, DSPi Console against the PIN, and
   marking the specs implemented once every chip passes.
 
+## Firmware 1.1.7 port (2026-11-17)
+
+DSPi firmware 1.1.7 addresses each vendor command by a page and a command
+number. Link 1.3 and this bridge follow it, in the order the firmware's
+migration guide (section 13.3) sets, so that no commit attaches a device
+whose generation the policy table does not describe:
+
+- Specs: Link 1.3 and the bridge spec name the paged commands, add
+  `policy.denied_ids` and the device `protocol` field, and open status
+  0x08 to 0x7F to the firmware's result codes.
+- Probe: `SYS.PROTOCOL_INFO`, which tells firmware 1.1.6 (refused, with an
+  update message on both pages) from 1.1.7.
+- Policy: `policy/commands.json` keyed by command ID, checked against the
+  firmware registry in `policy/firmware/`; the hub's bulk, analyser, write
+  and retry rules keyed on command IDs.
+- Attach: identity, heartbeat, name and snapshot reads on the paged
+  commands; replies up to 256 bytes; the TypeScript library and web app
+  send command IDs.
+- Left: the bench run of section 8 against 1.1.7 on RP2040 and RP2350, a
+  1.1.6 board refused with the update message, and DSPi Console's hub.
+
 ---
 
 ## Work outside this repository
@@ -386,6 +407,10 @@ These belong to DSPi Console and are listed so nothing is forgotten:
 
 - Default `auth` to `none` (Link spec 6.1).
 - Word the PIN prompt from `pin_source` (Link spec 6.2).
+- Link 1.3: classify by command ID with the new `policy/commands.json`,
+  probe with `SYS.PROTOCOL_INFO` and forward nothing to legacy devices,
+  report `protocol`, send `policy.denied_ids`, and explain a STALL with
+  `SYS.LAST_RESULT` (Link spec 7.4, 9.1).
 
 ## Decisions (2026-10-18)
 

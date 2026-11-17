@@ -22,8 +22,8 @@ static void decodes_the_set_master_volume_request(void)
     CHECK(request.tag == 7);
     CHECK(request.handle == 0);
     CHECK(!request.is_get);
-    CHECK(request.request == 0xD2);
-    CHECK(request.value == 0 && request.index == 2 && request.length == 4);
+    CHECK(request.request == 0x50); /* ROUTE.MASTER_VOLUME, 0x0550 */
+    CHECK(request.value == 0 && request.index == 0x0502 && request.length == 4);
     const uint8_t volume[] = {0x00, 0x00, 0xA0, 0xC1};
     CHECK(memcmp(request.payload, volume, 4) == 0);
 }
@@ -35,7 +35,8 @@ static void decodes_the_get_platform_request(void)
     link_cmd_request_t request;
     CHECK(link_decode_cmd_request(fixture, length, &request));
     CHECK(request.tag == 8 && request.handle == 1 && request.is_get);
-    CHECK(request.request == 0x7F && request.length == 7);
+    CHECK(request.request == 0x20 && request.index == 0x0102); /* SYS.PLATFORM */
+    CHECK(request.length == 7);
     CHECK(request.payload == NULL);
 }
 

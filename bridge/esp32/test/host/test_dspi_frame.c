@@ -23,13 +23,14 @@ static void crc_matches_the_reference_check_value(void)
 
 static void set_request_matches_the_firmware_example(void)
 {
-    /* control_interfaces_spec.md 6.1: master volume to -20 dB. */
+    /* control_interfaces_spec.md: ROUTE.MASTER_VOLUME (0x0550) to -20 dB,
+     * the page in wIdxH. */
     const uint8_t volume[] = {0x00, 0x00, 0xA0, 0xC1};
     const dspi_request_t request = {
         .is_get = false,
-        .request = 0xD2,
+        .request = 0x50,
         .value = 0,
-        .index = 0,
+        .index = 0x0500,
         .length = 4,
         .payload = volume,
     };
@@ -37,9 +38,22 @@ static void set_request_matches_the_firmware_example(void)
     uint8_t crc[DSPI_FRAME_CRC_BYTES];
     dspi_frame_encode_request(&request, header, crc);
 
-    const uint8_t expected_header[] = {0xA5, 0x01, 0xD2, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00};
+    const uint8_t expected_header[] = {0xA5, 0x01, 0x50, 0x00, 0x00, 0x00, 0x05, 0x04, 0x00};
     CHECK(memcmp(header, expected_header, sizeof(expected_header)) == 0);
-    CHECK(crc[0] == 0xCF && crc[1] == 0x6D);
+    CHECK(crc[0] == 0x71 && crc[1] == 0x3D);
+}
+
+/* Migration guide 13.3.4: the bridge's probe, SYS.PROTOCOL_INFO (0x0110). */
+static void the_probe_matches_the_firmware_example(void)
+{
+    const dspi_request_t request = {.is_get = true, .request = 0x10, .index = 0x0100, .length = 16};
+    uint8_t header[DSPI_FRAME_REQUEST_HEADER_BYTES];
+    uint8_t crc[DSPI_FRAME_CRC_BYTES];
+    dspi_frame_encode_request(&request, header, crc);
+
+    const uint8_t expected_header[] = {0xA5, 0x02, 0x10, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00};
+    CHECK(memcmp(header, expected_header, sizeof(expected_header)) == 0);
+    CHECK(crc[0] == 0xA0 && crc[1] == 0xBD);
 }
 
 static void get_request_has_no_payload_in_its_crc(void)
@@ -370,6 +384,7 @@ void test_dspi_frame(void)
 {
     RUN(crc_matches_the_reference_check_value);
     RUN(set_request_matches_the_firmware_example);
+    RUN(the_probe_matches_the_firmware_example);
     RUN(get_request_has_no_payload_in_its_crc);
     RUN(parses_a_get_response);
     RUN(parses_an_empty_set_response_and_a_notification);

@@ -1,21 +1,21 @@
 /*
  * The device page's master volume: a slider and a mute button.
  *
- * Reads and writes are REQ_GET/SET_MASTER_VOLUME (0xD3/0xD2) tunnelled as CMD
- * frames (Link spec 8.2), exactly as over USB. Writes while dragging are
+ * Reads and writes are ROUTE.MASTER_VOLUME (0x0550) GETs and SETs tunnelled as
+ * CMD frames (Link spec 8.2), exactly as over USB. Writes while dragging are
  * throttled, and the last value of a burst always reaches the device.
  */
 
-import { LinkClient, LinkStatus, MASTER_VOLUME_MUTE_DB } from "@dspi/link";
+import {
+  Command,
+  LinkClient,
+  LinkStatus,
+  MASTER_VOLUME_MUTE_DB,
+  isRetryableStatus,
+  statusName,
+} from "@dspi/link";
 import { el } from "../dom.js";
 import { describeProblem } from "../problems.js";
-
-/** REQ_SET_MASTER_VOLUME. */
-export const REQ_SET_MASTER_VOLUME = 0xd2;
-/** REQ_GET_MASTER_VOLUME. */
-export const REQ_GET_MASTER_VOLUME = 0xd3;
-/** wIndex for application commands (Link spec 8.2). */
-export const APP_WINDEX = 2;
 
 /** The slider's range; below it is the firmware's mute sentinel. */
 const VOLUME_MIN_DB = -127;
@@ -79,7 +79,7 @@ export function createVolumeControl(
   const writer = createThrottledWriter((db) => {
     if (disposed) return;
     client
-      .set(handle, REQ_SET_MASTER_VOLUME, floatBytes(db), 0, APP_WINDEX)
+      .set(handle, Command.ROUTE_MASTER_VOLUME, floatBytes(db))
       .then((response) => {
         if (response.status !== LinkStatus.OK) onProblem(refusal(response.status));
       })
@@ -144,7 +144,7 @@ export function createVolumeControl(
  * @returns The level in dB, or null when the device did not answer OK.
  */
 export async function readDeviceVolume(client: LinkClient, handle: number): Promise<number | null> {
-  const response = await client.get(handle, REQ_GET_MASTER_VOLUME, FLOAT32_BYTES, 0, APP_WINDEX);
+  const response = await client.get(handle, Command.ROUTE_MASTER_VOLUME, FLOAT32_BYTES);
   if (response.status !== LinkStatus.OK || response.payload.length < FLOAT32_BYTES) return null;
   return readFloat(response.payload);
 }
@@ -165,17 +165,17 @@ function floatBytes(value: number): Uint8Array {
 
 /** Why the device refused a volume write, in words. */
 function refusal(status: number): string {
-  switch (status) {
-    case LinkStatus.LOCKED:
-      return "Another app is applying changes to this DSPi. Try again in a moment.";
-    case LinkStatus.DENIED:
-      return "This browser can watch this DSPi but not change its volume.";
-    case LinkStatus.BUSY:
-    case LinkStatus.TIMEOUT:
-      return "The DSPi didn't answer in time. Try again.";
-    default:
-      return "The DSPi didn't accept the volume change.";
+  if (status === LinkStatus.LOCKED) {
+    return "Another app is applying changes to this DSPi. Try again in a moment.";
   }
+  if (status === LinkStatus.DENIED) {
+    return "This browser can watch this DSPi but not change its volume.";
+  }
+  if (status === LinkStatus.TIMEOUT || isRetryableStatus(status)) {
+    return "The DSPi didn't answer in time. Try again.";
+  }
+  console.warn(`device: the volume change was refused: ${statusName(status)}`);
+  return "The DSPi didn't accept the volume change.";
 }
 
 /** A trailing throttle: at most one write per interval, and the last value always goes. */

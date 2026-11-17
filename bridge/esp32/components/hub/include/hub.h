@@ -102,7 +102,7 @@ typedef enum {
     HUB_WORK_POLL,
     HUB_WORK_SNAPSHOT_BULK,
     HUB_WORK_SNAPSHOT_STATUS,
-    HUB_WORK_DEVICE_NAME, /* REQ_SET_DEVICE_NAME, for device.rename or adoption */
+    HUB_WORK_DEVICE_NAME, /* SYS.DEVICE_NAME SET, for device.rename or adoption */
 } hub_work_kind_t;
 
 /* One request waiting for the uart task. The uart task answers in order,

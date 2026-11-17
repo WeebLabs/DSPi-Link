@@ -148,7 +148,8 @@ typedef enum {
 
 /* Reads the serial number to check the device is still there, and is still
  * the one whose serial is `serial` (bridge spec 7.6). A busy answer means
- * the same device. Any other refusal means a device that does not know the
+ * the same device, and a damaged frame twice over is no answer. Any other
+ * refusal means a device that does not know the
  * read, such as older firmware swapped in, so it counts as another device
  * and the next probe classifies it. */
 dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial);
@@ -208,28 +209,31 @@ void dspi_platform_version(const uint8_t *platform, size_t length, char *out, si
  * Returns the bytes read into `platform` (DSPI_PLATFORM_BYTES), or -1. */
 int dspi_link_read_legacy_platform(dspi_link_t *link, uint8_t *platform);
 
-/* Characters in a DSPi serial number: REQ_GET_SERIAL returns 16 bytes. */
+/* Characters in a DSPi serial number: SYS.SERIAL returns 16 bytes. */
 #define DSPI_SERIAL_MAX_CHARS 16
 
-/* REQ_GET_DEVICE_NAME's reply: up to 31 characters and a NUL. */
+/* SYS.DEVICE_NAME's reply: up to 31 characters and a NUL. */
 #define DSPI_DEVICE_NAME_BYTES 32
 
 /* What the bridge reads from a device when it appears (bridge spec 7.6). */
 typedef struct {
-    char serial[DSPI_SERIAL_MAX_CHARS + 1]; /* REQ_GET_SERIAL (0x7E), NUL-terminated */
-    uint8_t platform[7];                    /* REQ_GET_PLATFORM (0x7F), as returned */
-    uint8_t platform_length;                /* 7 on current firmware, fewer on old */
-    bool uart_live;                         /* REQ_GET_CTRL_IFACE_STATUS (0xF9) byte 1 */
-    bool notify_enabled;                    /* REQ_GET_UART_CONFIG (0xF6) byte 3 */
-    uint32_t configured_baud;               /* REQ_GET_UART_CONFIG bytes 4 to 7 */
-    bool has_uart_config; /* False if 0xF6 failed; the two fields above are then unknown */
-    bool has_board_name;  /* REQ_GET_DEVICE_NAME (0x57) answered in full: the board keeps a name */
-    char board_name[DSPI_DEVICE_NAME_BYTES]; /* That name, NUL-terminated; empty when unnamed */
+    char serial[DSPI_SERIAL_MAX_CHARS + 1]; /* SYS.SERIAL, NUL-terminated */
+    uint8_t platform[DSPI_PLATFORM_BYTES];  /* SYS.PLATFORM, as returned */
+    uint8_t platform_length;                /* Always DSPI_PLATFORM_BYTES once read */
+    bool uart_live;                         /* XPORT.STATUS byte 1 */
+    bool notify_enabled;                    /* XPORT.UART_CONFIG byte 3 */
+    uint32_t configured_baud;               /* XPORT.UART_CONFIG bytes 4 to 7 */
+    bool has_uart_config; /* False if that read failed; the two fields above are then unknown */
+    char board_name[DSPI_DEVICE_NAME_BYTES]; /* SYS.DEVICE_NAME, NUL-terminated; empty when unnamed
+                                              */
+    uint8_t protocol_major;                  /* From the probe, SYS.PROTOCOL_INFO bytes 4 and 5 */
+    uint8_t protocol_minor;
 } dspi_identity_t;
 
 /* Reads the serial, platform, interface status, UART configuration and the
- * board's own name. Returns false if the serial or platform could not be
- * read. */
+ * board's own name with the paged commands of firmware 1.1.7. Call it only
+ * after the probe found protocol 1. Returns false if the serial, platform or
+ * name could not be read. */
 bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity);
 
 #endif /* DSPI_LINK_H */

@@ -24,12 +24,20 @@
 
 /* SYS page */
 #define DSPI_CMD_SYS_PROTOCOL_INFO 0x0110 /* GET, 16 bytes: "DSPi", major, minor, ... */
+#define DSPI_CMD_SYS_PLATFORM 0x0120      /* GET, 7 bytes, the 1.1.6 layout */
+#define DSPI_CMD_SYS_SERIAL 0x0121        /* GET, 16 bytes */
+#define DSPI_CMD_SYS_DEVICE_NAME 0x0124   /* GET 32 bytes, or SET 1 to 32 */
 
 /* STORE page */
 #define DSPI_CMD_STORE_ALL_PARAMS 0x0240 /* GET or SET the whole bulk blob */
 
+/* ROUTE and XPORT pages */
+#define DSPI_CMD_XPORT_UART_CONFIG 0x0B10 /* GET 8 bytes; the SET is USB only */
+#define DSPI_CMD_XPORT_STATUS 0x0B12      /* GET, 8 bytes */
+
 /* MEAS page: the analyser commands a hub arbitrates (Link spec 7.15). The
  * three reads are the registry's KEEPALIVE GETs: reading keeps it running. */
+#define DSPI_CMD_MEAS_LEVELS 0x0910 /* GET, 2 x channels + 7 bytes: the meter frame */
 #define DSPI_CMD_MEAS_RTA_BANDS 0x0923
 #define DSPI_CMD_MEAS_RTA_BINS 0x0924
 #define DSPI_CMD_MEAS_RTA_BANDS_ALL 0x0926

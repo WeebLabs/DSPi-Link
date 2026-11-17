@@ -60,7 +60,6 @@ typedef struct {
     int restart_level; /* -1 until restart is called */
     char saved_device_serial[17];
     char saved_device_name[64];
-    bool refuse_save_name; /* Make save_device_name fail */
     unsigned forget_count; /* forget_device_name calls that deleted a saved name */
     unsigned advertise_count;
 

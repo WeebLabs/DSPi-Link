@@ -426,42 +426,6 @@ esp_err_t settings_load_device_name(const char *serial, char *name, size_t size)
     return ESP_ERR_NOT_FOUND;
 }
 
-esp_err_t settings_save_device_name(const char *serial, const char *name)
-{
-    if (!settings_name_is_valid(name)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(DEVICES_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    saved_device_name_t names[LINK_MAX_DEVICE_NAMES];
-    size_t count = 0;
-    err = read_device_names(nvs, names, &count);
-    if (err == ESP_OK) {
-        /* Put this device first; drop its old entry, and the last entry if
-         * the list is full. */
-        saved_device_name_t updated[LINK_MAX_DEVICE_NAMES];
-        memset(updated, 0, sizeof(updated));
-        snprintf(updated[0].serial, sizeof(updated[0].serial), "%s", serial);
-        snprintf(updated[0].name, sizeof(updated[0].name), "%s", name);
-        size_t kept = 1;
-        for (size_t i = 0; i < count && kept < LINK_MAX_DEVICE_NAMES; i++) {
-            if (strncmp(names[i].serial, serial, sizeof(names[i].serial)) != 0) {
-                updated[kept++] = names[i];
-            }
-        }
-        err = nvs_set_blob(nvs, KEY_DEVICE_NAMES, updated, kept * sizeof(saved_device_name_t));
-    }
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs);
-    }
-    nvs_close(nvs);
-    return err;
-}
-
 esp_err_t settings_forget_device_name(const char *serial)
 {
     /* Checked read-only first, since opening for writing creates the

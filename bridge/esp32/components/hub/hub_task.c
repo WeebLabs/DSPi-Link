@@ -797,17 +797,6 @@ static uint32_t auth_now_ms(void *context)
     return now_ms();
 }
 
-static bool io_save_device_name(void *context, const char *serial, const char *name)
-{
-    (void)context;
-    const esp_err_t err = settings_save_device_name(serial, name);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Could not save the name of %s: %s", serial, esp_err_to_name(err));
-        return false;
-    }
-    return true;
-}
-
 static bool io_load_device_name(void *context, const char *serial, char *name, size_t size)
 {
     (void)context;
@@ -1098,7 +1087,6 @@ static hub_io_t hub_io_functions(void)
         .start_wifi_scan = io_start_wifi_scan,
         .wifi_join = io_wifi_join,
         .restart = io_restart,
-        .save_device_name = io_save_device_name,
         .load_device_name = io_load_device_name,
         .forget_device_name = io_forget_device_name,
         .advertise = io_advertise,

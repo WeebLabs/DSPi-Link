@@ -1,8 +1,9 @@
 /*
- * dspi-link: a TypeScript client for the DSPi Link protocol (Link spec 1.2).
+ * dspi-link: a TypeScript client for the DSPi Link protocol (Link spec 1.3).
  *
  * The package's one entry point. Each module is usable on its own:
  *   constants.ts  the port, paths and versions, defined once
+ *   commands.ts   firmware command IDs and how a CMD frame carries them
  *   frames.ts     binary data plane, Link spec 8
  *   messages.ts   JSON control plane, Link spec 7
  *   errors.ts     the errors the client rejects with
@@ -15,6 +16,7 @@
  */
 
 export * from "./constants.js";
+export * from "./commands.js";
 export * from "./frames.js";
 export * from "./messages.js";
 export { LinkCommandError, LinkProtocolError } from "./errors.js";
@@ -22,10 +24,4 @@ export * from "./decoders.js";
 export * from "./base64.js";
 export * from "./client.js";
 export { sha256, sha256Hex } from "./sha256.js";
-export {
-  type HubInfo,
-  fetchHubInfo,
-  infoUrl,
-  parseHostInput,
-  webSocketUrl,
-} from "./discovery.js";
+export { type HubInfo, fetchHubInfo, infoUrl, parseHostInput, webSocketUrl } from "./discovery.js";

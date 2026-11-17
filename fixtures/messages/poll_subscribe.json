@@ -4,17 +4,17 @@
   "polls" : [
     {
       "hz" : 10,
-      "idx" : 2,
+      "idx" : 2306,
       "len" : 41,
-      "req" : 80,
+      "req" : 16,
       "slot" : 0,
-      "val" : 9
+      "val" : 0
     },
     {
       "hz" : 15,
-      "idx" : 2,
+      "idx" : 2306,
       "len" : 82,
-      "req" : 11,
+      "req" : 35,
       "slot" : 1,
       "val" : 3
     }

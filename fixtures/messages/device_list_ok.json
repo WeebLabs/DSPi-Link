@@ -9,6 +9,10 @@
       "name" : "Living room",
       "outputs" : 9,
       "platform" : 1,
+      "protocol" : {
+        "major" : 1,
+        "minor" : 0
+      },
       "serial" : "E46058388B1A2E2C",
       "state" : "online",
       "wire_version" : 32

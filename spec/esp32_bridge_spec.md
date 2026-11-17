@@ -2,7 +2,7 @@
 
 *Version: 1.0 (draft)*
 *Implements: DSPi Link protocol 1.3 (`spec/dspi_link_protocol_spec.md`), against DSPi firmware 1.1.7 or later*
-*Status: draft; no implementation yet. `bridge/esp32/PLAN.md` gives the build order.*
+*Status: draft; implemented in `bridge/esp32`, whose `PLAN.md` gives the state of each part.*
 *Last updated: 2026-11-17*
 
 The ESP32 bridge is the reference implementation of a DSPi Link bridge hub.
@@ -1111,7 +1111,7 @@ default.
 | `bridge` | `schema` (u8), `hid`, `name`, `hostname`, `uart_tx`, `uart_rx`, `uart_baud`, `uart_detect`, `led_type`, `led_pin` | factory reset |
 | `wifi` | `network` (one blob: the name and password, always written together; the older separate `ssid` and `password` keys are read only when it is missing, and erased at the next save) | network or factory reset |
 | `auth` | `store` (one blob: a layout number, then whether the PIN is on, its hash and salt, and up to 16 records of token hash, name, created and last seen) | factory reset |
-| `devices` | `names` (blob: up to 8 records of serial and name, for boards whose firmware keeps no name of its own; an entry is deleted once its board holds a name, section 8.7) | factory reset |
+| `devices` | `names` (blob: up to 8 records of serial and name, saved by bridge firmware 0.1.0 for boards whose firmware then kept no name; now only read, to adopt onto the board once, and deleted once its board holds a name, section 8.7) | factory reset |
 
 - The bridge stores Wi-Fi credentials itself and keeps ESP-IDF's own copy in
   RAM only (`WIFI_STORAGE_RAM`), so forgetting a network is one explicit

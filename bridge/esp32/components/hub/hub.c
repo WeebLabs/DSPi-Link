@@ -14,7 +14,7 @@
 
 /* The protocol version this hub speaks (Link spec 10). */
 #define PROTOCOL_MAJOR 1
-#define PROTOCOL_MINOR 2
+#define PROTOCOL_MINOR 3
 
 /* An `id` of -1 means the request carried none, so replies leave it out. */
 #define NO_ID (-1)
@@ -455,7 +455,10 @@ static void reply_authenticated(hub_t *hub, int slot, int id, const char *token)
         cJSON_AddStringToObject(body, "token", token);
     }
     cJSON *policy = cJSON_AddObjectToObject(body, "policy");
-    cJSON_AddArrayToObject(policy, "denied"); /* Admin is denied nothing */
+    /* Admin is denied nothing. `denied` is the 1.2 field, always empty now
+     * (Link spec 7.3). */
+    cJSON_AddArrayToObject(policy, "denied");
+    cJSON_AddArrayToObject(policy, "denied_ids");
     hub_reply_ok(hub, slot, id, body);
 }
 

@@ -53,6 +53,10 @@ ground wire is still needed.
 
 ### 2. Turn on the DSPi's UART
 
+The bridge needs DSPi firmware 1.1.7 or later; update the DSPi in DSPi
+Console first if it runs anything older. Bridge firmware 0.1.0 is the last
+release that works with firmware 1.1.6.
+
 The DSPi accepts this setting only over USB, so set it once in DSPi Console
 with the DSPi plugged in. The DSPi keeps it, even through its own factory
 reset.
@@ -141,6 +145,10 @@ DSPi's UART control interface is off (step 2), TX and RX are swapped, the
 ground wire is missing, or the DSPi's UART was moved to other pins in
 Console. A wrong baud rate fixes itself: the bridge searches the usual rates
 when the DSPi does not answer.
+
+**"DSPi firmware too old".** The DSPi answers but runs firmware 1.1.6 or
+older, whose commands the bridge does not speak. Update it over USB with
+DSPi Console; the bridge finds it within a few seconds of it coming back.
 
 **"Notifications are off".** Turn on Notifications in DSPi Console's UART
 settings. The bridge works without them, but changes made elsewhere show up

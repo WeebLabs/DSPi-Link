@@ -14,14 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dspi_commands.h"
 #include "hub_internal.h"
 #include "link_base64.h"
-
-/* Commands the hub sends for itself (firmware commands.md). */
-#define REQ_GET_STATUS 0x50
-#define REQ_GET_ALL_PARAMS 0xA0
-#define REQ_SET_DEVICE_NAME 0x56
-#define STATUS_COMBINED_FRAME 9 /* REQ_GET_STATUS wValue for the meter frame */
 
 /* The v2 notification packet (notification_protocol_v2_spec.md). */
 #define PACKET_VERSION_2 2
@@ -93,6 +88,9 @@ cJSON *hub_device_json(const hub_t *hub)
     if (device->identity.platform_length >= 7) {
         cJSON_AddNumberToObject(object, "fw_beta", device->identity.platform[6]);
     }
+    cJSON *protocol = cJSON_AddObjectToObject(object, "protocol"); /* Link spec 7.4 */
+    cJSON_AddNumberToObject(protocol, "major", device->identity.protocol_major);
+    cJSON_AddNumberToObject(protocol, "minor", device->identity.protocol_minor);
     cJSON_AddNumberToObject(object, "outputs", device->identity.platform[3]);
     if (device->header_known) {
         cJSON_AddNumberToObject(object, "inputs", device->inputs);
@@ -184,7 +182,7 @@ static void default_name(const hub_t *hub, char *out, size_t size)
     snprintf(out, size, "DSPi %s", tail);
 }
 
-/* The board's own name, or the default when it has none. A raw 0x56 can
+/* The board's own name, or the default when it has none. A raw SYS.DEVICE_NAME SET can
  * store any bytes, so the copy is made valid UTF-8 for JSON. */
 static void board_or_default_name(const hub_t *hub, char *out, size_t size)
 {
@@ -202,7 +200,7 @@ static void board_or_default_name(const hub_t *hub, char *out, size_t size)
 static void resolve_name(hub_t *hub, char *out, size_t size)
 {
     const dspi_identity_t *identity = &hub->device.identity;
-    if (identity->has_board_name && identity->board_name[0] != '\0') {
+    if (identity->board_name[0] != '\0') {
         hub->io.forget_device_name(hub->io.context, identity->serial);
         board_or_default_name(hub, out, size);
     } else if (!hub->io.load_device_name(hub->io.context, identity->serial, out, size)) {
@@ -237,7 +235,7 @@ static void clean_board_name(const char *name, char out[DSPI_DEVICE_NAME_BYTES])
     out[length] = '\0';
 }
 
-/* Queues REQ_SET_DEVICE_NAME with `name` zero-padded to the full field, for
+/* Queues the SYS.DEVICE_NAME SET with `name` zero-padded to the full field, for
  * the session on `slot` (-1 for the hub). Returns its tag, or 0. */
 static uint32_t submit_name_write(hub_t *hub, const char name[DSPI_DEVICE_NAME_BYTES], int slot,
                                   uint16_t session_id, int request_id)
@@ -246,7 +244,8 @@ static uint32_t submit_name_write(hub_t *hub, const char name[DSPI_DEVICE_NAME_B
     memcpy(payload, name, strlen(name));
     const dspi_request_t write = {
         .is_get = false,
-        .request = REQ_SET_DEVICE_NAME,
+        .request = DSPI_CMD_REQUEST(DSPI_CMD_SYS_DEVICE_NAME),
+        .index = DSPI_CMD_INDEX(DSPI_CMD_SYS_DEVICE_NAME),
         .length = sizeof(payload),
         .payload = payload,
     };
@@ -259,9 +258,8 @@ static uint32_t submit_name_write(hub_t *hub, const char name[DSPI_DEVICE_NAME_B
 static void adopt_stored_name(hub_t *hub)
 {
     hub_device_t *device = &hub->device;
-    if (!device->identity.has_board_name || device->identity.board_name[0] != '\0' ||
-        device->adoption_tag != 0) {
-        return; /* Named already, old firmware, or the last attach's write is still out */
+    if (device->identity.board_name[0] != '\0' || device->adoption_tag != 0) {
+        return; /* Named already, or the last attach's write is still out */
     }
     char stored[SETTINGS_NAME_MAX_BYTES + 1];
     if (!hub->io.load_device_name(hub->io.context, device->identity.serial, stored,
@@ -379,7 +377,6 @@ static int packet_source(const uint8_t *packet, size_t length)
 static void note_board_name(hub_t *hub, const uint8_t *name)
 {
     hub_device_t *device = &hub->device;
-    device->identity.has_board_name = true;
     memcpy(device->identity.board_name, name, DSPI_DEVICE_NAME_BYTES);
     device->identity.board_name[DSPI_DEVICE_NAME_BYTES - 1] = '\0';
     hub->io.forget_device_name(hub->io.context, device->identity.serial);
@@ -458,8 +455,8 @@ static uint32_t submit_status_read(hub_t *hub)
     /* The meter frame is 2 x channels + 7 bytes (Link spec 7.6). */
     const dspi_request_t status_read = {
         .is_get = true,
-        .request = REQ_GET_STATUS,
-        .value = STATUS_COMBINED_FRAME,
+        .request = DSPI_CMD_REQUEST(DSPI_CMD_MEAS_LEVELS),
+        .index = DSPI_CMD_INDEX(DSPI_CMD_MEAS_LEVELS),
         .length = (uint16_t)(2 * hub->device.channels + 7),
     };
     const uint32_t tag = hub_submit_own(hub, HUB_WORK_SNAPSHOT_STATUS, &status_read, true, NULL);
@@ -485,8 +482,10 @@ static void start_snapshot_read(hub_t *hub)
     } else {
         /* Clear `stale` now: a change during the read marks it stale again. */
         snapshot->stale = false;
-        const dspi_request_t bulk_read = {
-            .is_get = true, .request = REQ_GET_ALL_PARAMS, .length = 0};
+        const dspi_request_t bulk_read = {.is_get = true,
+                                          .request = DSPI_CMD_REQUEST(DSPI_CMD_STORE_ALL_PARAMS),
+                                          .index = DSPI_CMD_INDEX(DSPI_CMD_STORE_ALL_PARAMS),
+                                          .length = 0}; /* The whole blob, whatever its size */
         snapshot->read_tag = hub_submit_own(hub, HUB_WORK_SNAPSHOT_BULK, &bulk_read, true, NULL);
     }
     if (snapshot->read_tag == 0) {
@@ -739,24 +738,7 @@ void hub_handle_device_rename(hub_t *hub, int slot, int id, const cJSON *message
         hub_reply_error(hub, slot, id, "no_device", NULL);
         return;
     }
-    if (hub->device.identity.has_board_name) {
-        rename_board(hub, slot, id, name);
-        return;
-    }
-    /* Older firmware keeps no name: the bridge stores it. */
-    if (!cJSON_IsString(name) || !settings_name_is_valid(name->valuestring)) {
-        hub_reply_error(hub, slot, id, "bad_request", "name must be 1 to 63 bytes of UTF-8");
-        return;
-    }
-    if (!hub->io.save_device_name(hub->io.context, hub->device.identity.serial,
-                                  name->valuestring)) {
-        hub_reply_error(hub, slot, id, "internal", "the name could not be saved");
-        return;
-    }
-    snprintf(hub->device.name, sizeof(hub->device.name), "%s", name->valuestring);
-    hub_reply_ok(hub, slot, id, NULL);
-    broadcast_device(hub, "device.changed");
-    hub->io.advertise(hub->io.context);
+    rename_board(hub, slot, id, name);
 }
 
 /* ---------------------------------------------------------------------------

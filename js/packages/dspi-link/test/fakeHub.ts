@@ -16,6 +16,8 @@ export interface FakeHubConfig {
   issuedToken?: string;
   session?: number;
   role?: "viewer" | "control" | "admin";
+  /** `[command ID, dir]` pairs sent as policy.denied_ids (Link spec 7.3). */
+  deniedIds?: Array<[number, number]>;
   devices?: DeviceInfo[];
   caps?: string[];
   /** Answer a decoded CMD request; return null to answer nothing. */
@@ -57,6 +59,11 @@ export class FakeHub {
       role: config.role ?? "control",
       ...config,
     };
+  }
+
+  /** The auth `ok` policy: `denied` empty, as a 1.3 hub sends it. */
+  private policy(): { denied: Array<[number, number]>; denied_ids: Array<[number, number]> } {
+    return { denied: [], denied_ids: this.config.deniedIds ?? [] };
   }
 
   get socket(): FakeSocket {
@@ -109,7 +116,13 @@ export class FakeHub {
           socket.deliverText({ t: "err", id, code: "denied", msg: "unknown token" });
           return;
         }
-        socket.deliverText({ t: "ok", id, session: this.config.session, role: this.config.role, policy: { denied: [] } });
+        socket.deliverText({
+          t: "ok",
+          id,
+          session: this.config.session,
+          role: this.config.role,
+          policy: this.policy(),
+        });
         return;
       }
       case "auth.pair": {
@@ -122,7 +135,7 @@ export class FakeHub {
           id,
           session: this.config.session,
           role: this.config.role,
-          policy: { denied: [] },
+          policy: this.policy(),
         };
         // Open access issues no token; a pin hub does.
         if (this.config.auth === "pin") reply.token = this.config.issuedToken ?? "TOKEN-abc";
@@ -141,7 +154,11 @@ export class FakeHub {
           return;
         }
         const polls = (msg.polls ?? []) as Array<{ slot: number; hz: number }>;
-        socket.deliverText({ t: "ok", id, granted: polls.map((p) => ({ slot: p.slot, hz: p.hz })) });
+        socket.deliverText({
+          t: "ok",
+          id,
+          granted: polls.map((p) => ({ slot: p.slot, hz: p.hz })),
+        });
         return;
       }
       case "poll.unsubscribe":
@@ -172,7 +189,12 @@ export class FakeHub {
     if (frame.type !== "cmd_request") return;
     const reply = this.config.onCommand
       ? this.config.onCommand(frame)
-      : ({ type: "cmd_response", tag: frame.tag, status: LinkStatus.OK, payload: new Uint8Array(0) } as LinkFrame);
+      : ({
+          type: "cmd_response",
+          tag: frame.tag,
+          status: LinkStatus.OK,
+          payload: new Uint8Array(0),
+        } as LinkFrame);
     if (reply) socket.deliverFrame(reply);
   }
 }

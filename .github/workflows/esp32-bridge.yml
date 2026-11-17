@@ -1,5 +1,6 @@
-# CI for the ESP32 bridge (bridge spec 17): formatting, host tests, and a
-# firmware build for every supported chip with the image-size budget.
+# CI for the ESP32 bridge (bridge spec 17): formatting, host tests, the JS
+# library tests, and a firmware build for every supported chip with the
+# image-size budget.
 # Actions are pinned by commit, with the release in a comment; update both
 # together.
 name: ESP32 bridge
@@ -55,6 +56,27 @@ jobs:
           cmake -S test/host -B build-host
           cmake --build build-host
           ctest --test-dir build-host --output-on-failure
+
+  js-tests:
+    # The TypeScript library's tests, including the structural checks on
+    # policy/commands.json and the fixtures every implementation shares.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Typecheck and test
+        run: |
+          npm ci
+          npm run build --workspace @dspi/link
+          npm run typecheck
+          npm test
 
   firmware:
     runs-on: ubuntu-latest

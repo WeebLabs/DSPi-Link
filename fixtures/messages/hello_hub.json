@@ -23,7 +23,7 @@
   },
   "proto" : {
     "major" : 1,
-    "minor" : 1
+    "minor" : 3
   },
   "t" : "hello"
 }

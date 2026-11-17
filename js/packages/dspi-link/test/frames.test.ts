@@ -8,8 +8,10 @@ import {
   ResyncReason,
   decodeFrame,
   encodeFrame,
+  isRetryableStatus,
   statusName,
 } from "../src/frames.js";
+import { Command, commandAddress, commandId } from "../src/commands.js";
 import { fixtureBytes, fixtureJson, fixtureNames, toHex } from "./fixtures.js";
 
 interface FrameFixture {
@@ -142,5 +144,36 @@ describe("frame codec edge cases", () => {
     expect(statusName(LinkStatus.OK)).toBe("OK");
     expect(statusName(LinkStatus.DENIED)).toBe("DENIED");
     expect(statusName(0x42)).toBe("0x42");
+  });
+});
+
+describe("status codes (spec 8.1)", () => {
+  it("names the firmware's result codes", () => {
+    expect(statusName(0x10)).toBe("VC_ERR_UNKNOWN");
+    expect(statusName(0x16)).toBe("VC_ERR_BLOCKED");
+    expect(statusName(0x1a)).toBe("VC_ERR_PIN_IN_USE");
+    expect(statusName(0x7e)).toBe("0x7e"); // Unknown: shown in hex
+  });
+
+  it("retries only what can succeed unchanged", () => {
+    const retryable = [0x01, 0x04, 0x17, 0x84];
+    for (let status = 0; status <= 0xff; status++) {
+      expect(isRetryableStatus(status), `0x${status.toString(16)}`).toBe(
+        retryable.includes(status),
+      );
+    }
+  });
+});
+
+describe("command IDs (spec 8.2)", () => {
+  it("puts the page in wIndex beside the vendor interface", () => {
+    expect(commandAddress(Command.ROUTE_MASTER_VOLUME)).toEqual({ bRequest: 0x50, wIndex: 0x0502 });
+    expect(commandAddress(Command.SYS_PROTOCOL_INFO)).toEqual({ bRequest: 0x10, wIndex: 0x0102 });
+    expect(commandId(0x50, 0x0502)).toBe(0x0550);
+  });
+
+  it("refuses an ID with no page", () => {
+    expect(() => commandAddress(0x00a0)).toThrow(RangeError);
+    expect(() => commandAddress(0x10000)).toThrow(RangeError);
   });
 });

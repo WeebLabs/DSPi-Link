@@ -15,7 +15,9 @@
  */
 
 import {
+  Command,
   LinkClient,
+  commandAddress,
   decodePlatform,
   readMasterVolumeDb,
   decodeBulkHeader,
@@ -29,9 +31,6 @@ if (!host) {
 }
 const url = `ws://${host.includes(":") ? host : `${host}:11915`}/dspi/v1`;
 
-const REQ_GET_PLATFORM = 0x7f;
-const REQ_GET_STATUS = 0x50;
-const REQ_SET_MASTER_VOLUME = 0xd2;
 
 let failures = 0;
 function check(condition, what) {
@@ -54,8 +53,9 @@ async function main() {
   check(devices.length === 1, `one device listed (${devices[0]?.serial}, fw ${devices[0]?.fw})`);
   const handle = devices[0].handle;
 
+  check(devices[0].protocol?.major === 1, `protocol ${JSON.stringify(devices[0].protocol)}`);
   const platformBytes = await writer.commandOk({
-    handle, direction: "get", bRequest: REQ_GET_PLATFORM, wValue: 0, wIndex: 2, wLength: 7,
+    handle, direction: "get", ...commandAddress(Command.SYS_PLATFORM), wValue: 0, wLength: 7,
   });
   const platform = decodePlatform(platformBytes);
   check(platformBytes.length >= 6, `platform read (${JSON.stringify(platform)})`);
@@ -76,16 +76,11 @@ async function main() {
   writer.on("notify", (frame) => { heard.writer ??= frame; });
   listener.on("notify", (frame) => { heard.listener ??= frame; });
   const asBytes = (db) => new Uint8Array(new Float32Array([db]).buffer);
-  const setVolume = (client, db) => client.command({
-    handle, direction: "set", bRequest: REQ_SET_MASTER_VOLUME, wValue: 0, wIndex: 2,
-    payload: asBytes(db),
-  });
+  const setVolume = (client, db) => client.set(handle, Command.ROUTE_MASTER_VOLUME, asBytes(db));
   let locked = false;
   try {
-    await writer.commandOk({
-      handle, direction: "set", bRequest: REQ_SET_MASTER_VOLUME, wValue: 0, wIndex: 2,
-      payload: asBytes(volumeDb - 0.5),
-    });
+    const written = await setVolume(writer, volumeDb - 0.5);
+    check(written.status === 0, `the volume write is accepted (status ${written.status})`);
     await wait(500);
     check(heard.listener !== null, "the other session heard the notification");
     if (heard.listener) {
@@ -96,10 +91,11 @@ async function main() {
     check(heard.writer?.origin === writer.session, "the writer can recognise its own echo");
 
     const statusLength = 2 * header.numChannels + 7;
+    const meters = commandAddress(Command.MEAS_LEVELS);
     let polls = 0;
     listener.on("poll", () => { polls++; });
     const grants = await listener.subscribePolls(handle, [
-      { slot: 3, req: REQ_GET_STATUS, val: 9, idx: 2, len: statusLength, hz: 10 },
+      { slot: 3, req: meters.bRequest, val: 0, idx: meters.wIndex, len: statusLength, hz: 10 },
     ]);
     await wait(2000);
     await listener.unsubscribePolls(handle, [3]);

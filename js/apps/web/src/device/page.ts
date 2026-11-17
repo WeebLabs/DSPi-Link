@@ -3,7 +3,7 @@
  *
  * Everything goes through the Link client: the volume is a CMD tunnel (Link
  * spec 8.2, volume.ts), and the meters are a poll subscription on
- * REQ_GET_STATUS (0x50, wValue 9) whose verbatim responses come back as POLL
+ * MEAS.LEVELS (0x0910) whose verbatim responses come back as POLL
  * frames (Link spec 7.6, meters.ts). Other clients' changes arrive as NOTIFY
  * frames (Link spec 8.3), and RESYNC (8.6) or BULK_INVALIDATED re-read the
  * state. Nothing here is Link-specific except the transport; the decoding is
@@ -14,6 +14,7 @@ import {
   BULK_HEADER_BYTES,
   BULK_MASTER_VOLUME_OFFSET,
   BULK_PARAMS_BYTES,
+  Command,
   LinkClient,
   LinkStatus,
   type DeviceInfo,
@@ -24,18 +25,15 @@ import {
   decodeNotifyPacket,
   decodeStatusFrame,
   isSupportedBulkVersion,
+  commandAddress,
   readMasterVolumeDb,
   statusFrameLength,
 } from "@dspi/link";
 import { el } from "../dom.js";
 import { describeProblem } from "../problems.js";
 import { createMeters } from "./meters.js";
-import { APP_WINDEX, createVolumeControl, readDeviceVolume, readFloat } from "./volume.js";
+import { createVolumeControl, readDeviceVolume, readFloat } from "./volume.js";
 
-const REQ_GET_STATUS = 0x50;
-/** REQ_GET_ALL_PARAMS: the bulk blob, whose header gives the channel layout. */
-const REQ_GET_ALL_PARAMS = 0xa0;
-const STATUS_WVALUE_COMBINED = 9;
 const METER_SLOT = 0;
 const METER_RATE_HZ = 10;
 const FLOAT32_BYTES = 4;
@@ -145,11 +143,12 @@ export function createDevicePage(
     return true;
   }
 
-  /** The device's bulk blob (REQ_GET_ALL_PARAMS), or null if it cannot be had. */
+  /** The device's bulk blob (STORE.ALL_PARAMS), whose header gives the channel
+   * layout, or null if it cannot be had. */
   async function readBulk(): Promise<Uint8Array | null> {
     const length = Math.min(client.limits?.max_payload ?? BULK_PARAMS_BYTES, MAX_GET_BYTES);
     try {
-      const response = await client.get(handle, REQ_GET_ALL_PARAMS, length, 0, APP_WINDEX);
+      const response = await client.get(handle, Command.STORE_ALL_PARAMS, length);
       return response.status === LinkStatus.OK ? response.payload : null;
     } catch (error) {
       console.warn("device: could not read the bulk blob:", error);
@@ -162,15 +161,9 @@ export function createDevicePage(
     const length = statusFrameLength(inputs + outputs);
     if (length === subscribedLength) return;
     subscribedLength = length;
+    const { bRequest, wIndex } = commandAddress(Command.MEAS_LEVELS);
     await client.subscribePolls(handle, [
-      {
-        slot: METER_SLOT,
-        req: REQ_GET_STATUS,
-        val: STATUS_WVALUE_COMBINED,
-        idx: APP_WINDEX,
-        len: length,
-        hz: METER_RATE_HZ,
-      },
+      { slot: METER_SLOT, req: bRequest, val: 0, idx: wIndex, len: length, hz: METER_RATE_HZ },
     ]);
   }
 
@@ -267,12 +260,22 @@ export function createDevicePage(
       el("p", { class: "dim mono", text: deviceSummary(device) }),
       status,
     ),
-    volume.root,
-    meters.root,
+    // A legacy device takes no paged command, so it gets no controls.
+    device.protocol ? volume.root : null,
+    device.protocol ? meters.root : null,
   );
 
   meters.build(inputs, outputs);
-  refresh();
+  if (device.protocol) {
+    refresh();
+  } else {
+    // Firmware before 1.1.7 numbers its commands differently, and the hub
+    // forwards nothing to it (Link spec 7.4).
+    setStatus(
+      "This DSPi's firmware is too old for DSPi Link. Update it over USB with DSPi Console.",
+      true,
+    );
+  }
 
   return {
     handle,

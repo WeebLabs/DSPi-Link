@@ -15,15 +15,8 @@
 #include "bridge_config.h"
 #include "dspi_commands.h"
 
-/* Commands the bridge sends on its own behalf (firmware commands.md). */
-#define REQ_GET_SERIAL 0x7E
-#define REQ_GET_PLATFORM 0x7F
-#define REQ_GET_DEVICE_NAME 0x57
-#define REQ_GET_UART_CONFIG 0xF6
-#define REQ_GET_CTRL_IFACE_STATUS 0xF9
-
-#define PLATFORM_MIN_BYTES 4 /* Old firmware returns 4; current returns 7 */
-#define IFACE_STATUS_BYTES 8
+/* Reply sizes of the reads the bridge makes (firmware commands.md). */
+#define XPORT_STATUS_BYTES 8
 #define UART_CONFIG_BYTES 8
 
 /* ---------------------------------------------------------------------------
@@ -446,8 +439,10 @@ static const dspi_request_t PROBE_REQUEST = {.is_get = true,
                                              .index = DSPI_CMD_INDEX(DSPI_CMD_SYS_PROTOCOL_INFO),
                                              .length = DSPI_PROTOCOL_INFO_BYTES};
 
-static const dspi_request_t SERIAL_REQUEST = {
-    .is_get = true, .request = REQ_GET_SERIAL, .length = DSPI_SERIAL_MAX_CHARS};
+static const dspi_request_t SERIAL_REQUEST = {.is_get = true,
+                                              .request = DSPI_CMD_REQUEST(DSPI_CMD_SYS_SERIAL),
+                                              .index = DSPI_CMD_INDEX(DSPI_CMD_SYS_SERIAL),
+                                              .length = DSPI_SERIAL_MAX_CHARS};
 
 /* Copies a serial number's characters into `out` (DSPI_SERIAL_MAX_CHARS + 1
  * bytes): raw bytes padded with NULs, so it stops at the first NUL. */
@@ -469,6 +464,9 @@ dspi_heartbeat_t dspi_link_heartbeat(dspi_link_t *link, const char *serial)
     }
     if (dspi_status_is_busy(reply.status)) {
         return DSPI_HEARTBEAT_SAME_DEVICE; /* It is there, and nothing says it changed */
+    }
+    if (reply.status == DSPI_STATUS_CRC_ERROR || reply.status == DSPI_STATUS_FRAME_ERROR) {
+        return DSPI_HEARTBEAT_NO_ANSWER; /* Line noise, even after the retry: not a swap */
     }
     if (reply.status != DSPI_STATUS_OK) {
         return DSPI_HEARTBEAT_OTHER_DEVICE; /* It does not know the read: not the device found */
@@ -541,12 +539,14 @@ bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t 
     return found;
 }
 
-/* Reads up to `capacity` bytes of a GET into `out`. Returns the number of
- * bytes read, or -1 if the DSPi did not answer OK. */
-static int read_get(dspi_link_t *link, uint8_t request_code, uint8_t *out, size_t capacity)
+/* Reads up to `capacity` bytes of a GET of command `id` into `out`. Returns
+ * the number of bytes read, or -1 if the DSPi did not answer OK. */
+static int read_get(dspi_link_t *link, uint16_t id, uint8_t *out, size_t capacity)
 {
-    const dspi_request_t request = {
-        .is_get = true, .request = request_code, .length = (uint16_t)capacity};
+    const dspi_request_t request = {.is_get = true,
+                                    .request = DSPI_CMD_REQUEST(id),
+                                    .index = DSPI_CMD_INDEX(id),
+                                    .length = (uint16_t)capacity};
     const dspi_reply_t reply = dspi_link_transact(link, &request, true);
     if (reply.kind != DSPI_REPLY_ANSWERED || reply.status != DSPI_STATUS_OK) {
         return -1;
@@ -577,7 +577,7 @@ bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)
     memset(identity, 0, sizeof(*identity));
 
     uint8_t serial[DSPI_SERIAL_MAX_CHARS];
-    const int serial_length = read_get(link, REQ_GET_SERIAL, serial, sizeof(serial));
+    const int serial_length = read_get(link, DSPI_CMD_SYS_SERIAL, serial, sizeof(serial));
     if (serial_length <= 0) {
         return false;
     }
@@ -587,35 +587,33 @@ bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)
     }
 
     const int platform_length =
-        read_get(link, REQ_GET_PLATFORM, identity->platform, sizeof(identity->platform));
-    if (platform_length < PLATFORM_MIN_BYTES) {
+        read_get(link, DSPI_CMD_SYS_PLATFORM, identity->platform, sizeof(identity->platform));
+    if (platform_length != DSPI_PLATFORM_BYTES) {
         return false;
     }
     identity->platform_length = (uint8_t)platform_length;
 
-    uint8_t status[IFACE_STATUS_BYTES];
+    uint8_t status[XPORT_STATUS_BYTES];
     identity->uart_live =
-        read_get(link, REQ_GET_CTRL_IFACE_STATUS, status, sizeof(status)) >= 2 && status[1] != 0;
+        read_get(link, DSPI_CMD_XPORT_STATUS, status, sizeof(status)) >= 2 && status[1] != 0;
 
     /* UartCtrlConfig: enabled, tx_pin, rx_pin, notify_enable, baud (u32 LE). */
     uint8_t config[UART_CONFIG_BYTES];
-    if (read_get(link, REQ_GET_UART_CONFIG, config, sizeof(config)) == UART_CONFIG_BYTES) {
+    if (read_get(link, DSPI_CMD_XPORT_UART_CONFIG, config, sizeof(config)) == UART_CONFIG_BYTES) {
         identity->has_uart_config = true;
         identity->notify_enabled = config[3] != 0;
         identity->configured_baud = (uint32_t)config[4] | ((uint32_t)config[5] << 8) |
                                     ((uint32_t)config[6] << 16) | ((uint32_t)config[7] << 24);
     }
 
-    /* Older firmware STALLs 0x57 or answers it with one byte (device_name_spec
-     * 2). One more try, so a transient miss does not pass for old firmware for
-     * the whole attachment. */
+    /* Every 1.1.7 build answers 32 bytes. Without the name the board cannot
+     * be shown or renamed, so the identity counts as unread and the next
+     * probe tries again. */
     uint8_t name[DSPI_DEVICE_NAME_BYTES];
-    for (int tries = 0; tries < 2 && !identity->has_board_name; tries++) {
-        if (read_get(link, REQ_GET_DEVICE_NAME, name, sizeof(name)) == DSPI_DEVICE_NAME_BYTES) {
-            identity->has_board_name = true;
-            memcpy(identity->board_name, name, sizeof(name));
-            identity->board_name[sizeof(identity->board_name) - 1] = '\0';
-        }
+    if (read_get(link, DSPI_CMD_SYS_DEVICE_NAME, name, sizeof(name)) != DSPI_DEVICE_NAME_BYTES) {
+        return false;
     }
+    memcpy(identity->board_name, name, sizeof(name));
+    identity->board_name[sizeof(identity->board_name) - 1] = '\0';
     return true;
 }

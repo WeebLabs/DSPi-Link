@@ -15,7 +15,12 @@
 // Exits non-zero if any check fails.
 
 import { spawn } from "node:child_process";
-import { LinkClient, decodeBulkHeader } from "../../../js/packages/dspi-link/dist/index.js";
+import {
+  Command,
+  LinkClient,
+  commandAddress,
+  decodeBulkHeader,
+} from "../../../js/packages/dspi-link/dist/index.js";
 
 const args = process.argv.slice(2);
 const host = args.find((arg) => !arg.startsWith("--"));
@@ -27,8 +32,8 @@ const withOffline = args.includes("--offline");
 const base = `${host}:11915`;
 const url = `ws://${base}/dspi/v1`;
 
-const REQ_GET_STATUS = 0x50;
-const REQ_GET_ALL_PARAMS = 0xa0; // The bulk read: about 60 ms at 1 Mbaud
+const BULK_READ = commandAddress(Command.STORE_ALL_PARAMS); // About 60 ms at 1 Mbaud
+const METERS = commandAddress(Command.MEAS_LEVELS);
 const STATUS_OK = 0x00;
 const STATUS_RATE_LIMITED = 0x84;
 const DEVICE_REMOVED_WITHIN_MS = 75000; // 60 s offline retention plus margin
@@ -124,7 +129,7 @@ async function handshake() {
   const without = await rawSocket(undefined, undefined);
   check(without.event !== "message", `no sub-protocol is refused (${without.event} ${without.code ?? ""})`);
 
-  const hello = JSON.stringify({ t: "hello", proto: { major: 1, minor: 2 }, client: { name: "conformance" } });
+  const hello = JSON.stringify({ t: "hello", proto: { major: 1, minor: 3 }, client: { name: "conformance" } });
   const first = await rawSocket("dspi-link-1", hello);
   const message = first.event === "message" ? JSON.parse(first.data) : {};
   check(first.protocol === "dspi-link-1", "the hub accepts dspi-link-1");
@@ -146,7 +151,7 @@ async function commands(client) {
   const replies = await Promise.all(
     Array.from({ length: count }, (_, i) =>
       client
-        .command({ handle: 0, direction: "get", bRequest: REQ_GET_ALL_PARAMS, wValue: 0, wIndex: 0, wLength: 6136 })
+        .command({ handle: 0, direction: "get", ...BULK_READ, wValue: 0, wLength: 6136 })
         .then((reply) => {
           arrivals.push(i);
           return reply.status;
@@ -164,7 +169,7 @@ async function commands(client) {
 async function polls(clients, statusLength) {
   section("Polls: fan-out and stop (Link spec 7.6)");
   const [first, second] = clients;
-  const poll = { slot: 2, req: REQ_GET_STATUS, val: 9, idx: 2, len: statusLength, hz: 10 };
+  const poll = { slot: 2, req: METERS.bRequest, val: 0, idx: METERS.wIndex, len: statusLength, hz: 10 };
   const received = [0, 0];
   const stops = clients.map((client, i) => client.on("poll", () => received[i]++));
   await first.subscribePolls(0, [poll]);

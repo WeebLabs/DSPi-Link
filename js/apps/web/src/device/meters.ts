@@ -1,6 +1,6 @@
 /*
  * The device page's meter strip: one bar per channel, inputs first, from the
- * combined status frame (REQ_GET_STATUS wValue 9) the hub pushes as POLL
+ * meter frame (MEAS.LEVELS, 0x0910) the hub pushes as POLL
  * frames (Link spec 7.6 and 8.4). A clipped channel says so in words as well
  * as in red (bridge spec 10.4).
  */

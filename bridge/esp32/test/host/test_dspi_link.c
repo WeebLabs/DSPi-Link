@@ -42,7 +42,9 @@ static void start(uint32_t device_baud, uint32_t link_baud)
     notified_count = 0;
 }
 
-static const dspi_request_t GET_PLATFORM = {.is_get = true, .request = 0x7F, .length = 7};
+/* SYS.PLATFORM (0x0120). */
+static const dspi_request_t GET_PLATFORM = {
+    .is_get = true, .request = 0x20, .index = 0x0100, .length = 7};
 
 static void a_get_returns_its_payload(void)
 {
@@ -64,8 +66,11 @@ static void a_bulk_set_arrives_intact(void)
     for (size_t i = 0; i < sizeof(blob); i++) {
         blob[i] = (uint8_t)(i * 7);
     }
-    const dspi_request_t set_all = {
-        .is_get = false, .request = 0xA1, .length = sizeof(blob), .payload = blob};
+    const dspi_request_t set_all = {.is_get = false,
+                                    .request = 0x40, /* STORE.ALL_PARAMS, 0x0240 */
+                                    .index = 0x0200,
+                                    .length = sizeof(blob),
+                                    .payload = blob};
     const dspi_reply_t reply = dspi_link_transact(&link, &set_all, false);
 
     CHECK(reply.kind == DSPI_REPLY_ANSWERED);
@@ -117,7 +122,7 @@ static void an_unsafe_request_is_not_retried_after_silence(void)
     fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_STAY_SILENT});
     const uint8_t volume[] = {0x00, 0x00, 0xA0, 0xC1};
     const dspi_request_t set_volume = {
-        .is_get = false, .request = 0xD2, .length = 4, .payload = volume};
+        .is_get = false, .request = 0x50, .index = 0x0500, .length = 4, .payload = volume};
     const uint32_t started = fake.now_ms;
     const dspi_reply_t reply = dspi_link_transact(&link, &set_volume, false);
 
@@ -137,7 +142,7 @@ static void any_request_is_resent_when_the_dspi_rejects_the_frame(void)
         &fake, (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = DSPI_STATUS_CRC_ERROR});
     const uint8_t volume[] = {0x00, 0x00, 0xA0, 0xC1};
     const dspi_request_t set_volume = {
-        .is_get = false, .request = 0xD2, .length = 4, .payload = volume};
+        .is_get = false, .request = 0x50, .index = 0x0500, .length = 4, .payload = volume};
     const dspi_reply_t reply = dspi_link_transact(&link, &set_volume, false);
 
     CHECK(reply.kind == DSPI_REPLY_ANSWERED);
@@ -162,7 +167,9 @@ static void a_corrupt_answer_is_reported_or_retried(void)
 {
     start(BAUD, BAUD);
     fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_CORRUPT});
-    const dspi_request_t set_mute = {.is_get = false, .request = 0xD4, .length = 0};
+    /* MEAS.RTA_STOP (0x0929): a zero-length SET. */
+    const dspi_request_t set_mute = {
+        .is_get = false, .request = 0x29, .index = 0x0900, .length = 0};
     dspi_reply_t reply = dspi_link_transact(&link, &set_mute, false);
     CHECK(reply.kind == DSPI_REPLY_CORRUPT);
     CHECK(dspi_link_counters(&link)->crc_errors == 1);
@@ -174,7 +181,9 @@ static void a_corrupt_answer_is_reported_or_retried(void)
     CHECK(reply.attempts == 2);
 }
 
-static const dspi_request_t GET_SERIAL = {.is_get = true, .request = 0x7E, .length = 16};
+/* SYS.SERIAL (0x0121). */
+static const dspi_request_t GET_SERIAL = {
+    .is_get = true, .request = 0x21, .index = 0x0100, .length = 16};
 
 /* After a timeout, the late answer arrives while the link is still
  * draining the line, and is dropped there. */
@@ -215,7 +224,9 @@ static void requests_keep_the_idle_gap(void)
     CHECK(fake.smallest_gap_ms >= DSPI_UART_IDLE_GAP_MS);
 }
 
-static const dspi_request_t SET_MUTE = {.is_get = false, .request = 0xD4, .length = 0};
+/* MEAS.RTA_STOP (0x0929): a zero-length SET. */
+static const dspi_request_t SET_MUTE = {
+    .is_get = false, .request = 0x29, .index = 0x0900, .length = 0};
 
 static void repeated_timeouts_restart_the_uart(void)
 {
@@ -296,7 +307,8 @@ static void the_heartbeat_reads_the_serial(void)
     start(BAUD, BAUD);
     CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_SAME_DEVICE);
     CHECK(fake.record_count == 1);
-    CHECK(fake.records[0].is_get && fake.records[0].request == 0x7E);
+    CHECK(fake.records[0].is_get && fake.records[0].request == 0x21);
+    CHECK(fake.records[0].index == 0x0100);
     CHECK(fake.records[0].length == 16);
 
     /* Silence twice: a heartbeat is a safe read, so it gets its retry. */
@@ -318,6 +330,17 @@ static void the_heartbeat_reads_the_serial(void)
 /* A board that refuses the serial read does not know it: older firmware
  * swapped in answers a paged read with 0x02. It must not stay attached,
  * so it counts as another device and the next probe classifies it. */
+/* A frame the DSPi rejected twice is line noise, not another board. */
+static void a_damaged_heartbeat_is_no_answer(void)
+{
+    start(BAUD, BAUD);
+    for (int i = 0; i < 2; i++) {
+        fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS,
+                                                .status = DSPI_STATUS_CRC_ERROR});
+    }
+    CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_NO_ANSWER);
+}
+
 static void a_refused_heartbeat_means_another_device(void)
 {
     start(BAUD, BAUD);
@@ -336,18 +359,21 @@ static void the_heartbeat_spots_a_swapped_device(void)
 {
     start(BAUD, BAUD);
     const uint8_t other[16] = "F00D58388B1A2E2C";
-    fake_dspi_can(&fake, 0x7E, other, sizeof(other));
+    fake_dspi_can(&fake, 0x0121, other, sizeof(other));
     CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_OTHER_DEVICE);
 
     /* A shorter serial that matches the start of the old one differs too. */
     const uint8_t prefix[16] = "E460";
-    fake_dspi_can(&fake, 0x7E, prefix, sizeof(prefix));
+    fake_dspi_can(&fake, 0x0121, prefix, sizeof(prefix));
     CHECK(dspi_link_heartbeat(&link, SERIAL) == DSPI_HEARTBEAT_OTHER_DEVICE);
 }
 
 static const uint8_t ONE[] = {0x01};
-static const dspi_request_t SET_ONE = {
-    .is_get = false, .request = 0xD4, .length = 1, .payload = ONE};
+static const dspi_request_t SET_ONE = {.is_get = false,
+                                       .request = 0x10,
+                                       .index = 0x0800,
+                                       .length = 1,
+                                       .payload = ONE}; /* FX.CROSSFEED_ENABLE */
 
 /* Noise that looks like the start of a frame claiming 64 bytes arrives
  * while idle. It must not swallow the next answer (audit UART-1). */
@@ -516,6 +542,7 @@ static void the_probe_is_sys_protocol_info(void)
 static void older_firmware_is_too_old(void)
 {
     start(BAUD, BAUD);
+    fake_dspi_set_paged(&fake, false);
     CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
     CHECK(probe.firmware == DSPI_FIRMWARE_TOO_OLD);
 
@@ -573,76 +600,88 @@ static void a_short_serial_stops_at_its_padding(void)
 {
     start(BAUD, BAUD);
     const uint8_t padded[16] = {'A', 'B', 'C', 0};
-    fake_dspi_can(&fake, 0x7E, padded, sizeof(padded));
+    fake_dspi_can(&fake, 0x0121, padded, sizeof(padded));
     dspi_identity_t identity;
     CHECK(dspi_link_read_identity(&link, &identity));
     CHECK(strcmp(identity.serial, "ABC") == 0);
 }
 
-/* How many times the fake was asked REQ_GET_DEVICE_NAME (0x57). */
+/* How many times the fake was asked SYS.DEVICE_NAME (0x0124). */
 static unsigned name_reads(void)
 {
     unsigned count = 0;
     for (size_t i = 0; i < fake.record_count; i++) {
-        count += fake.records[i].request == 0x57 ? 1 : 0;
+        count += fake.records[i].request == 0x24 && fake.records[i].index == 0x0100 ? 1 : 0;
     }
     return count;
 }
 
-static void a_board_that_keeps_a_name_reports_it(void)
+static void the_identity_uses_the_paged_commands(void)
+{
+    start(BAUD, BAUD);
+    dspi_identity_t identity;
+    CHECK(dspi_link_read_identity(&link, &identity));
+    static const uint16_t expected[] = {0x0121, 0x0120, 0x0B12, 0x0B10, 0x0124};
+    CHECK(fake.record_count == sizeof(expected) / sizeof(expected[0]));
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        CHECK(fake.records[i].is_get);
+        CHECK((uint16_t)((fake.records[i].index & 0xFF00) | fake.records[i].request) ==
+              expected[i]);
+    }
+    CHECK(identity.uart_live && identity.has_uart_config && identity.notify_enabled);
+    CHECK(identity.platform_length == 7);
+}
+
+static void the_board_name_is_read(void)
 {
     start(BAUD, BAUD);
     uint8_t name[32] = "Rack left";
-    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    fake_dspi_can(&fake, 0x0124, name, sizeof(name));
     dspi_identity_t identity;
     CHECK(dspi_link_read_identity(&link, &identity));
-    CHECK(identity.has_board_name);
     CHECK(strcmp(identity.board_name, "Rack left") == 0);
     CHECK(name_reads() == 1);
 
-    /* Unnamed is all zeros, and still counts as support. */
+    /* Unnamed is all zeros. */
     memset(name, 0, sizeof(name));
-    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    fake_dspi_can(&fake, 0x0124, name, sizeof(name));
     CHECK(dspi_link_read_identity(&link, &identity));
-    CHECK(identity.has_board_name && identity.board_name[0] == '\0');
+    CHECK(identity.board_name[0] == '\0');
 
     /* A name without its NUL is cut to 31 characters. */
     memset(name, 'A', sizeof(name));
-    fake_dspi_can(&fake, 0x57, name, sizeof(name));
+    fake_dspi_can(&fake, 0x0124, name, sizeof(name));
     CHECK(dspi_link_read_identity(&link, &identity));
     CHECK(strlen(identity.board_name) == 31);
 }
 
-static void older_firmware_has_no_board_name(void)
-{
-    /* No 0x57 at all: the fake answers ERROR, as a STALL arrives over UART. */
-    start(BAUD, BAUD);
-    dspi_identity_t identity;
-    CHECK(dspi_link_read_identity(&link, &identity));
-    CHECK(!identity.has_board_name && identity.board_name[0] == '\0');
-    CHECK(name_reads() == 2); /* Retried once */
-
-    /* The legacy channel mute answers 0x57 with one byte. */
-    start(BAUD, BAUD);
-    fake_dspi_can(&fake, 0x57, (const uint8_t[]){1}, 1);
-    CHECK(dspi_link_read_identity(&link, &identity));
-    CHECK(!identity.has_board_name);
-}
-
-static void a_missed_name_read_is_tried_again(void)
+/* Every 1.1.7 build answers the name in full. Without it the board cannot
+ * be shown or renamed, so the identity is unread and the next probe tries
+ * again, rather than the board being attached as one that keeps no name. */
+static void a_board_whose_name_cannot_be_read_is_not_identified(void)
 {
     start(BAUD, BAUD);
-    const uint8_t name[32] = "Studio";
-    fake_dspi_can(&fake, 0x57, name, sizeof(name));
     for (int i = 0; i < 4; i++) { /* Serial, platform, interface status, UART config */
         fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_NORMALLY});
     }
-    fake_dspi_script(&fake, (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = 0x01});
+    fake_dspi_script(
+        &fake, (fake_answer_t){.kind = FAKE_ANSWER_WITH_STATUS, .status = DSPI_STATUS_VC_ERR_BUSY});
     dspi_identity_t identity;
-    CHECK(dspi_link_read_identity(&link, &identity));
-    CHECK(identity.has_board_name);
-    CHECK(strcmp(identity.board_name, "Studio") == 0);
-    CHECK(name_reads() == 2);
+    CHECK(!dspi_link_read_identity(&link, &identity));
+
+    start(BAUD, BAUD);
+    fake_dspi_can(&fake, 0x0124, (const uint8_t[]){1}, 1); /* A short reply */
+    CHECK(!dspi_link_read_identity(&link, &identity));
+}
+
+/* SYS.PLATFORM is always 7 bytes on paged firmware; anything else is not
+ * a DSPi the bridge can describe. */
+static void a_short_platform_is_not_identified(void)
+{
+    start(BAUD, BAUD);
+    fake_dspi_can(&fake, 0x0120, (const uint8_t[]){1, 1, 0x17, 9}, 4);
+    dspi_identity_t identity;
+    CHECK(!dspi_link_read_identity(&link, &identity));
 }
 
 void test_dspi_link(void)
@@ -665,6 +704,7 @@ void test_dspi_link(void)
     RUN(a_failed_restart_is_tried_again);
     RUN(the_heartbeat_reads_the_serial);
     RUN(the_heartbeat_spots_a_swapped_device);
+    RUN(a_damaged_heartbeat_is_no_answer);
     RUN(a_refused_heartbeat_means_another_device);
     RUN(a_false_start_while_idle_does_not_swallow_the_answer);
     RUN(a_notification_missing_a_byte_does_not_swallow_the_answer);
@@ -679,7 +719,8 @@ void test_dspi_link(void)
     RUN(a_busy_probe_is_not_ready);
     RUN(the_identity_is_read);
     RUN(a_short_serial_stops_at_its_padding);
-    RUN(a_board_that_keeps_a_name_reports_it);
-    RUN(older_firmware_has_no_board_name);
-    RUN(a_missed_name_read_is_tried_again);
+    RUN(the_identity_uses_the_paged_commands);
+    RUN(the_board_name_is_read);
+    RUN(a_board_whose_name_cannot_be_read_is_not_identified);
+    RUN(a_short_platform_is_not_identified);
 }

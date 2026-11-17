@@ -12,14 +12,14 @@
  * goes through this class, so the session rules live in one place.
  */
 
-import {
-  LINK_LIBRARY_VERSION,
-  LINK_PROTO_VERSION,
-  LINK_SUBPROTOCOL,
-} from "./constants.js";
+import { LINK_LIBRARY_VERSION, LINK_PROTO_VERSION, LINK_SUBPROTOCOL } from "./constants.js";
 import { base64ToBytes } from "./base64.js";
+import { commandAddress, commandId } from "./commands.js";
 import { asError, LinkCommandError, LinkProtocolError } from "./errors.js";
 import {
+  CMD_DIR_GET,
+  CMD_DIR_SET,
+  type CmdDirection,
   type CmdRequestFrame,
   type CmdResponseFrame,
   type NotifyFrame,
@@ -79,12 +79,7 @@ export type LinkClientState =
  * which the client retries.
  */
 export type LinkCloseReason =
-  | "normal"
-  | "protocol_error"
-  | "auth_failed"
-  | "revoked"
-  | "shutting_down"
-  | "abnormal";
+  "normal" | "protocol_error" | "auth_failed" | "revoked" | "shutting_down" | "abnormal";
 
 /**
  * Maps a WebSocket close code to its meaning.
@@ -193,9 +188,9 @@ export interface SnapshotResult {
   age_ms?: number;
   bulk_b64?: string;
   status_b64?: string;
-  /** Decoded `bulk_b64`, the REQ_GET_ALL_PARAMS blob. */
+  /** Decoded `bulk_b64`, the STORE.ALL_PARAMS blob. */
   bulk?: Uint8Array;
-  /** Decoded `status_b64`, the REQ_GET_STATUS wValue 9 response. */
+  /** Decoded `status_b64`, the MEAS.LEVELS response. */
   status?: Uint8Array;
 }
 
@@ -571,7 +566,12 @@ export class LinkClient {
     this.releaseSocket(new Error("disconnected"), code, reason);
     this.setState("closed");
     if (wasOpen) {
-      this.emit("close", { code, reason: closeReasonFor(code), willReconnect: false, message: reason });
+      this.emit("close", {
+        code,
+        reason: closeReasonFor(code),
+        willReconnect: false,
+        message: reason,
+      });
     }
   }
 
@@ -957,7 +957,8 @@ export class LinkClient {
     return new Promise<CmdResponseFrame>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingCommands.delete(tag);
-        reject(new Error(`command 0x${request.bRequest.toString(16)} timed out`));
+        const id = commandId(request.bRequest, request.wIndex);
+        reject(new Error(`command 0x${id.toString(16).padStart(4, "0")} timed out`));
       }, this.options.commandTimeoutMs);
       this.pendingCommands.set(tag, { resolve, reject, timer });
       try {
@@ -984,43 +985,71 @@ export class LinkClient {
   }
 
   /**
-   * A GET command.
+   * A GET command. Refused here, before anything is sent, for a listed
+   * device without `protocol`: legacy firmware ignores the page and would
+   * run an unrelated 1.1.6 opcode (spec 7.4). command() is the way to send
+   * such a device its own opcodes.
    *
    * @param handle The device.
-   * @param bRequest The vendor command id.
-   * @param wLength The number of bytes requested.
-   * @param wValue The command's wValue.
-   * @param wIndex 2 for application commands.
+   * @param id The command ID, `(page << 8) | command`, such as Command.SYS_PLATFORM.
+   * @param wLength The number of bytes wanted; never 0 (spec 8.2).
+   * @param wValue The command's address, or 0.
    * @returns The response frame.
    */
-  get(
-    handle: number,
-    bRequest: number,
-    wLength: number,
-    wValue = 0,
-    wIndex = 2,
-  ): Promise<CmdResponseFrame> {
-    return this.command({ handle, direction: "get", bRequest, wValue, wIndex, wLength });
+  get(handle: number, id: number, wLength: number, wValue = 0): Promise<CmdResponseFrame> {
+    if (!Number.isInteger(wLength) || wLength < 1) {
+      throw new RangeError("a GET must ask for at least one byte");
+    }
+    this.requirePaged(handle);
+    return this.command({ handle, direction: "get", ...commandAddress(id), wValue, wLength });
   }
 
   /**
-   * A SET command.
+   * A SET command. An action with no value is a SET with an empty payload.
+   * Refused for a legacy device, as get() is.
    *
    * @param handle The device.
-   * @param bRequest The vendor command id.
+   * @param id The command ID, `(page << 8) | command`.
    * @param payload The bytes to send; wLength is their length.
-   * @param wValue The command's wValue.
-   * @param wIndex 2 for application commands.
+   * @param wValue The command's address, or 0.
    * @returns The response frame.
    */
   set(
     handle: number,
-    bRequest: number,
-    payload: Uint8Array,
+    id: number,
+    payload: Uint8Array = new Uint8Array(0),
     wValue = 0,
-    wIndex = 2,
   ): Promise<CmdResponseFrame> {
-    return this.command({ handle, direction: "set", bRequest, wValue, wIndex, payload });
+    this.requirePaged(handle);
+    return this.command({ handle, direction: "set", ...commandAddress(id), wValue, payload });
+  }
+
+  /**
+   * Throws when `handle` is a listed device whose firmware predates paged
+   * commands (spec 7.4). An unlisted handle is left to the hub to answer.
+   *
+   * @param handle The device.
+   */
+  private requirePaged(handle: number): void {
+    const device = this.devices.get(handle);
+    if (device && !device.protocol) {
+      throw new Error(
+        `device ${handle} runs firmware older than 1.1.7, which takes no paged commands`,
+      );
+    }
+  }
+
+  /**
+   * Whether the hub said the session may not send a command (spec 6.3). The
+   * hub still enforces it; this is for greying out controls.
+   *
+   * @param id The command ID.
+   * @param direction The direction.
+   * @returns True when `policy.denied_ids` lists it.
+   */
+  isDenied(id: number, direction: CmdDirection): boolean {
+    const dir = direction === "get" ? CMD_DIR_GET : CMD_DIR_SET;
+    return (this._policy?.denied_ids ?? []).some(([d, x]) => d === id && x === dir);
   }
 
   /**

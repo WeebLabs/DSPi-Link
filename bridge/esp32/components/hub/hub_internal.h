@@ -177,7 +177,7 @@ void hub_snapshot_resume(hub_t *hub);
 
 void hub_snapshot_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
 
-/* The answer to a REQ_SET_DEVICE_NAME: answers its device.rename, or
+/* The answer to a SYS.DEVICE_NAME SET: answers its device.rename, or
  * retires the stored name an adoption wrote. */
 void hub_device_name_on_reply(hub_t *hub, const hub_pending_t *work, const dspi_reply_t *reply);
 void hub_device_session_closed(hub_t *hub, int slot, uint16_t session_id);

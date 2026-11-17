@@ -15,8 +15,7 @@ Public API:
   `settings_hostname_is_valid()`, `settings_hub_id_is_valid()` and
   `settings_baud_is_supported()`.
 - Storage: `settings_init()`, `settings_load()`, `settings_save()`,
-  `settings_load_device_name()`, `settings_save_device_name()`,
-  `settings_forget_device_name()`,
+  `settings_load_device_name()`, `settings_forget_device_name()`,
   `settings_load_wifi()`, `settings_save_wifi()`, `settings_forget_wifi()`,
   `settings_load_auth()`, `settings_save_auth()` and `settings_erase_all()`.
 

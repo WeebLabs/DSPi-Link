@@ -127,10 +127,11 @@ every control, and every destructive action red and confirmed.
 - **Device list.** From `device.list`, kept current from `device.added`,
   `device.changed` and `device.removed`.
 - **Device.** Master volume as a slider (-127 to 0 dB, mute at -128), read from
-  the hub's snapshot, the device's bulk blob (`0xA0`, when the hub gives no
-  snapshot and no input count) or a `0xD3` GET, and written with `0xD2`,
-  throttled to about 20 writes a second. A meter strip from a poll subscription on `0x50` /
-  wValue 9 at 10 Hz, decoded with `decodeStatusFrame`; a clipped channel says
+  the hub's snapshot, the device's bulk blob (`STORE.ALL_PARAMS`, when the
+  hub gives no snapshot and no input count) or a `ROUTE.MASTER_VOLUME` GET,
+  and written with its SET, throttled to about 20 writes a second. A meter
+  strip from a poll subscription on `MEAS.LEVELS` at 10 Hz, decoded with
+  `decodeStatusFrame`; a clipped channel says
   "Clip" under its bar. A `PARAM_CHANGED` notification for the master volume
   offset moves the slider when another client makes the change; frames whose
   `origin` is our own session id are dropped. `RESYNC` and `BULK_INVALIDATED`

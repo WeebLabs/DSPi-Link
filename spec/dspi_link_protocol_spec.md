@@ -102,7 +102,7 @@ work without DNS-SD:
 GET /dspi/v1/info
 200 OK, Content-Type: application/json
 {
-  "proto": {"major": 1, "minor": 2},
+  "proto": {"major": 1, "minor": 3},
   "hub":   {"id": "<uuid>", "name": "Studio Mac", "kind": "console", "version": "1.1.7"},
   "auth":  "none",
   "tls":   false,

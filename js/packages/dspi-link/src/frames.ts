@@ -20,16 +20,33 @@ export const FrameType = {
 
 export type FrameTypeValue = (typeof FrameType)[keyof typeof FrameType];
 
-/** CMD response status byte, spec 8.1. 0x00..0x07 are the firmware's CTRL_STATUS_*. */
+/**
+ * CMD response status byte, spec 8.1. 0x00..0x7F are the firmware's: its UART
+ * transport statuses 0x00..0x07 and its command results 0x10..0x1A. Link's own
+ * codes start at 0x80.
+ */
 export enum LinkStatus {
   OK = 0x00,
   BUSY = 0x01,
+  /** Refused, reason unknown: legacy firmware, or a USB STALL a hub could not explain. */
   ERROR = 0x02,
+  /** Legacy firmware only; firmware 1.1.7 answers VC_ERR_BLOCKED. */
   BLOCKED = 0x03,
   BULK_LOCKED = 0x04,
   CRC_ERROR = 0x05,
   OVERSIZE = 0x06,
   FRAME_ERROR = 0x07,
+  VC_ERR_UNKNOWN = 0x10,
+  VC_ERR_DIRECTION = 0x11,
+  VC_ERR_LENGTH = 0x12,
+  VC_ERR_ADDRESS = 0x13,
+  VC_ERR_VALUE = 0x14,
+  VC_ERR_UNSUPPORTED = 0x15,
+  VC_ERR_BLOCKED = 0x16,
+  VC_ERR_BUSY = 0x17,
+  VC_ERR_STATE = 0x18,
+  VC_ERR_PIN_INVALID = 0x19,
+  VC_ERR_PIN_IN_USE = 0x1a,
   NO_DEVICE = 0x80,
   DENIED = 0x81,
   TIMEOUT = 0x82,
@@ -50,6 +67,23 @@ export function statusName(status: number): string {
   return LinkStatus[status] ?? `0x${status.toString(16).padStart(2, "0")}`;
 }
 
+/**
+ * Whether a command refused with `status` may be resent unchanged (spec 8.1):
+ * the busy statuses and RATE_LIMITED. TIMEOUT is not: a read may be retried
+ * after a pause, but a write may have run, so read it back instead.
+ *
+ * @param status A CMD response status.
+ * @returns True for 0x01, 0x04, 0x17 and 0x84.
+ */
+export function isRetryableStatus(status: number): boolean {
+  return (
+    status === LinkStatus.BUSY ||
+    status === LinkStatus.BULK_LOCKED ||
+    status === LinkStatus.VC_ERR_BUSY ||
+    status === LinkStatus.RATE_LIMITED
+  );
+}
+
 /** RESYNC reasons, spec 8.6. An unknown reason is treated as 0 (re-read state). */
 export enum ResyncReason {
   NOTIFY_DROPPED = 0,
@@ -58,8 +92,8 @@ export enum ResyncReason {
 }
 
 /**
- * Command direction. The client states the USB transfer type; write-as-read
- * commands travel as `get` exactly as they do over USB (spec 8.2).
+ * Command direction: the USB transfer type. Every change is a `set`, including
+ * actions with no value; a `get` never changes the device (spec 8.2).
  */
 export type CmdDirection = "set" | "get";
 
@@ -240,7 +274,8 @@ export function decodeFrame(bytes: Uint8Array): LinkFrame | null {
         wLength,
       };
       // On a GET, wLength is the number of bytes requested, not a payload length.
-      if (direction === "set") frame.payload = slice(bytes, CMD_REQUEST_HEADER_BYTES, CMD_REQUEST_HEADER_BYTES + wLength);
+      if (direction === "set")
+        frame.payload = slice(bytes, CMD_REQUEST_HEADER_BYTES, CMD_REQUEST_HEADER_BYTES + wLength);
       return frame;
     }
     case FrameType.CMD_RESPONSE: {

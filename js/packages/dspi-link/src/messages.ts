@@ -72,9 +72,12 @@ export interface HubLimits {
   poll_budget_bps: number;
 }
 
-/** `[bRequest, dir]` pairs the session may not issue; dir 0 = SET, 1 = GET. */
+/** What the session's role may not send (spec 6.3 and 7.3). */
 export interface PolicyDescriptor {
+  /** The 1.2 list of `[bRequest, dir]` pairs; a 1.3 hub sends it empty. */
   denied: Array<[number, number]>;
+  /** `[command ID, dir]` pairs, dir 0 = SET and 1 = GET. Added in 1.3. */
+  denied_ids?: Array<[number, number]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +232,11 @@ export interface DeviceInfo {
   fw?: string;
   /** Beta number, 0 for a final release. Absent means unknown, not 0 (spec 7.4, 1.1). */
   fw_beta?: number;
+  /**
+   * The device's vendor protocol, from SYS.PROTOCOL_INFO (spec 7.4, 1.3).
+   * Absent for a legacy device, which must be sent no paged command.
+   */
+  protocol?: { major: number; minor: number };
   outputs?: number;
   inputs?: number;
   wire_version?: number;

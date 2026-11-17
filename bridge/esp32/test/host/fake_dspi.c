@@ -32,11 +32,17 @@ void fake_dspi_init(fake_dspi_t *fake, uint32_t baud)
     fake->device_baud = baud;
     fake->host_baud = baud;
     fake->smallest_gap_ms = UINT32_MAX;
+    fake->paged = true;
+    static const uint8_t no_name[32] = {0};
+    fake_dspi_can(fake, PROTOCOL_INFO_ID, PROTOCOL_INFO, sizeof(PROTOCOL_INFO));
+    fake_dspi_can(fake, 0x0121, SERIAL, sizeof(SERIAL));             /* SYS.SERIAL */
+    fake_dspi_can(fake, 0x0120, PLATFORM, sizeof(PLATFORM));         /* SYS.PLATFORM */
+    fake_dspi_can(fake, 0x0B12, IFACE_STATUS, sizeof(IFACE_STATUS)); /* XPORT.STATUS */
+    fake_dspi_can(fake, 0x0B10, UART_CONFIG, sizeof(UART_CONFIG));   /* XPORT.UART_CONFIG */
+    fake_dspi_can(fake, 0x0124, no_name, sizeof(no_name));           /* SYS.DEVICE_NAME */
+    /* The same answers to firmware 1.1.6's opcodes, for its legacy mode. */
     fake_dspi_can(fake, 0x7E, SERIAL, sizeof(SERIAL));
     fake_dspi_can(fake, 0x7F, PLATFORM, sizeof(PLATFORM));
-    fake_dspi_can(fake, 0xF9, IFACE_STATUS, sizeof(IFACE_STATUS));
-    fake_dspi_can(fake, 0xF6, UART_CONFIG, sizeof(UART_CONFIG));
-    fake_dspi_can(fake, PROTOCOL_INFO_ID, PROTOCOL_INFO, sizeof(PROTOCOL_INFO));
 }
 
 void fake_dspi_set_paged(fake_dspi_t *fake, bool paged)

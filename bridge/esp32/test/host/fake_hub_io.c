@@ -108,17 +108,6 @@ static void restart(void *context, hub_restart_level_t level)
     fake->restart_level = (int)level;
 }
 
-static bool save_device_name(void *context, const char *serial, const char *name)
-{
-    fake_hub_io_t *fake = context;
-    if (fake->refuse_save_name) {
-        return false;
-    }
-    snprintf(fake->saved_device_serial, sizeof(fake->saved_device_serial), "%s", serial);
-    snprintf(fake->saved_device_name, sizeof(fake->saved_device_name), "%s", name);
-    return true;
-}
-
 static bool load_device_name(void *context, const char *serial, char *name, size_t size)
 {
     const fake_hub_io_t *fake = context;
@@ -199,7 +188,6 @@ hub_io_t fake_hub_io_init(fake_hub_io_t *fake)
         .start_wifi_scan = start_wifi_scan,
         .wifi_join = wifi_join,
         .restart = restart,
-        .save_device_name = save_device_name,
         .load_device_name = load_device_name,
         .forget_device_name = forget_device_name,
         .advertise = advertise,

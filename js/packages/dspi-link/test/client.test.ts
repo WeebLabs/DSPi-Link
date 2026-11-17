@@ -7,6 +7,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { LinkClient, closeReasonFor } from "../src/client.js";
+import { Command } from "../src/commands.js";
 import { LINK_SUBPROTOCOL } from "../src/constants.js";
 import { LinkCommandError, LinkProtocolError } from "../src/errors.js";
 import { LinkStatus, ResyncReason, type LinkFrame } from "../src/frames.js";
@@ -20,8 +21,9 @@ const DEVICE: DeviceInfo = {
   serial: "0123456789ABCDEF",
   name: "Bench",
   platform: 1,
-  fw: "1.1.6",
-  fw_beta: 5,
+  fw: "1.1.7",
+  fw_beta: 1,
+  protocol: { major: 1, minor: 0 },
   outputs: 9,
   inputs: 8,
   wire_version: 32,
@@ -139,8 +141,8 @@ describe("commands", () => {
     const client = newClient(hub);
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
 
-    const first = client.get(0, 0x7f, 6);
-    const second = client.get(0, 0xd3, 4);
+    const first = client.get(0, Command.SYS_PLATFORM, 6);
+    const second = client.get(0, Command.ROUTE_MASTER_VOLUME, 4);
     await settle();
     expect(pending.length).toBe(2);
     expect(pending[0].tag).not.toBe(pending[1].tag);
@@ -171,17 +173,66 @@ describe("commands", () => {
 
     const payload = new Uint8Array(4);
     new DataView(payload.buffer).setFloat32(0, -20, true);
-    await client.set(0, 0xd2, payload);
+    await client.set(0, Command.ROUTE_MASTER_VOLUME, payload);
 
     const sent = hub.receivedFrames.find((f) => f.type === "cmd_request");
     expect(sent).toMatchObject({
       handle: 0,
       direction: "set",
-      bRequest: 0xd2,
+      bRequest: 0x50,
       wValue: 0,
-      wIndex: 2,
+      wIndex: 0x0502,
       wLength: 4,
     });
+    client.disconnect();
+  });
+
+  it("sends an action as a SET with no payload", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.set(0, Command.MEAS_RTA_STOP);
+    const sent = hub.receivedFrames.find((f) => f.type === "cmd_request");
+    expect(sent).toMatchObject({ direction: "set", bRequest: 0x29, wIndex: 0x0902, wLength: 0 });
+    client.disconnect();
+  });
+
+  it("reports what the hub's policy denies, by command ID and direction", async () => {
+    const hub = new FakeHub({
+      auth: "pin",
+      pin: "123456",
+      role: "control",
+      deniedIds: [[Command.SYS_ENTER_BOOTLOADER, 0]],
+    });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    await client.pair("123456", "Test", "control");
+    expect(client.isDenied(Command.SYS_ENTER_BOOTLOADER, "set")).toBe(true);
+    expect(client.isDenied(Command.SYS_ENTER_BOOTLOADER, "get")).toBe(false);
+    expect(client.isDenied(Command.ROUTE_MASTER_VOLUME, "set")).toBe(false);
+    client.disconnect();
+  });
+
+  it("sends no paged command to a device without a protocol", async () => {
+    const legacy: DeviceInfo = { ...DEVICE, handle: 1, serial: "OLD0000000000001" };
+    delete legacy.protocol;
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE, legacy] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    expect(() => client.get(1, Command.SYS_PLATFORM, 7)).toThrow(/older than 1\.1\.7/);
+    expect(() => client.set(1, Command.MEAS_RTA_STOP)).toThrow(/older than 1\.1\.7/);
+    expect(hub.receivedFrames.some((f) => f.type === "cmd_request")).toBe(false);
+    await expect(client.get(0, Command.SYS_PLATFORM, 7)).resolves.toBeDefined();
+    client.disconnect();
+  });
+
+  it("refuses a GET of no bytes and a command with no page", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    expect(() => client.get(0, Command.SYS_PLATFORM, 0)).toThrow(RangeError);
+    expect(() => client.get(0, 0x7f, 7)).toThrow(RangeError); // A 1.1.6 opcode: page 0
+    expect(hub.receivedFrames.some((f) => f.type === "cmd_request")).toBe(false);
     client.disconnect();
   });
 
@@ -197,8 +248,16 @@ describe("commands", () => {
     });
     const client = newClient(hub);
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
-    await expect(client.commandOk({ handle: 0, direction: "get", bRequest: 0x7f, wValue: 0, wIndex: 2, wLength: 6 }))
-      .rejects.toBeInstanceOf(LinkCommandError);
+    await expect(
+      client.commandOk({
+        handle: 0,
+        direction: "get",
+        bRequest: 0x7f,
+        wValue: 0,
+        wIndex: 2,
+        wLength: 6,
+      }),
+    ).rejects.toBeInstanceOf(LinkCommandError);
     client.disconnect();
   });
 });
@@ -215,7 +274,10 @@ describe("events and inventory", () => {
     await settle();
     expect(client.deviceList.map((d) => d.handle)).toEqual([0, 1]);
 
-    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, handle: 1, name: "Renamed" } });
+    hub.socket.deliverText({
+      t: "device.changed",
+      device: { ...DEVICE, handle: 1, name: "Renamed" },
+    });
     await settle();
     expect(client.device(1)?.name).toBe("Renamed");
 
@@ -294,7 +356,7 @@ describe("snapshot and polls", () => {
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
 
     const granted = await client.subscribePolls(0, [
-      { slot: 0, req: 0x50, val: 9, idx: 2, len: 64, hz: 10 },
+      { slot: 0, req: 0x10, val: 0, idx: 0x0902, len: 64, hz: 10 },
     ]);
     expect(granted).toEqual([{ slot: 0, hz: 10 }]);
     await client.unsubscribePolls(0, [0]);
@@ -307,7 +369,11 @@ describe("snapshot and polls", () => {
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
     await client.acquireLock(0, "Applying configuration", 10000);
     const acquire = hub.received.find((m) => m.t === "lock.acquire");
-    expect(acquire).toMatchObject({ handle: 0, reason: "Applying configuration", timeout_ms: 10000 });
+    expect(acquire).toMatchObject({
+      handle: 0,
+      reason: "Applying configuration",
+      timeout_ms: 10000,
+    });
     await client.releaseLock(0);
     client.disconnect();
   });
@@ -342,7 +408,10 @@ describe("hub administration (spec 7.10 to 7.13)", () => {
     expect(error.code).toBe("bad_request");
     expect(error.field).toBe("uart.tx_pin");
     expect(error.detail).toBe("pin 3 cannot be used");
-    expect(hub.received.at(-1)).toMatchObject({ t: "hub.config.set", config: { uart: { tx_pin: 3 } } });
+    expect(hub.received.at(-1)).toMatchObject({
+      t: "hub.config.set",
+      config: { uart: { tx_pin: 3 } },
+    });
     client.disconnect();
   });
 
@@ -514,7 +583,7 @@ describe("close handling", () => {
     const client = newClient(hub);
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
 
-    const inflight = client.get(0, 0x7f, 6);
+    const inflight = client.get(0, Command.SYS_PLATFORM, 6);
     await settle(2);
     hub.socket.serverClose(1006);
     await expect(inflight).rejects.toThrow(/closed/);
@@ -523,7 +592,7 @@ describe("close handling", () => {
 });
 
 describe("sessions that go wrong", () => {
-  const POLL = { slot: 0, req: 0x50, val: 9, idx: 2, len: 41, hz: 10 };
+  const POLL = { slot: 0, req: 0x10, val: 0, idx: 0x0902, len: 41, hz: 10 }; // MEAS.LEVELS
 
   /** The listeners of `event` registered on a client, read for leak checks. */
   function listenerCount(client: LinkClient, event: string): number {
@@ -550,7 +619,9 @@ describe("sessions that go wrong", () => {
     await settle();
     expect(client.state).toBe("ready");
     expect(client.deviceList).toHaveLength(1);
-    await expect(client.get(0, 0x7f, 6)).resolves.toMatchObject({ status: LinkStatus.OK });
+    await expect(client.get(0, Command.SYS_PLATFORM, 6)).resolves.toMatchObject({
+      status: LinkStatus.OK,
+    });
     client.disconnect();
   });
 
@@ -701,7 +772,12 @@ describe("missed notifications (spec 8.3)", () => {
 
   it("stays quiet while both sequences run on", async () => {
     const { hub, client, resyncs } = await watch([DEVICE]);
-    for (const [tag, seq] of [[7, 254], [8, 255], [9, 0], [10, 1]]) {
+    for (const [tag, seq] of [
+      [7, 254],
+      [8, 255],
+      [9, 0],
+      [10, 1],
+    ]) {
       hub.socket.deliverFrame(notify(tag, 0, seq));
     }
     await settle();
@@ -763,7 +839,7 @@ describe("missed notifications (spec 8.3)", () => {
 });
 
 describe("restoring polls on a new session", () => {
-  const POLL = { slot: 0, req: 0x50, val: 9, idx: 2, len: 41, hz: 10 };
+  const POLL = { slot: 0, req: 0x10, val: 0, idx: 0x0902, len: 41, hz: 10 }; // MEAS.LEVELS
 
   /** Drops the socket and returns the poll.subscribe messages of the new session. */
   async function reconnect(

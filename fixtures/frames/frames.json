@@ -1,28 +1,29 @@
 {
   "frames" : [
     {
-      "bRequest" : 210,
+      "bRequest" : 80,
       "direction" : "set",
       "file" : "cmd_request_set_master_volume.bin",
       "handle" : 0,
-      "hex" : "010007000000d2000000020004000000a0c1",
-      "note" : "spec 11.1: master volume -20.0 dB, session 12",
+      "hex" : "01000700000050000000020504000000a0c1",
+      "note" : "spec 11.1: ROUTE.MASTER_VOLUME (0x0550) to -20.0 dB, session 12",
       "payload_hex" : "0000a0c1",
       "tag" : 7,
       "type" : "cmd_request",
-      "wIndex" : 2,
+      "wIndex" : 1282,
       "wLength" : 4,
       "wValue" : 0
     },
     {
-      "bRequest" : 127,
+      "bRequest" : 32,
       "direction" : "get",
       "file" : "cmd_request_get_platform.bin",
       "handle" : 1,
-      "hex" : "0100080001017f00000002000700",
+      "hex" : "0100080001012000000002010700",
+      "note" : "spec 11.2: SYS.PLATFORM (0x0120)",
       "tag" : 8,
       "type" : "cmd_request",
-      "wIndex" : 2,
+      "wIndex" : 258,
       "wLength" : 7,
       "wValue" : 0
     },
@@ -91,5 +92,5 @@
       "type" : "resync"
     }
   ],
-  "spec_version" : "1.1"
+  "spec_version" : "1.3"
 }

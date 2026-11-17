@@ -126,9 +126,11 @@
  * (bridge spec 7.5). */
 #define DSPI_UART_BAUD_CANDIDATES {1000000, 921600, 460800, 230400, 115200}
 
-/* Firmware limits on the UART (Link spec 9.2): non-bulk GET replies are cut
- * to 132 bytes and non-bulk SET payloads above 64 bytes are refused. */
-#define DSPI_UART_MAX_GET_REPLY_BYTES 132
+/* Firmware limits on the UART (Link spec 9.2), which SYS.PROTOCOL_INFO
+ * reports: a non-bulk GET reply is at most 256 bytes (MEAS.RTA_BINS returns
+ * that many) and arrives whole, and a non-bulk SET payload above 64 bytes
+ * is refused. */
+#define DSPI_UART_MAX_GET_REPLY_BYTES 256
 #define DSPI_UART_MAX_SET_PAYLOAD_BYTES 64
 
 /* Pause after every response so the firmware can send queued notifications

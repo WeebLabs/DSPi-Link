@@ -45,6 +45,7 @@ static const dspi_identity_t IDENTITY = {
     .notify_enabled = true,
     .configured_baud = 1000000,
     .has_uart_config = true,
+    .protocol_major = 1,
 };
 
 /* ---------------------------------------------------------------------------
@@ -278,7 +279,7 @@ static void hello_describes_the_bridge(void)
     cJSON *hello = last_json(0, "hello");
     CHECK(hello != NULL);
     const cJSON *proto = cJSON_GetObjectItemCaseSensitive(hello, "proto");
-    CHECK(json_number(proto, "major") == 1 && json_number(proto, "minor") == 2);
+    CHECK(json_number(proto, "major") == 1 && json_number(proto, "minor") == 3);
     const cJSON *hub_object = cJSON_GetObjectItemCaseSensitive(hello, "hub");
     CHECK(strcmp(json_string(hub_object, "kind"), "bridge") == 0);
     CHECK(strcmp(json_string(hub_object, "version"), "0.1.0") == 0);
@@ -326,6 +327,13 @@ static void pairing_without_auth_reports_the_session(void)
 
     cJSON *ok = last_json(0, "ok");
     CHECK(strcmp(json_string(ok, "role"), "admin") == 0);
+    /* Both denial lists, empty for an admin; `denied_ids` is the 1.3 one
+     * (Link spec 7.3). */
+    const cJSON *policy = cJSON_GetObjectItemCaseSensitive(ok, "policy");
+    const cJSON *denied = cJSON_GetObjectItemCaseSensitive(policy, "denied");
+    const cJSON *denied_ids = cJSON_GetObjectItemCaseSensitive(policy, "denied_ids");
+    CHECK(cJSON_IsArray(denied) && cJSON_GetArraySize(denied) == 0);
+    CHECK(cJSON_IsArray(denied_ids) && cJSON_GetArraySize(denied_ids) == 0);
     cJSON_Delete(ok);
 }
 
@@ -393,11 +401,13 @@ static void a_found_device_is_announced_and_listed(void)
     CHECK(json_number(device, "outputs") == 9);
     CHECK(strcmp(json_string(device, "link"), "uart") == 0);
     CHECK(strcmp(json_string(device, "state"), "online") == 0);
+    const cJSON *protocol = cJSON_GetObjectItemCaseSensitive(device, "protocol");
+    CHECK(json_number(protocol, "major") == 1 && json_number(protocol, "minor") == 0);
     cJSON_Delete(added);
 
     /* The background read gives the device object its wire version. */
     CHECK(io_record.submission_count == 1);
-    CHECK(io_record.submissions[0].request.request == 0xA0);
+    CHECK(submitted_id(&io_record.submissions[0]) == STORE_ALL_PARAMS);
     static uint8_t bulk[6136] = {32, 1, 17, 9, 8};
     answer_last(0, bulk, sizeof(bulk));
     cJSON *changed = last_json(0, "device.changed");
@@ -438,31 +448,16 @@ static void a_returning_device_triggers_resync(void)
     CHECK(resync != NULL && resync->data[5] == LINK_RESYNC_REATTACHED);
 }
 
-static void devices_can_be_renamed(void)
-{
-    start();
-    open_session(0);
-    attach_device();
-    send_json(0, "{\"t\":\"device.rename\",\"id\":4,\"handle\":0,\"name\":\"Living room\"}");
-    CHECK(strcmp(io_record.saved_device_name, "Living room") == 0);
-    CHECK(io_record.submission_count == 0); /* Old firmware: nothing goes to the board */
-    cJSON *changed = last_json(0, "device.changed");
-    CHECK(strcmp(json_string(cJSON_GetObjectItemCaseSensitive(changed, "device"), "name"),
-                 "Living room") == 0);
-    cJSON_Delete(changed);
-}
-
 /* ---------------------------------------------------------------------------
  * Names kept on the board (firmware device_name_spec.md section 5)
  * ------------------------------------------------------------------------- */
 
 static uint16_t last_notify_origin(int slot);
 
-/* IDENTITY on firmware that keeps its own name, currently `name`. */
+/* IDENTITY with the board's own name `name`. */
 static dspi_identity_t capable_identity(const char *name)
 {
     dspi_identity_t identity = IDENTITY;
-    identity.has_board_name = true;
     snprintf(identity.board_name, sizeof(identity.board_name), "%s", name);
     return identity;
 }
@@ -474,11 +469,11 @@ static void store_name(const char *name)
     snprintf(io_record.saved_device_name, sizeof(io_record.saved_device_name), "%s", name);
 }
 
-/* The last submission of `request`, or NULL. */
-static const fake_submission_t *submission_of(uint8_t request)
+/* The last submission of command `id`, or NULL. */
+static const fake_submission_t *submission_of(uint16_t id)
 {
     for (size_t i = io_record.submission_count; i > 0; i--) {
-        if (io_record.submissions[i - 1].request.request == request) {
+        if (submitted_id(&io_record.submissions[i - 1]) == id) {
             return &io_record.submissions[i - 1];
         }
     }
@@ -494,18 +489,18 @@ static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uin
 }
 
 /* Brings `identity` online and answers the snapshot read. With a name to
- * adopt, the 0x56 is answered `adoption_status` in queue order. */
+ * adopt, the name write is answered `adoption_status` in queue order. */
 static void attach_identity(const dspi_identity_t *identity, uint8_t adoption_status)
 {
     hub_device_found(&hub, identity, 1000000);
     static uint8_t bulk[6136] = {32, 0, 17, 0, 8};
-    answer_tag(submission_of(0xA0)->tag, 0, bulk, sizeof(bulk));
-    const fake_submission_t *adoption = submission_of(0x56);
+    answer_tag(submission_of(STORE_ALL_PARAMS)->tag, 0, bulk, sizeof(bulk));
+    const fake_submission_t *adoption = submission_of(SYS_DEVICE_NAME);
     if (adoption != NULL) {
         answer_tag(adoption->tag, adoption_status, NULL, 0);
     }
     static const uint8_t status[41] = {1, 2, 3};
-    answer_tag(submission_of(0x50)->tag, 0, status, sizeof(status));
+    answer_tag(submission_of(MEAS_LEVELS)->tag, 0, status, sizeof(status));
 }
 
 /* A NOTIFY_EVT_DEVICE_NAME (0x10) packet carrying `name` from `source`. */
@@ -544,7 +539,7 @@ static void the_board_name_wins_over_the_stored_one(void)
     hub_device_found(&hub, &identity, 1000000);
     CHECK(strcmp(shown_name(0, "device.added"), "Rack left") == 0);
     CHECK(io_record.saved_device_name[0] == '\0' && io_record.forget_count == 1);
-    CHECK(submission_of(0x56) == NULL);
+    CHECK(submission_of(SYS_DEVICE_NAME) == NULL);
 
     /* Back again after a rename elsewhere: the board decides again. */
     hub_device_lost(&hub);
@@ -562,7 +557,7 @@ static void a_stored_name_is_adopted_by_an_unnamed_board_once(void)
     hub_device_found(&hub, &identity, 1000000);
     CHECK(strcmp(shown_name(0, "device.added"), "Caf\xC3\xA9 \xE2\x80\x93 Rack") == 0);
 
-    const fake_submission_t *write = submission_of(0x56);
+    const fake_submission_t *write = submission_of(SYS_DEVICE_NAME);
     CHECK(write != NULL);
     CHECK(!write->request.is_get && write->request.length == 32 && !write->may_retry);
     uint8_t expected[32] = "Caf Rack";
@@ -570,10 +565,10 @@ static void a_stored_name_is_adopted_by_an_unnamed_board_once(void)
 
     /* Refused: the stored name stays, for the next attach. */
     static uint8_t bulk[6136] = {32, 0, 17, 0, 8};
-    answer_tag(submission_of(0xA0)->tag, 0, bulk, sizeof(bulk));
+    answer_tag(submission_of(STORE_ALL_PARAMS)->tag, 0, bulk, sizeof(bulk));
     answer_tag(write->tag, DSPI_STATUS_ERROR, NULL, 0);
     CHECK(io_record.forget_count == 0 && io_record.saved_device_name[0] != '\0');
-    answer_tag(submission_of(0x50)->tag, 0, (const uint8_t[41]){0}, 41);
+    answer_tag(submission_of(MEAS_LEVELS)->tag, 0, (const uint8_t[41]){0}, 41);
 
     /* Accepted: forgotten at once, even with no 0x10 to follow. */
     hub_device_lost(&hub);
@@ -584,19 +579,8 @@ static void a_stored_name_is_adopted_by_an_unnamed_board_once(void)
     hub_device_lost(&hub);
     forget_submissions();
     hub_device_found(&hub, &identity, 1000000);
-    CHECK(submission_of(0x56) == NULL);
+    CHECK(submission_of(SYS_DEVICE_NAME) == NULL);
     CHECK(strcmp(hub.device.name, "DSPi 2E2C") == 0);
-}
-
-static void old_firmware_keeps_the_stored_name(void)
-{
-    start();
-    open_session(0);
-    store_name("Kitchen");
-    hub_device_found(&hub, &IDENTITY, 1000000);
-    CHECK(strcmp(shown_name(0, "device.added"), "Kitchen") == 0);
-    CHECK(submission_of(0x56) == NULL);
-    CHECK(strcmp(io_record.saved_device_name, "Kitchen") == 0);
 }
 
 static void a_name_notification_sets_the_name(void)
@@ -626,15 +610,16 @@ static void a_name_notification_sets_the_name(void)
 
 static void a_name_notification_retires_the_stored_name(void)
 {
-    /* An old-firmware identity can still hear 0x10: the board was updated
-     * meanwhile, or both probes missed. */
+    /* The adoption write is refused, so the stored entry stays until the
+     * board names itself some other way. */
     start();
     open_session(0);
     store_name("Kitchen");
-    attach_device();
+    const dspi_identity_t identity = capable_identity("");
+    attach_identity(&identity, DSPI_STATUS_VC_ERR_BUSY);
+    CHECK(io_record.forget_count == 0);
     notify_name(1, 6, "Studio");
     CHECK(io_record.forget_count == 1);
-    CHECK(hub.device.identity.has_board_name);
     CHECK(strcmp(hub.device.name, "Studio") == 0);
 }
 
@@ -652,7 +637,8 @@ static void a_rename_writes_the_board_and_waits_for_the_notification(void)
                  "\"name\":\"  Caf\xC3\xA9  \xE2\x80\x93 Rack\\u0007 \"}");
     CHECK(io_record.submission_count == 1);
     const fake_submission_t *write = &io_record.submissions[0];
-    CHECK(write->request.request == 0x56 && write->request.length == 32 && !write->may_retry);
+    CHECK(submitted_id(write) == SYS_DEVICE_NAME && write->request.length == 32 &&
+          !write->may_retry);
     uint8_t expected[32] = "Caf Rack";
     CHECK(memcmp(write->payload, expected, sizeof(expected)) == 0);
     CHECK(last_answer_id(0, "ok") != 7);
@@ -744,12 +730,12 @@ static void a_locked_board_cannot_be_renamed_by_another_session(void)
     CHECK(io_record.submission_count == 0);
 }
 
-/* How many 0x56 writes the hub has submitted. */
+/* How many SYS.DEVICE_NAME writes the hub has submitted. */
 static size_t name_writes(void)
 {
     size_t count = 0;
     for (size_t i = 0; i < io_record.submission_count; i++) {
-        count += io_record.submissions[i].request.request == 0x56;
+        count += submitted_id(&io_record.submissions[i]) == SYS_DEVICE_NAME;
     }
     return count;
 }
@@ -783,7 +769,7 @@ static void a_rename_answer_for_a_closed_session_goes_nowhere(void)
     attach_identity(&identity, DSPI_STATUS_OK);
     forget_submissions();
     send_json(0, "{\"t\":\"device.rename\",\"id\":5,\"handle\":0,\"name\":\"Den\"}");
-    const uint32_t tag = submission_of(0x56)->tag;
+    const uint32_t tag = submission_of(SYS_DEVICE_NAME)->tag;
 
     hub_session_closed(&hub, 0);
     open_session(0); /* The slot is reused by a new session */
@@ -800,7 +786,7 @@ static void a_pending_adoption_is_not_repeated_on_reattach(void)
     store_name("Kitchen");
     const dspi_identity_t identity = capable_identity("");
     hub_device_found(&hub, &identity, 1000000);
-    const uint32_t tag = submission_of(0x56)->tag;
+    const uint32_t tag = submission_of(SYS_DEVICE_NAME)->tag;
 
     hub_device_lost(&hub);
     hub_device_found(&hub, &identity, 1000000);
@@ -817,7 +803,7 @@ static void an_adoption_answer_after_a_board_swap_is_ignored(void)
     store_name("Kitchen");
     const dspi_identity_t identity = capable_identity("");
     hub_device_found(&hub, &identity, 1000000);
-    const uint32_t tag = submission_of(0x56)->tag;
+    const uint32_t tag = submission_of(SYS_DEVICE_NAME)->tag;
 
     dspi_identity_t other = capable_identity("Desk");
     snprintf(other.serial, sizeof(other.serial), "%s", "0000000000000001");
@@ -932,6 +918,39 @@ static void long_sets_are_oversize_but_bulk_sets_go_through(void)
     CHECK(io_record.submission_count == 1);
     CHECK(io_record.submissions[0].request.length == sizeof(payload));
     CHECK(io_record.submissions[0].payload[100] == 0x5A);
+}
+
+/* MEAS.RTA_BINS returns up to 256 bytes per request: the whole reply
+ * reaches the client. */
+static void a_256_byte_reply_arrives_whole(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    send_cmd(0, 9, true, MEAS_RTA_BINS, 256, NULL);
+    static uint8_t bins[256];
+    bins[255] = 0x77;
+    answer_last(0, bins, sizeof(bins));
+    const fake_message_t *response = last_frame(0, LINK_FRAME_CMD_RESPONSE);
+    CHECK(response != NULL && response->data[4] == 0);
+    CHECK((response->data[6] | response->data[7] << 8) == 256);
+    CHECK(response->data[LINK_CMD_RESPONSE_HEADER_BYTES + 255] == 0x77);
+}
+
+/* The firmware's command results pass through unchanged (Link spec 8.1). */
+static void firmware_result_codes_reach_the_client(void)
+{
+    start();
+    open_session(0);
+    attach_device();
+    const uint8_t codes[] = {DSPI_STATUS_VC_ERR_UNKNOWN, DSPI_STATUS_VC_ERR_BLOCKED,
+                             DSPI_STATUS_VC_ERR_BUSY, DSPI_STATUS_VC_ERR_PIN_IN_USE};
+    for (size_t i = 0; i < sizeof(codes); i++) {
+        send_cmd(0, (uint16_t)(20 + i), false, ROUTE_MASTER_VOLUME, 4,
+                 (const uint8_t[]){0, 0, 0xA0, 0xC1});
+        answer_last(codes[i], NULL, 0);
+        CHECK(last_status(0) == codes[i]);
+    }
 }
 
 static void failures_map_to_link_statuses(void)
@@ -1132,11 +1151,11 @@ static void only_reads_may_be_polled(void)
 
 static void answer_tag(uint32_t tag, uint8_t status, const uint8_t *payload, uint16_t length);
 
-/* The request of the last submission, or -1 if there is none. */
+/* The command ID of the last submission, or -1 if there is none. */
 static int last_request(void)
 {
     return io_record.submission_count > 0
-               ? io_record.submissions[io_record.submission_count - 1].request.request
+               ? submitted_id(&io_record.submissions[io_record.submission_count - 1])
                : -1;
 }
 
@@ -1150,7 +1169,7 @@ static void snapshots_read_the_status_fresh_and_the_blob_when_it_changed(void)
      * 8.6), and the answer waits for it. */
     forget_messages();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
-    CHECK(io_record.submission_count == 1 && last_request() == 0x50);
+    CHECK(io_record.submission_count == 1 && last_request() == MEAS_LEVELS);
     CHECK(last_json(0, "ok") == NULL);
     static const uint8_t status[41] = {7, 7, 7};
     answer_last(0, status, sizeof(status));
@@ -1164,7 +1183,8 @@ static void snapshots_read_the_status_fresh_and_the_blob_when_it_changed(void)
     forget_messages();
     forget_submissions();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
-    CHECK(io_record.submission_count == 1 && last_request() == 0xA0); /* Stale: blob too */
+    CHECK(io_record.submission_count == 1 &&
+          last_request() == STORE_ALL_PARAMS); /* Stale: blob too */
     CHECK(last_json(0, "ok") == NULL);
 }
 
@@ -1184,7 +1204,7 @@ static void a_snapshot_asked_during_a_status_read_waits_for_the_next(void)
     CHECK(ok != NULL);
     cJSON_Delete(ok);
     CHECK(last_json(1, "ok") == NULL); /* Its read had started before it asked */
-    CHECK(io_record.submission_count == 2 && last_request() == 0x50);
+    CHECK(io_record.submission_count == 2 && last_request() == MEAS_LEVELS);
     answer_last(0, status, sizeof(status));
     ok = last_json(1, "ok");
     CHECK(ok != NULL && json_number(ok, "id") == 7);
@@ -1206,7 +1226,7 @@ static void without_notifications_every_snapshot_reads_the_blob(void)
 
     /* Nothing would tell the cache the DSPi changed, so it is never trusted. */
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
-    CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
+    CHECK(io_record.submission_count == 1 && last_request() == STORE_ALL_PARAMS);
 }
 
 static void a_set_marks_the_cache_stale_and_a_get_does_not(void)
@@ -1218,14 +1238,14 @@ static void a_set_marks_the_cache_stale_and_a_get_does_not(void)
     answer_last(0, (const uint8_t[82]){0}, 82);
     forget_submissions();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":6,\"handle\":0}");
-    CHECK(io_record.submission_count == 1 && last_request() == 0x50); /* Status only */
+    CHECK(io_record.submission_count == 1 && last_request() == MEAS_LEVELS); /* Status only */
     answer_last(0, (const uint8_t[41]){0}, 41);
 
     send_cmd(0, 2, false, STORE_PRESET_LOAD, 0, NULL);
     answer_last(0, NULL, 0);
     forget_submissions();
     send_json(0, "{\"t\":\"device.snapshot\",\"id\":7,\"handle\":0}");
-    CHECK(io_record.submission_count == 1 && last_request() == 0xA0);
+    CHECK(io_record.submission_count == 1 && last_request() == STORE_ALL_PARAMS);
 }
 
 static void an_answer_for_an_abandoned_snapshot_read_is_ignored(void)
@@ -1831,7 +1851,8 @@ static void an_update_holds_back_large_answers_until_it_ends(void)
     forget_submissions();
     send_chunk(0, transfer, 4, 2); /* A gap ends the update */
     CHECK(io_record.update_aborts == 1);
-    CHECK(io_record.submission_count == 1 && last_request() == 0x50); /* The snapshot's read */
+    CHECK(io_record.submission_count == 1 &&
+          last_request() == MEAS_LEVELS); /* The snapshot's read */
     answer_last(0, status, sizeof(status));
     cJSON *ok = last_json(1, "ok");
     CHECK(ok != NULL);
@@ -1945,13 +1966,6 @@ static void failures_the_io_reports_are_errors(void)
     CHECK(strcmp(json_string(err, "code"), "internal") == 0);
     cJSON_Delete(err);
     CHECK(hub_rename(&hub, "Studio") == HUB_CHANGE_FAILED);
-
-    io_record.refuse_save_name = true;
-    send_json(0, "{\"t\":\"device.rename\",\"id\":23,\"handle\":0,\"name\":\"Kitchen\"}");
-    err = last_json(0, "err");
-    CHECK(strcmp(json_string(err, "code"), "internal") == 0);
-    cJSON_Delete(err);
-    CHECK(strcmp(hub.device.name, "Kitchen") != 0);
 
     io_record.scan_result = HUB_IO_BUSY;
     send_json(0, "{\"t\":\"hub.wifi.scan\",\"id\":24}");
@@ -2618,10 +2632,8 @@ void test_hub(void)
     RUN(a_found_device_is_announced_and_listed);
     RUN(a_lost_device_goes_offline_then_away);
     RUN(a_returning_device_triggers_resync);
-    RUN(devices_can_be_renamed);
     RUN(the_board_name_wins_over_the_stored_one);
     RUN(a_stored_name_is_adopted_by_an_unnamed_board_once);
-    RUN(old_firmware_keeps_the_stored_name);
     RUN(a_name_notification_sets_the_name);
     RUN(a_name_notification_retires_the_stored_name);
     RUN(a_rename_writes_the_board_and_waits_for_the_notification);
@@ -2638,6 +2650,8 @@ void test_hub(void)
     RUN(commands_without_a_device_are_refused);
     RUN(too_many_commands_are_rate_limited);
     RUN(long_sets_are_oversize_but_bulk_sets_go_through);
+    RUN(a_256_byte_reply_arrives_whole);
+    RUN(firmware_result_codes_reach_the_client);
     RUN(failures_map_to_link_statuses);
     RUN(a_reply_for_a_closed_session_goes_nowhere);
     RUN(notifications_carry_the_writers_session);

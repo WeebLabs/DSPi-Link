@@ -21,7 +21,7 @@
 #define FAKE_DSPI_MAX_PAYLOAD 8192
 #define FAKE_DSPI_OUTPUT_BYTES 16384
 #define FAKE_DSPI_MAX_ACTIONS 16
-#define FAKE_DSPI_MAX_CANNED 8
+#define FAKE_DSPI_MAX_CANNED 16
 #define FAKE_DSPI_MAX_RECORDED 32
 
 /* How the fake answers one request. */
@@ -89,14 +89,16 @@ typedef struct {
     uint32_t smallest_gap_ms;    /* Shortest time from an answer to the next request */
 } fake_dspi_t;
 
-/* A DSPi at `baud` with serial, platform, interface status and UART
- * configuration answers already canned. It starts as firmware 1.1.6, which
- * ignores the page byte and refuses unknown commands with 0x02. */
+/* A DSPi at `baud` with protocol info, serial, platform, interface status,
+ * UART configuration and an empty board name already canned, both as the
+ * paged commands of firmware 1.1.7 and as the 1.1.6 opcodes. It starts as
+ * firmware 1.1.7; fake_dspi_set_paged(false) makes it 1.1.6. */
 void fake_dspi_init(fake_dspi_t *fake, uint32_t baud);
 
-/* Makes the fake firmware 1.1.7: it answers SYS.PROTOCOL_INFO, finds canned
- * replies by full command ID, and refuses page 0 and unknown commands with
- * 0x10 VC_ERR_UNKNOWN. */
+/* Chooses the firmware generation. Paged (1.1.7): canned replies are found
+ * by full command ID, and page 0 and unknown commands are refused with 0x10
+ * VC_ERR_UNKNOWN. Legacy (1.1.6): the page byte is ignored, only page 0 IDs
+ * are found, and unknown commands are refused with 0x02. */
 void fake_dspi_set_paged(fake_dspi_t *fake, bool paged);
 
 /* The port a dspi_link uses to talk to this fake. */

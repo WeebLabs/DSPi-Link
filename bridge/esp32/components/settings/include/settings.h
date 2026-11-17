@@ -38,18 +38,14 @@ esp_err_t settings_load(bridge_settings_t *out);
 esp_err_t settings_save(const bridge_settings_t *settings);
 
 /*
- * Device names, saved by serial in the `devices` namespace (bridge spec
- * 8.7 and 11). Up to LINK_MAX_DEVICE_NAMES are kept; saving a new one when
- * full replaces the name saved least recently.
+ * Device names saved by serial in the `devices` namespace (bridge spec 8.7
+ * and 11) by bridge firmware 0.1.0, for boards whose firmware kept no name.
+ * The hub only reads them, to adopt onto a board, and deletes them.
  */
 
 /* Copies the saved name for `serial` into `name`. ESP_ERR_NOT_FOUND if
  * there is none. */
 esp_err_t settings_load_device_name(const char *serial, char *name, size_t size);
-
-/* Saves `name` for `serial`, replacing any earlier name for it. Returns
- * ESP_ERR_INVALID_ARG if the name breaks settings_name_is_valid(). */
-esp_err_t settings_save_device_name(const char *serial, const char *name);
 
 /* Deletes the saved name for `serial`. ESP_OK, writing nothing, if there is
  * none: a board that keeps its own name is checked on every attach. */

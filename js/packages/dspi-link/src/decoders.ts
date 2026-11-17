@@ -39,10 +39,10 @@ export const BULK_MASTER_VOLUME_OFFSET = 4700;
 /** master_volume_db sentinel meaning muted (the firmware's mute value). */
 export const MASTER_VOLUME_MUTE_DB = -128;
 
-/** The `platform` byte of the bulk header and REQ_GET_PLATFORM for an RP2040. */
+/** The `platform` byte of the bulk header and SYS.PLATFORM for an RP2040. */
 export const WIRE_PLATFORM_RP2040 = 0;
 
-/** The `platform` byte of the bulk header and REQ_GET_PLATFORM for an RP2350. */
+/** The `platform` byte of the bulk header and SYS.PLATFORM for an RP2350. */
 export const WIRE_PLATFORM_RP2350 = 1;
 
 const FLOAT32_BYTES = 4;
@@ -67,7 +67,7 @@ function requireLength(bytes: Uint8Array, minimum: number, what: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk blob (REQ_GET_ALL_PARAMS, 0xA0)
+// Bulk blob (STORE.ALL_PARAMS, 0x0240)
 
 /** The 16-byte WireHeader at the start of every bulk blob. */
 export interface BulkHeader {
@@ -90,7 +90,7 @@ export interface BulkHeader {
  * Decodes the 16-byte WireHeader that opens every bulk blob. This part of the
  * layout has never moved, so it is safe to read before checking the version.
  *
- * @param blob A REQ_GET_ALL_PARAMS response or a snapshot's `bulk`.
+ * @param blob A STORE.ALL_PARAMS response or a snapshot's `bulk`.
  * @returns The header fields.
  * @throws LinkDecodeError when the blob is shorter than the header.
  */
@@ -147,7 +147,7 @@ export function isSupportedBulkVersion(header: BulkHeader): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Combined status frame (REQ_GET_STATUS 0x50, wValue 9)
+// Meter frame (MEAS.LEVELS, 0x0910; the 1.1.6 status frame, same bytes)
 
 /** The combined meter packet, decoded. */
 export interface StatusFrame {
@@ -177,7 +177,7 @@ const STATUS_TAIL_BYTES = 7;
  * must supply the bulk header's. Older firmware sent clip_flags as a u16 and
  * no input count, so the tail is read by length.
  *
- * @param bytes The REQ_GET_STATUS wValue 9 response or a POLL payload.
+ * @param bytes The MEAS.LEVELS response or a POLL payload.
  * @param numChannels The bulk header's num_channels.
  * @returns The decoded frame.
  * @throws LinkDecodeError on a bad channel count or a frame too short for it.
@@ -218,7 +218,7 @@ export function statusFrameLength(numChannels: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Platform reply (REQ_GET_PLATFORM, 0x7F)
+// Platform reply (SYS.PLATFORM, 0x0120; the 1.1.6 layout)
 
 /** The platform reply, decoded. */
 export interface PlatformInfo {
@@ -252,7 +252,7 @@ const PLATFORM_FULL_BYTES = 7;
  * while both fields are 15 or under, so they are a fallback for the 4-byte
  * short read old firmware returns.
  *
- * @param bytes The REQ_GET_PLATFORM response.
+ * @param bytes The SYS.PLATFORM response.
  * @returns The decoded reply.
  * @throws LinkDecodeError when the reply is shorter than 4 bytes.
  */

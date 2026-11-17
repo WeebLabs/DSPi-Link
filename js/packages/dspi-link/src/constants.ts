@@ -20,10 +20,10 @@ export const LINK_WS_PATH = "/dspi/v1";
 export const LINK_INFO_PATH = `${LINK_WS_PATH}/info`;
 
 /** The protocol version this library implements, sent in the client hello (Link spec 7.2). */
-export const LINK_PROTO_VERSION = { major: 1, minor: 2 } as const;
+export const LINK_PROTO_VERSION = { major: 1, minor: 3 } as const;
 
 /**
  * This library's own version, sent as the client's `version` in hello when
  * the application gives none. Kept equal to package.json by a test.
  */
-export const LINK_LIBRARY_VERSION = "1.2.0";
+export const LINK_LIBRARY_VERSION = "1.3.0";
