@@ -213,16 +213,45 @@ describe("commands", () => {
     client.disconnect();
   });
 
-  it("sends no paged command to a device without a protocol", async () => {
+  it("sends no paged command to a device without protocol 1", async () => {
     const legacy: DeviceInfo = { ...DEVICE, handle: 1, serial: "OLD0000000000001" };
     delete legacy.protocol;
-    const hub = new FakeHub({ auth: "none", devices: [DEVICE, legacy] });
+    const future: DeviceInfo = {
+      ...DEVICE,
+      handle: 2,
+      serial: "NEW0000000000002",
+      protocol: { major: 2, minor: 0 },
+    };
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE, legacy, future] });
     const client = newClient(hub);
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
-    expect(() => client.get(1, Command.SYS_PLATFORM, 7)).toThrow(/older than 1\.1\.7/);
-    expect(() => client.set(1, Command.MEAS_RTA_STOP)).toThrow(/older than 1\.1\.7/);
+    await expect(client.get(1, Command.SYS_PLATFORM, 7)).rejects.toThrow(/older than 1\.1\.7/);
+    await expect(client.set(1, Command.MEAS_RTA_STOP)).rejects.toThrow(/older than 1\.1\.7/);
+    await expect(client.get(2, Command.SYS_PLATFORM, 7)).rejects.toThrow(/protocol 2/);
+    const meters = { slot: 0, req: 0x10, val: 0, idx: 0x0902, len: 41, hz: 10 };
+    await expect(client.subscribePolls(1, [meters])).rejects.toThrow(/older than 1\.1\.7/);
     expect(hub.receivedFrames.some((f) => f.type === "cmd_request")).toBe(false);
+    expect(hub.received.some((m) => m.t === "poll.subscribe")).toBe(false);
     await expect(client.get(0, Command.SYS_PLATFORM, 7)).resolves.toBeDefined();
+    client.disconnect();
+  });
+
+  it("drops remembered polls when a device returns on older firmware", async () => {
+    const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
+    const client = newClient(hub);
+    await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
+    const meters = { slot: 0, req: 0x10, val: 0, idx: 0x0902, len: 41, hz: 10 };
+    await client.subscribePolls(0, [meters]);
+    const errors: Error[] = [];
+    client.on("error", (error) => errors.push(error));
+
+    hub.socket.deliverText({ t: "device.changed", device: { ...DEVICE, state: "offline" } });
+    const downgraded: DeviceInfo = { ...DEVICE, fw: "1.1.6" };
+    delete downgraded.protocol;
+    hub.socket.deliverText({ t: "device.changed", device: downgraded });
+    await settle();
+    expect(hub.received.filter((m) => m.t === "poll.subscribe")).toHaveLength(1);
+    expect(errors.some((e) => /older than 1\.1\.7/.test(e.message))).toBe(true);
     client.disconnect();
   });
 
@@ -230,8 +259,8 @@ describe("commands", () => {
     const hub = new FakeHub({ auth: "none", devices: [DEVICE] });
     const client = newClient(hub);
     await client.connect("ws://hub/dspi/v1", { clientName: "Test" });
-    expect(() => client.get(0, Command.SYS_PLATFORM, 0)).toThrow(RangeError);
-    expect(() => client.get(0, 0x7f, 7)).toThrow(RangeError); // A 1.1.6 opcode: page 0
+    await expect(client.get(0, Command.SYS_PLATFORM, 0)).rejects.toThrow(RangeError);
+    await expect(client.get(0, 0x7f, 7)).rejects.toThrow(RangeError); // A 1.1.6 opcode: page 0
     expect(hub.receivedFrames.some((f) => f.type === "cmd_request")).toBe(false);
     client.disconnect();
   });

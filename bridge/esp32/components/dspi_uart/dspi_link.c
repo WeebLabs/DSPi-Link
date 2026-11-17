@@ -481,16 +481,16 @@ static dspi_probe_t classify_probe(const dspi_reply_t *reply)
 {
     static const uint8_t magic[4] = {'D', 'S', 'P', 'i'};
     dspi_probe_t probe = {.firmware = DSPI_FIRMWARE_NOT_READY};
-    if (reply->status == DSPI_STATUS_ERROR) {
+    if (dspi_status_is_legacy(reply->status)) {
         probe.firmware = DSPI_FIRMWARE_TOO_OLD;
-    } else if (reply->status == DSPI_STATUS_OK) {
-        const bool ours = reply->length >= 6 && memcmp(reply->payload, magic, 4) == 0 &&
-                          reply->payload[4] == DSPI_PROTOCOL_MAJOR;
+    } else if (reply->status == DSPI_STATUS_OK && reply->length >= 6 &&
+               memcmp(reply->payload, magic, sizeof(magic)) == 0) {
+        /* A DSPi. Without the magic it is something else, or a damaged
+         * reply: not ready, so it is probed again and never attached. */
+        const bool ours = reply->payload[4] == DSPI_PROTOCOL_MAJOR;
         probe.firmware = ours ? DSPI_FIRMWARE_PAGED : DSPI_FIRMWARE_TOO_NEW;
-        if (ours) {
-            probe.protocol_major = reply->payload[4];
-            probe.protocol_minor = reply->payload[5];
-        }
+        probe.protocol_major = reply->payload[4];
+        probe.protocol_minor = reply->payload[5];
     }
     return probe;
 }
@@ -570,6 +570,33 @@ void dspi_platform_version(const uint8_t *platform, size_t length, char *out, si
 int dspi_link_read_legacy_platform(dspi_link_t *link, uint8_t *platform)
 {
     return read_get(link, DSPI_LEGACY_REQ_GET_PLATFORM, platform, DSPI_PLATFORM_BYTES);
+}
+
+dspi_attach_t dspi_link_identify(dspi_link_t *link, const dspi_probe_t *probe,
+                                 dspi_identity_t *identity, dspi_legacy_t *legacy)
+{
+    switch (probe->firmware) {
+    case DSPI_FIRMWARE_PAGED:
+        if (!dspi_link_read_identity(link, identity)) {
+            return DSPI_ATTACH_IDENTITY_FAILED;
+        }
+        identity->protocol_major = probe->protocol_major;
+        identity->protocol_minor = probe->protocol_minor;
+        return DSPI_ATTACH_FOUND;
+    case DSPI_FIRMWARE_TOO_OLD:
+        /* Its own platform read, once, and nothing else: every paged
+         * request would run an unrelated 1.1.6 opcode. */
+        if (legacy->platform_length == 0) {
+            const int length = dspi_link_read_legacy_platform(link, legacy->platform);
+            legacy->platform_length = length > 0 ? (uint8_t)length : 0;
+        }
+        return DSPI_ATTACH_REFUSED;
+    case DSPI_FIRMWARE_TOO_NEW:
+        return DSPI_ATTACH_REFUSED;
+    case DSPI_FIRMWARE_NOT_READY:
+        break;
+    }
+    return DSPI_ATTACH_NOT_READY;
 }
 
 bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity)

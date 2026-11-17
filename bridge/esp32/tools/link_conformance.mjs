@@ -274,6 +274,13 @@ async function main() {
   const client = await connect("conformance");
   const listener = await connect("conformance listener");
   check(client.deviceList.length === 1, `the DSPi is online (${info.devices[0]?.serial})`);
+  const protocol = client.deviceList[0]?.protocol;
+  check(protocol?.major === 1, `the DSPi speaks protocol 1 (${JSON.stringify(protocol)})`);
+  if (protocol?.major !== 1) {
+    // Older firmware ignores the page and would run unrelated opcodes.
+    console.error("Stopping: every check from here sends paged commands.");
+    process.exit(1);
+  }
   await commands(client);
   // The combined status frame's length, as tools/link_smoke.mjs works it out.
   const snapshot = await client.snapshot(0);

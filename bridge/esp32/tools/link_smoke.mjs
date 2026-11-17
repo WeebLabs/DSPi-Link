@@ -54,6 +54,11 @@ async function main() {
   const handle = devices[0].handle;
 
   check(devices[0].protocol?.major === 1, `protocol ${JSON.stringify(devices[0].protocol)}`);
+  if (devices[0].protocol?.major !== 1) {
+    // Older firmware ignores the page and would run unrelated opcodes.
+    console.error("The DSPi does not speak protocol 1 (firmware 1.1.7 or later); stopping.");
+    process.exit(1);
+  }
   const platformBytes = await writer.commandOk({
     handle, direction: "get", ...commandAddress(Command.SYS_PLATFORM), wValue: 0, wLength: 7,
   });

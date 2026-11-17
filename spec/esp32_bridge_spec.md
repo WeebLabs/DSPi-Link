@@ -541,24 +541,31 @@ reports into Link events.
     `XPORT.UART_CONFIG` (0x0B10) and `SYS.DEVICE_NAME` (0x0124, 32 bytes),
     then reports the device found with those values and the protocol
     version. The hub assigns handle 0 and sends `device.added`.
-  - **Status `0x02`.** Firmware 1.1.6 or older, which does not know the
-    command. The uart task sends it only the legacy `REQ_GET_PLATFORM`
+  - **Status `0x02` or `0x03`.** Firmware 1.1.6 or older, which does not
+    know the command. The uart task sends it only the legacy `REQ_GET_PLATFORM`
     (0x7F, frame `A5 02 7F 00 00 00 00 07 00 87 29`) to learn its version,
     reports the firmware too old, and attaches nothing. It keeps probing
     every 2 s, so the bridge attaches the board once it is updated.
-  - **OK with any other protocol major, or a reply that is not `DSPi`.**
-    Firmware too new for this bridge. Reported like too old, without a
-    version, and nothing is attached.
-  - **Any other status**, such as `0x01` while a USB transfer holds the
-    device's buffers. Not found yet; the next probe tries again.
-- **Watching.** When the link has carried no traffic for 1 s, the uart task
-  reads `SYS.SERIAL` as a heartbeat. An answer with a different serial
+  - **OK, `DSPi`, with any other protocol major.** Firmware too new for
+    this bridge. Reported like too old, without a version, and nothing is
+    attached.
+  - **Any other answer**, such as `0x01` while a USB transfer holds the
+    device's buffers, or an OK reply that is not `DSPi`. Not found yet; the
+    next probe tries again, and nothing else is sent.
+- **Watching.** When the link has carried no traffic for 1 s, and in any
+  case at least every 5 s however busy it is, the uart task reads
+  `SYS.SERIAL` as a heartbeat. An answer with a different serial
   means another DSPi was plugged in: the uart task reports the device lost,
   and the next probe finds the new one (see Swapping). A busy answer
   (`0x01`, `0x04` or `0x17`) means the same device. Any other refusal also
   means the device changed, because a legacy board swapped in answers a
-  paged read with `0x02`, so it is reported lost and re-probed. A quick
-  reboot of the same DSPi cannot be told apart from no change.
+  paged read with `0x02`, so it is reported lost and re-probed. For the
+  same reason, any request answered `0x02` or `0x03`, which firmware 1.1.7
+  never sends, reports the device lost at once: the answer goes to the
+  client, and nothing more reaches that board until the probe has
+  classified it. A heartbeat answered with a damaged frame twice is line
+  noise and changes nothing. A quick reboot of the same DSPi cannot be told
+  apart from no change.
 - **Notifications** are relayed only while a device is present. Frames that
   arrive before the device is reported found are dropped, since no client
   could yet place them.

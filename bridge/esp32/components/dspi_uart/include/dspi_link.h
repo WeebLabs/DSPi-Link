@@ -171,9 +171,9 @@ const dspi_link_counters_t *dspi_link_counters(const dspi_link_t *link);
 /* Which firmware answered the probe (bridge spec 7.6). */
 typedef enum {
     DSPI_FIRMWARE_PAGED,     /* "DSPi", protocol major 1: firmware 1.1.7 or later */
-    DSPI_FIRMWARE_TOO_OLD,   /* Status 0x02: 1.1.6 or older, which numbers commands otherwise */
-    DSPI_FIRMWARE_TOO_NEW,   /* OK, but not a protocol this bridge speaks */
-    DSPI_FIRMWARE_NOT_READY, /* Any other status, such as busy: probe again later */
+    DSPI_FIRMWARE_TOO_OLD,   /* 0x02 or 0x03: 1.1.6 or older, which numbers commands otherwise */
+    DSPI_FIRMWARE_TOO_NEW,   /* "DSPi", but a protocol major this bridge does not speak */
+    DSPI_FIRMWARE_NOT_READY, /* Busy, or an answer that is not a DSPi's: probe again later */
 } dspi_firmware_t;
 
 /* The answer to the probe. */
@@ -203,6 +203,13 @@ bool dspi_link_find_baud(dspi_link_t *link, uint32_t first_baud, const uint32_t 
  * `out`: bytes 1, 4 and 5, or the nibbles of byte 2 on old firmware that
  * sends only 4 bytes. */
 void dspi_platform_version(const uint8_t *platform, size_t length, char *out, size_t size);
+
+/* What the bridge learned of firmware 1.1.6 or older: its platform reply,
+ * read once, to show which version to update. */
+typedef struct {
+    uint8_t platform[DSPI_PLATFORM_BYTES];
+    uint8_t platform_length; /* 0 until read, or when it could not be */
+} dspi_legacy_t;
 
 /* Reads the platform of firmware 1.1.6 or older with its own REQ_GET_PLATFORM
  * (0x7F), the one request such a device is sent, to show its version.
@@ -235,5 +242,22 @@ typedef struct {
  * after the probe found protocol 1. Returns false if the serial, platform or
  * name could not be read. */
 bool dspi_link_read_identity(dspi_link_t *link, dspi_identity_t *identity);
+
+/* What to do with the device the probe found (bridge spec 7.6). */
+typedef enum {
+    DSPI_ATTACH_FOUND,           /* Paged firmware, identity read: attach it */
+    DSPI_ATTACH_IDENTITY_FAILED, /* Paged firmware, identity unreadable: probe again */
+    DSPI_ATTACH_REFUSED,         /* Too old or too new: never attached */
+    DSPI_ATTACH_NOT_READY,       /* Busy, or not a DSPi: probe again */
+} dspi_attach_t;
+
+/*
+ * Acts on the probe's answer. Only paged firmware has its identity read
+ * (with the protocol version copied in from the probe). Firmware 1.1.6 or
+ * older is sent only its own platform read, once, into `legacy` while
+ * `legacy->platform_length` is 0. Anything else is sent nothing.
+ */
+dspi_attach_t dspi_link_identify(dspi_link_t *link, const dspi_probe_t *probe,
+                                 dspi_identity_t *identity, dspi_legacy_t *legacy);
 
 #endif /* DSPI_LINK_H */

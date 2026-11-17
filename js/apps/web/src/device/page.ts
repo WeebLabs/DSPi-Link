@@ -81,6 +81,7 @@ export function createDevicePage(
   onBack: () => void,
 ): DevicePageHandles {
   const handle = device.handle;
+  const paged = device.protocol?.major === 1;
   let inputs = device.inputs ?? 0;
   let outputs = device.outputs ?? 0;
   // A hub may leave `inputs` out (Link spec 7.4), and the status frame starts
@@ -260,21 +261,24 @@ export function createDevicePage(
       el("p", { class: "dim mono", text: deviceSummary(device) }),
       status,
     ),
-    // A legacy device takes no paged command, so it gets no controls.
-    device.protocol ? volume.root : null,
-    device.protocol ? meters.root : null,
+    // A device that does not speak protocol 1 takes no command from this
+    // page, so it gets no controls.
+    paged ? volume.root : null,
+    paged ? meters.root : null,
   );
 
   meters.build(inputs, outputs);
-  if (device.protocol) {
+  if (paged) {
     refresh();
-  } else {
+  } else if (!device.protocol) {
     // Firmware before 1.1.7 numbers its commands differently, and the hub
     // forwards nothing to it (Link spec 7.4).
     setStatus(
       "This DSPi's firmware is too old for DSPi Link. Update it over USB with DSPi Console.",
       true,
     );
+  } else {
+    setStatus("This DSPi's firmware is newer than this page understands. Update the hub.", true);
   }
 
   return {

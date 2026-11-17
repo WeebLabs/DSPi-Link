@@ -167,6 +167,11 @@
  * there (bridge spec 7.6). */
 #define DSPI_UART_HEARTBEAT_IDLE_MS 1000
 
+/* However busy the link, the heartbeat runs at least this often, so a board
+ * swapped in under constant polling is still found out (bridge spec 7.6).
+ * One 16-byte read every 5 s costs nothing worth counting. */
+#define DSPI_UART_HEARTBEAT_MAX_INTERVAL_MS 5000
+
 /* While no request is waiting, the uart task checks for notifications this
  * often. Requests themselves start at once; this only bounds how late a
  * notification can be read. */

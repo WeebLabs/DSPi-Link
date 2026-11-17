@@ -996,7 +996,7 @@ export class LinkClient {
    * @param wValue The command's address, or 0.
    * @returns The response frame.
    */
-  get(handle: number, id: number, wLength: number, wValue = 0): Promise<CmdResponseFrame> {
+  async get(handle: number, id: number, wLength: number, wValue = 0): Promise<CmdResponseFrame> {
     if (!Number.isInteger(wLength) || wLength < 1) {
       throw new RangeError("a GET must ask for at least one byte");
     }
@@ -1014,7 +1014,7 @@ export class LinkClient {
    * @param wValue The command's address, or 0.
    * @returns The response frame.
    */
-  set(
+  async set(
     handle: number,
     id: number,
     payload: Uint8Array = new Uint8Array(0),
@@ -1025,18 +1025,21 @@ export class LinkClient {
   }
 
   /**
-   * Throws when `handle` is a listed device whose firmware predates paged
-   * commands (spec 7.4). An unlisted handle is left to the hub to answer.
+   * Throws when `handle` is a listed device that does not speak protocol 1
+   * (spec 7.4): firmware older than 1.1.7, which ignores the page and would
+   * run an unrelated opcode, or a protocol this library does not know. An
+   * unlisted handle is left to the hub to answer.
    *
    * @param handle The device.
    */
   private requirePaged(handle: number): void {
     const device = this.devices.get(handle);
-    if (device && !device.protocol) {
-      throw new Error(
-        `device ${handle} runs firmware older than 1.1.7, which takes no paged commands`,
-      );
-    }
+    if (!device || device.protocol?.major === 1) return;
+    throw new Error(
+      device.protocol
+        ? `device ${handle} speaks protocol ${device.protocol.major}, which this library does not`
+        : `device ${handle} runs firmware older than 1.1.7, which takes no paged commands`,
+    );
   }
 
   /**
@@ -1083,6 +1086,7 @@ export class LinkClient {
    * @returns The rates the hub granted.
    */
   async subscribePolls(handle: number, polls: PollRequest[]): Promise<PollGrant[]> {
+    this.requirePaged(handle); // A poll is a paged GET too
     let slots = this.pollSubscriptions.get(handle);
     if (!slots) {
       slots = new Map();
@@ -1139,6 +1143,14 @@ export class LinkClient {
   private async restorePolls(handle: number): Promise<void> {
     const slots = this.pollSubscriptions.get(handle);
     if (!slots || slots.size === 0) return;
+    try {
+      this.requirePaged(handle);
+    } catch (error) {
+      // The device came back on firmware that takes no paged GET: its
+      // feeds end here rather than being sent to it.
+      this.pollSubscriptions.delete(handle);
+      throw error;
+    }
     await this.request({ t: "poll.subscribe", id: 0, handle, polls: [...slots.values()] });
   }
 

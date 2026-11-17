@@ -344,7 +344,7 @@ static void a_damaged_heartbeat_is_no_answer(void)
 static void a_refused_heartbeat_means_another_device(void)
 {
     start(BAUD, BAUD);
-    const uint8_t refusals[] = {DSPI_STATUS_ERROR, DSPI_STATUS_VC_ERR_UNKNOWN,
+    const uint8_t refusals[] = {DSPI_STATUS_ERROR, DSPI_STATUS_BLOCKED, DSPI_STATUS_VC_ERR_UNKNOWN,
                                 DSPI_STATUS_VC_ERR_ADDRESS};
     for (size_t i = 0; i < sizeof(refusals); i++) {
         fake_dspi_script(&fake,
@@ -538,37 +538,64 @@ static void the_probe_is_sys_protocol_info(void)
 }
 
 /* Firmware 1.1.6 refuses the probe with 0x02, which still proves the rate.
- * The only other request it is sent is its own platform read. */
-static void older_firmware_is_too_old(void)
+ * The attach decision then sends it only its own platform read, once. */
+static void older_firmware_is_sent_only_its_platform_read(void)
 {
     start(BAUD, BAUD);
     fake_dspi_set_paged(&fake, false);
     CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
     CHECK(probe.firmware == DSPI_FIRMWARE_TOO_OLD);
 
-    uint8_t platform[DSPI_PLATFORM_BYTES];
-    CHECK(dspi_link_read_legacy_platform(&link, platform) == DSPI_PLATFORM_BYTES);
+    dspi_identity_t identity;
+    dspi_legacy_t legacy = {0};
+    CHECK(dspi_link_identify(&link, &probe, &identity, &legacy) == DSPI_ATTACH_REFUSED);
+    CHECK(fake.record_count == 2); /* The probe and GET_PLATFORM, nothing paged */
     CHECK(fake.records[1].request == 0x7F && fake.records[1].index == 0);
+    CHECK(legacy.platform_length == DSPI_PLATFORM_BYTES);
     char version[16];
-    dspi_platform_version(platform, DSPI_PLATFORM_BYTES, version, sizeof(version));
+    dspi_platform_version(legacy.platform, legacy.platform_length, version, sizeof(version));
     CHECK(strcmp(version, "1.1.7") == 0); /* The fake's platform bytes */
+
+    /* Probed again later: the version is known, so nothing more is sent. */
+    CHECK(dspi_link_identify(&link, &probe, &identity, &legacy) == DSPI_ATTACH_REFUSED);
+    CHECK(fake.record_count == 2);
 }
 
-/* A probe answered OK with something that is not protocol 1 is firmware
- * too new for this bridge. */
-static void an_unknown_protocol_is_too_new(void)
+/* Paged firmware: the identity is read, and the probe's version kept. */
+static void paged_firmware_is_identified(void)
 {
     start(BAUD, BAUD);
-    fake_dspi_set_paged(&fake, true);
+    CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
+    dspi_identity_t identity;
+    dspi_legacy_t legacy = {0};
+    CHECK(dspi_link_identify(&link, &probe, &identity, &legacy) == DSPI_ATTACH_FOUND);
+    CHECK(identity.protocol_major == 1 && identity.protocol_minor == 0);
+    CHECK(fake.record_count == 6); /* The probe and five identity reads */
+    CHECK(legacy.platform_length == 0);
+}
+
+/* "DSPi" with a protocol major other than 1 is firmware too new for this
+ * bridge; anything without the magic is not a DSPi, and is only probed
+ * again. Neither is sent anything after the probe. */
+static void an_unknown_protocol_is_refused_and_a_stranger_ignored(void)
+{
+    start(BAUD, BAUD);
     const uint8_t major_two[16] = {'D', 'S', 'P', 'i', 0x02, 0x00};
     fake_dspi_can(&fake, 0x0110, major_two, sizeof(major_two));
     CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
-    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_NEW);
+    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_NEW && probe.protocol_major == 2);
+    dspi_identity_t identity;
+    dspi_legacy_t legacy = {0};
+    CHECK(dspi_link_identify(&link, &probe, &identity, &legacy) == DSPI_ATTACH_REFUSED);
+    CHECK(fake.record_count == 1);
 
+    start(BAUD, BAUD);
     const uint8_t not_dspi[16] = {'X', 'S', 'P', 'i', 0x01, 0x00};
     fake_dspi_can(&fake, 0x0110, not_dspi, sizeof(not_dspi));
     CHECK(dspi_link_find_baud(&link, BAUD, NULL, 0, &probe));
-    CHECK(probe.firmware == DSPI_FIRMWARE_TOO_NEW);
+    CHECK(probe.firmware == DSPI_FIRMWARE_NOT_READY);
+    CHECK(dspi_link_identify(&link, &probe, &identity, &legacy) == DSPI_ATTACH_NOT_READY);
+    CHECK(fake.record_count == 1);
 }
 
 /* A busy answer proves the rate but says nothing of the firmware yet. */
@@ -714,8 +741,9 @@ void test_dspi_link(void)
     RUN(the_baud_rate_is_found);
     RUN(a_missing_device_leaves_the_first_rate);
     RUN(the_probe_is_sys_protocol_info);
-    RUN(older_firmware_is_too_old);
-    RUN(an_unknown_protocol_is_too_new);
+    RUN(older_firmware_is_sent_only_its_platform_read);
+    RUN(paged_firmware_is_identified);
+    RUN(an_unknown_protocol_is_refused_and_a_stranger_ignored);
     RUN(a_busy_probe_is_not_ready);
     RUN(the_identity_is_read);
     RUN(a_short_serial_stops_at_its_padding);

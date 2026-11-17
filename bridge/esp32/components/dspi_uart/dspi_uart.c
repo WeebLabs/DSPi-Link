@@ -48,13 +48,13 @@ static struct {
     dspi_link_t link;
     bool driver_installed;
     bool device_present;
-    dspi_identity_t identity; /* Of the device present */
-    bool identity_warned;     /* An unreadable identity was logged; not again until found */
-    dspi_probe_t last_probe;  /* The last probe's answer, while no device is present */
-    bool probe_answered;      /* `last_probe` holds an answer */
-    bool firmware_warned;     /* An unusable firmware was logged; not again until it changes */
-    uint8_t legacy_platform[DSPI_PLATFORM_BYTES];
-    uint8_t legacy_platform_length;
+    dspi_identity_t identity;   /* Of the device present */
+    bool identity_warned;       /* An unreadable identity was logged; not again until found */
+    dspi_probe_t last_probe;    /* The last probe's answer, while no device is present */
+    bool probe_answered;        /* `last_probe` holds an answer */
+    bool firmware_warned;       /* An unusable firmware was logged; not again until it changes */
+    dspi_legacy_t legacy;       /* Firmware 1.1.6 found by the last probes */
+    uint32_t last_heartbeat_ms; /* For DSPI_UART_HEARTBEAT_MAX_INTERVAL_MS */
     QueueHandle_t queue;
     volatile uint32_t last_loop_ms; /* For dspi_uart_is_alive() */
     dspi_uart_status_t published;   /* For dspi_uart_get_status(), counters aside */
@@ -230,9 +230,9 @@ static void publish_status(void)
         (firmware == DSPI_FIRMWARE_TOO_OLD || firmware == DSPI_FIRMWARE_TOO_NEW)) {
         status.unusable_answered = true;
         status.unusable_firmware = firmware;
-        memcpy(status.legacy_platform, uart_task_state.legacy_platform,
+        memcpy(status.legacy_platform, uart_task_state.legacy.platform,
                sizeof(status.legacy_platform));
-        status.legacy_platform_length = uart_task_state.legacy_platform_length;
+        status.legacy_platform_length = uart_task_state.legacy.platform_length;
     }
     portENTER_CRITICAL(&status_lock);
     uart_task_state.published = status;
@@ -361,17 +361,11 @@ static bool ensure_driver(void)
     return true;
 }
 
-/* A DSPi answered that the bridge cannot serve (bridge spec 7.6). It is not
- * attached and is sent nothing else, apart from the legacy platform read of
- * firmware 1.1.6 and older, which shows the user what to update. */
-static void refuse_firmware(const dspi_probe_t *probe)
+/* Logs, once until the probe's answer changes, why a DSPi that answered is
+ * not attached (bridge spec 7.6). */
+static void warn_refused(const dspi_probe_t *probe)
 {
-    dspi_link_t *link = &uart_task_state.link;
-    if (probe->firmware == DSPI_FIRMWARE_TOO_OLD && uart_task_state.legacy_platform_length == 0) {
-        const int length = dspi_link_read_legacy_platform(link, uart_task_state.legacy_platform);
-        uart_task_state.legacy_platform_length = length > 0 ? (uint8_t)length : 0;
-    }
-    if (uart_task_state.firmware_warned || probe->firmware == DSPI_FIRMWARE_NOT_READY) {
+    if (uart_task_state.firmware_warned) {
         return;
     }
     uart_task_state.firmware_warned = true;
@@ -379,11 +373,13 @@ static void refuse_firmware(const dspi_probe_t *probe)
         ESP_LOGW(TAG,
                  "The DSPi runs firmware 1.1.6 or older; update it over USB with DSPi Console");
     } else {
-        ESP_LOGW(TAG, "The DSPi runs firmware newer than this bridge understands");
+        ESP_LOGW(TAG, "The DSPi speaks protocol %u, which this bridge does not; update the bridge",
+                 probe->protocol_major);
     }
 }
 
-/* Probes for the DSPi once (bridge spec 7.5 and 7.6). */
+/* Probes for the DSPi once and acts on the answer (bridge spec 7.5 and 7.6).
+ * dspi_link_identify() decides what may be sent to it. */
 static void look_for_device(void)
 {
     static const uint32_t candidates[] = DSPI_UART_BAUD_CANDIDATES;
@@ -407,41 +403,66 @@ static void look_for_device(void)
     }
     if (changed) {
         uart_task_state.firmware_warned = false;
-        uart_task_state.legacy_platform_length = 0;
+        uart_task_state.legacy.platform_length = 0;
     }
     if (!answered) {
         publish_status(); /* The rate may have changed */
         return;
     }
-    if (probe.firmware != DSPI_FIRMWARE_PAGED) {
-        refuse_firmware(&probe);
-        publish_status();
-        return;
-    }
-
-    publish_status(); /* The rate may have changed */
 
     dspi_identity_t identity;
-    if (!dspi_link_read_identity(link, &identity)) {
+    switch (dspi_link_identify(link, &probe, &identity, &uart_task_state.legacy)) {
+    case DSPI_ATTACH_REFUSED:
+        warn_refused(&probe);
+        publish_status();
+        return;
+    case DSPI_ATTACH_NOT_READY:
+        publish_status();
+        return;
+    case DSPI_ATTACH_IDENTITY_FAILED:
         if (!uart_task_state.identity_warned) {
             ESP_LOGW(TAG, "A DSPi answered at %lu baud but its identity could not be read",
                      (unsigned long)dspi_link_baud(link));
             uart_task_state.identity_warned = true;
         }
+        publish_status();
         return;
+    case DSPI_ATTACH_FOUND:
+        break;
     }
-    identity.protocol_major = probe.protocol_major;
-    identity.protocol_minor = probe.protocol_minor;
 
     uart_task_state.identity = identity;
     uart_task_state.device_present = true;
     uart_task_state.identity_warned = false;
+    uart_task_state.last_heartbeat_ms = now_ms();
     publish_status();
     ESP_LOGI(TAG, "Found DSPi %s at %lu baud, protocol %u.%u", identity.serial,
              (unsigned long)dspi_link_baud(link), identity.protocol_major, identity.protocol_minor);
     if (config->handlers.device_found != NULL) {
         config->handlers.device_found(config->handlers.context, &identity, dspi_link_baud(link));
     }
+}
+
+/* The attached board stopped being the one found: a different serial, or
+ * an answer only older firmware gives. It is dropped, so the next probe
+ * classifies whatever is there now. */
+static void drop_changed_device(const char *why)
+{
+    ESP_LOGW(TAG, "DSPi %s: %s", uart_task_state.identity.serial, why);
+    report_device_lost();
+    publish_status();
+}
+
+/* Checks the serial. Returns false if the device was dropped. */
+static bool heartbeat(void)
+{
+    uart_task_state.last_heartbeat_ms = now_ms();
+    if (dspi_link_heartbeat(&uart_task_state.link, uart_task_state.identity.serial) ==
+        DSPI_HEARTBEAT_OTHER_DEVICE) {
+        drop_changed_device("another board answers in its place");
+        return false;
+    }
+    return true;
 }
 
 static void check_still_present(void)
@@ -469,13 +490,21 @@ static void serve_device(void)
         }
         const dspi_reply_t reply = dspi_link_transact(link, &item.request, item.may_retry);
         deliver_reply(&item, &reply);
+        if (reply.kind == DSPI_REPLY_ANSWERED && dspi_status_is_legacy(reply.status)) {
+            /* Firmware 1.1.7 never answers 0x02 or 0x03: older firmware was
+             * swapped in. Nothing more may reach it (bridge spec 7.6). */
+            drop_changed_device("it answers as firmware 1.1.6 or older");
+            return;
+        }
+        if (now_ms() - uart_task_state.last_heartbeat_ms >= DSPI_UART_HEARTBEAT_MAX_INTERVAL_MS &&
+            !heartbeat()) {
+            return;
+        }
     } else if (dspi_link_idle_ms(link) >= DSPI_UART_HEARTBEAT_IDLE_MS) {
-        /* A missed heartbeat shows up in check_still_present() below. */
-        if (dspi_link_heartbeat(link, uart_task_state.identity.serial) ==
-            DSPI_HEARTBEAT_OTHER_DEVICE) {
-            ESP_LOGW(TAG, "Another DSPi has replaced %s", uart_task_state.identity.serial);
-            report_device_lost(); /* The next pass finds the new one */
-            publish_status();
+        /* A heartbeat with no answer shows up in check_still_present()
+         * below; one answered with a damaged frame twice is line noise and
+         * does not count towards losing the device. */
+        if (!heartbeat()) {
             return;
         }
     } else {

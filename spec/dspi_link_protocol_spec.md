@@ -482,8 +482,9 @@ forwards nothing to it: it answers every CMD for that handle with
 may still list the device (with `fw` from the legacy `REQ_GET_PLATFORM`,
 0x7F) so that a client can offer a firmware update, and `fw.install` works on
 it (section 7.8). A hub that cannot install firmware, such as a bridge, need
-not list it at all. A client sends paged commands only to a device whose
-object carries `protocol`.
+not list it at all. A client sends paged commands, and subscribes polls,
+only to a device whose object carries `protocol` with `major` 1; a later
+major may change what a command means.
 
 Events, sent to every session:
 
@@ -1273,7 +1274,7 @@ A client is conformant when it:
 - [ ] uses `caps` and `limits` instead of assuming hub kind;
 - [ ] suppresses echoes by `origin`, never by `source` alone;
 - [ ] re-reads state on any sequence gap or RESYNC;
-- [ ] sends paged commands only to a device with `protocol`, with `wIndex` carrying the page and a non-zero `wLength` on every GET;
+- [ ] sends paged commands and polls only to a device with `protocol` major 1, with `wIndex` carrying the page and a non-zero `wLength` on every GET;
 - [ ] retries only the codes section 8.1 names as retryable;
 - [ ] gates device features on the device's own version and capability reports.
 

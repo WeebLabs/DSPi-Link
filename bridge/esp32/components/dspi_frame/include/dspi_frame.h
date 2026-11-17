@@ -68,6 +68,14 @@
 #define DSPI_STATUS_VC_ERR_PIN_INVALID 0x19 /* The GPIO cannot be used for this */
 #define DSPI_STATUS_VC_ERR_PIN_IN_USE 0x1A  /* The GPIO is already claimed */
 
+/* True for the statuses only firmware 1.1.6 and older sends: ERROR and
+ * BLOCKED. A device that answers one of them speaks the old opcodes and must
+ * be sent no paged request (bridge spec 7.6). */
+static inline bool dspi_status_is_legacy(uint8_t status)
+{
+    return status == DSPI_STATUS_ERROR || status == DSPI_STATUS_BLOCKED;
+}
+
 /* True for the statuses that mean "busy, the same request may succeed
  * shortly": BUSY, BULK_LOCKED and VC_ERR_BUSY. */
 static inline bool dspi_status_is_busy(uint8_t status)

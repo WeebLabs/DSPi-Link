@@ -331,7 +331,8 @@ the ESP32, ESP32-C3 and ESP32-C6 are waiting for boards.
     serial, so a swapped DSPi is noticed; a damaged answer is reported as
     TIMEOUT, never CRC_ERROR.
   - Hub: one poll budget for the whole link; fresh status for every
-    snapshot; write-as-read commands count as writes; client names are
+    snapshot; write-as-read commands count as writes (firmware 1.1.6; since
+    the 1.1.7 port every SET is a write and no GET is); client names are
     valid UTF-8; unreadable PIN data fails closed; a client forgotten to
     make room is disconnected.
   - Glue: the uart task never waits on the hub; each session has a share
