@@ -88,9 +88,9 @@ typedef struct {
     uint8_t commands_in_flight;
     uint16_t notify_sequence;
     uint16_t poll_sequence;
-    bool resync_owed; /* A notification was dropped; RESYNC when there is room */
-    bool rta_watching;       /* Read the analyser or started it (Link spec 7.15) */
-    uint32_t rta_watched_ms; /* When it last did */
+    bool resync_owed;           /* A notification was dropped; RESYNC when there is room */
+    bool rta_watching;          /* Read the analyser or started it (Link spec 7.15) */
+    uint32_t rta_watched_ms;    /* When it last did */
     uint8_t deferred_ack_count; /* Also counted in commands_in_flight */
     hub_deferred_ack_t deferred_acks[LINK_MAX_INFLIGHT];
     hub_poll_slot_t polls[HUB_POLL_SLOTS];

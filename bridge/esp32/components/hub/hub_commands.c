@@ -385,8 +385,7 @@ static uint32_t newest_queued_command(const hub_t *hub, int slot, uint16_t sessi
 
 /* Answers a swallowed STOP in its place in the session's order: now, or
  * once the session's newest queued CMD has been answered. */
-static void answer_swallowed_stop(hub_t *hub, int slot, hub_session_t *session,
-                                  uint16_t client_tag)
+static void answer_swallowed_stop(hub_t *hub, int slot, hub_session_t *session, uint16_t client_tag)
 {
     const uint32_t after_tag = newest_queued_command(hub, slot, session->id);
     if (after_tag == 0) {

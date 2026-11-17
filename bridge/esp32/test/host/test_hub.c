@@ -1976,9 +1976,20 @@ static void subscribe_one(int slot, int poll_slot, int request, int value, int l
  * send_cmd() lays out a GET. */
 static void send_rta_control_value(int slot, uint16_t tag, uint8_t control)
 {
-    const uint8_t frame[LINK_CMD_REQUEST_HEADER_BYTES] = {
-        LINK_FRAME_CMD_REQUEST, 0, (uint8_t)(tag & 0xFF), (uint8_t)(tag >> 8), 0, 1, 0x0E, 0,
-        control, 0, 2, 0, 1, 0};
+    const uint8_t frame[LINK_CMD_REQUEST_HEADER_BYTES] = {LINK_FRAME_CMD_REQUEST,
+                                                          0,
+                                                          (uint8_t)(tag & 0xFF),
+                                                          (uint8_t)(tag >> 8),
+                                                          0,
+                                                          1,
+                                                          0x0E,
+                                                          0,
+                                                          control,
+                                                          0,
+                                                          2,
+                                                          0,
+                                                          1,
+                                                          0};
     hub_session_binary(&hub, slot, frame, sizeof(frame));
 }
 
